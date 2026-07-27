@@ -16,12 +16,12 @@ from uuid import uuid4
 from deeptutor.services.private_state import (
     chmod_private,
     ensure_private_directory,
-    ensure_private_file,
     exclusive_path_lock,
 )
 
 from .models import Role
 from .paths import PROJECT_ROOT, SYSTEM_ROOT, migrate_legacy_multi_user_tree
+from deeptutor.utils.secret_files import write_secret_text
 
 logger = logging.getLogger(__name__)
 
@@ -145,9 +145,7 @@ def _migrate_secret() -> None:
     try:
         secret = LEGACY_SECRET_FILE.read_text(encoding="utf-8").strip()
         if secret:
-            ensure_private_file(SECRET_FILE)
-            SECRET_FILE.write_text(secret, encoding="utf-8")
-            chmod_private(SECRET_FILE)
+            write_secret_text(SECRET_FILE, secret)
             logger.info("Migrated auth secret from %s to %s", LEGACY_SECRET_FILE, SECRET_FILE)
     except Exception as exc:
         logger.warning("Failed to migrate legacy auth secret: %s", exc)
@@ -485,14 +483,11 @@ def load_or_create_auth_secret() -> str:
         with exclusive_path_lock(SECRET_FILE):
             _migrate_secret()
             if SECRET_FILE.exists():
-                chmod_private(SECRET_FILE)
                 existing = SECRET_FILE.read_text(encoding="utf-8").strip()
                 if existing:
                     return existing
-            ensure_private_file(SECRET_FILE)
             generated = secrets.token_hex(32)
-            SECRET_FILE.write_text(generated, encoding="utf-8")
-            chmod_private(SECRET_FILE)
+            write_secret_text(SECRET_FILE, generated)
             logger.warning(
                 "Auth is enabled and no auth_secret file exists. "
                 "Generated a stable local secret at %s.",
