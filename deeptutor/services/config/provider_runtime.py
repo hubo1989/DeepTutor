@@ -7,6 +7,17 @@ import json
 from typing import Any
 from urllib.parse import urlparse
 
+from deeptutor.multi_user.byok_policy import (
+    allowed_binding,
+    byok_runtime_enabled,
+    grant_service_enabled,
+    load_policy,
+    official_endpoint,
+    validate_endpoint,
+)
+from deeptutor.multi_user.byok_vault import get_user_byok_vault
+from deeptutor.multi_user.context import get_current_user
+from deeptutor.multi_user.grants import load_grant
 from deeptutor.services.imagegen.config import ImagegenConfig
 from deeptutor.services.model_selection import LLMSelection, apply_llm_selection_to_catalog
 from deeptutor.services.provider_registry import (
@@ -454,6 +465,7 @@ class ResolvedLLMConfig:
     extra_headers: dict[str, str] = field(default_factory=dict)
     reasoning_effort: str | None = None
     context_window: int | None = None
+    source: str = "platform"
 
 
 @dataclass(slots=True)
@@ -616,6 +628,68 @@ def _choose_resolved_provider(
     return find_by_name("openai") or PROVIDERS[0]
 
 
+def _resolve_byok_llm_runtime_config(selection: LLMSelection) -> ResolvedLLMConfig:
+    """Resolve a user-owned LLM profile without touching the platform catalog."""
+    user = get_current_user()
+    policy = load_policy()
+    grant = load_grant(user.id)
+    if not byok_runtime_enabled("llm", policy):
+        raise PermissionError("BYOK is disabled for LLM requests")
+    if not user.is_admin and not grant_service_enabled(grant, "byok", "llm"):
+        raise PermissionError("BYOK is not enabled for this account")
+    if not selection.profile_id:
+        raise ValueError("Invalid BYOK selection: profile_id is required")
+
+    metadata, api_key = get_user_byok_vault().load_secret(user.id, selection.profile_id)
+    if str(metadata.get("service") or "") != "llm":
+        raise PermissionError("The selected BYOK profile is not an LLM profile")
+    current_generation = int(metadata.get("generation") or 0)
+    if selection.generation is not None and current_generation != selection.generation:
+        raise PermissionError("The selected BYOK profile changed; reload and select it again")
+
+    binding_hint_raw = _as_str(metadata.get("provider"))
+    if not binding_hint_raw or not allowed_binding("llm", binding_hint_raw, policy):
+        raise PermissionError("This BYOK provider is not allowed by the administrator")
+    binding_hint = canonical_provider_name(binding_hint_raw) or binding_hint_raw
+    spec = find_by_name(binding_hint)
+    if spec is None:
+        raise ValueError("The selected BYOK provider is not registered")
+
+    model = _as_str(metadata.get("model"))
+    if not model:
+        raise ValueError("The selected BYOK profile has no model")
+    configured_endpoint = _as_str(metadata.get("base_url")) or official_endpoint(binding_hint)
+    if not configured_endpoint:
+        raise ValueError("The selected BYOK profile has no usable endpoint")
+    endpoint = validate_endpoint(
+        configured_endpoint,
+        service="llm",
+        binding=binding_hint,
+        policy=policy,
+        # Profile creation validates DNS synchronously before persistence. Keep
+        # runtime resolution off that path so it cannot block the event loop.
+        resolve_dns=False,
+    )
+    if not endpoint:
+        raise ValueError("The selected BYOK profile has no usable endpoint")
+
+    return ResolvedLLMConfig(
+        model=model,
+        provider_name=spec.name,
+        provider_mode=spec.mode,
+        binding_hint=binding_hint,
+        binding=spec.name,
+        api_key=api_key,
+        base_url=endpoint,
+        effective_url=endpoint,
+        api_version=None,
+        extra_headers={},
+        reasoning_effort=None,
+        context_window=None,
+        source="byok",
+    )
+
+
 def resolve_llm_runtime_config(
     catalog: dict[str, Any] | None = None,
     *,
@@ -623,9 +697,28 @@ def resolve_llm_runtime_config(
     llm_selection: dict[str, Any] | LLMSelection | None = None,
 ) -> ResolvedLLMConfig:
     """Resolve active LLM config with TutorBot-style provider matching."""
+    resolved_selection = LLMSelection.from_payload(llm_selection)
+    if resolved_selection is None and not get_current_user().is_admin:
+        from deeptutor.multi_user.model_access import default_llm_selection
+
+        resolved_selection = LLMSelection.from_payload(default_llm_selection())
+        if resolved_selection is None:
+            raise PermissionError("No LLM model is assigned to your account")
+    if resolved_selection is not None and resolved_selection.source == "byok":
+        return _resolve_byok_llm_runtime_config(resolved_selection)
+    if resolved_selection is not None and not get_current_user().is_admin:
+        # Runtime resolution is also a public server boundary for callers that
+        # do not pass through TurnRuntimeManager.
+        from deeptutor.multi_user.model_access import apply_allowed_llm_selection
+
+        resolved_selection = (
+            LLMSelection.from_payload(apply_allowed_llm_selection(resolved_selection.to_dict()))
+            or resolved_selection
+        )
+
     catalog_service = service or get_model_catalog_service()
     loaded = _load_catalog(catalog)
-    loaded = apply_llm_selection_to_catalog(loaded, llm_selection)
+    loaded = apply_llm_selection_to_catalog(loaded, resolved_selection)
 
     profile, model = _active_profile_and_model(loaded, catalog_service, "llm")
     resolved_model = _as_str((model or {}).get("model"))
@@ -676,6 +769,7 @@ def resolve_llm_runtime_config(
         extra_headers=extra_headers,
         reasoning_effort=reasoning_effort,
         context_window=context_window,
+        source="platform",
     )
 
 

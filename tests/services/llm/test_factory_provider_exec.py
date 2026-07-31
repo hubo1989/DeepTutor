@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 
 from deeptutor.services.llm.config import LLMConfig
-from deeptutor.services.llm.factory import complete, stream
+from deeptutor.services.llm.factory import _reserve_factory_quota, complete, stream
 from deeptutor.services.llm.provider_core.base import LLMResponse
 
 
@@ -55,6 +55,10 @@ def _make_cfg(**overrides: Any) -> LLMConfig:
     )
     defaults.update(overrides)
     return LLMConfig(**defaults)
+
+
+def test_factory_does_not_reserve_platform_quota_for_byok() -> None:
+    assert _reserve_factory_quota(_make_cfg(source="byok"), [], max_tokens=128) == (None, 0)
 
 
 @pytest.mark.asyncio
@@ -138,6 +142,37 @@ async def test_explicit_call_inherits_matching_profile_headers_and_reasoning(
     assert captured_config["config"].extra_headers == {"User-Agent": "DeepTutor-Test"}
     assert captured_config["config"].reasoning_effort == "minimal"
     assert provider.complete_kwargs["reasoning_effort"] == "minimal"
+
+
+@pytest.mark.asyncio
+async def test_explicit_byok_source_overrides_platform_active_config(monkeypatch) -> None:
+    """Factory calls retain BYOK accounting when context propagation is absent."""
+    cfg = _make_cfg(source="platform")
+    provider = _FakeProvider()
+    captured_config: dict[str, LLMConfig] = {}
+
+    monkeypatch.setattr("deeptutor.services.llm.factory.get_llm_config", lambda: cfg)
+
+    def _fake_get_runtime_provider(config: LLMConfig):
+        captured_config["config"] = config
+        return provider
+
+    monkeypatch.setattr(
+        "deeptutor.services.llm.factory.get_runtime_provider", _fake_get_runtime_provider
+    )
+
+    assert (
+        await complete(
+            "hello",
+            model=cfg.model,
+            api_key=cfg.api_key,
+            base_url=cfg.base_url,
+            binding=cfg.binding,
+            source="byok",
+        )
+        == "ok"
+    )
+    assert captured_config["config"].source == "byok"
 
 
 @pytest.mark.asyncio

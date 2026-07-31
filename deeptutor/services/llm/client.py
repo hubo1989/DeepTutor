@@ -13,7 +13,7 @@ import logging
 from typing import Any, cast
 
 from .capabilities import supports_vision
-from .config import LLMConfig, get_llm_config
+from .config import LLMConfig, get_llm_config, get_scoped_llm_config
 from .utils import sanitize_url
 
 
@@ -44,6 +44,14 @@ class LLMClient:
         Set OpenAI environment variables for compatibility with OpenAI-style SDKs.
         """
         import os
+
+        # A BYOK config is request-scoped. Writing it to process-global
+        # OPENAI_* variables would let concurrent users race and leak one
+        # user's credential into another user's request.  Do not infer this
+        # from ExecutionSource: ContextVars are not guaranteed to cross every
+        # async or thread boundary used by provider clients.
+        if getattr(self.config, "source", "platform") != "platform":
+            return
 
         binding = getattr(self.config, "binding", "openai")
 
@@ -91,6 +99,7 @@ class LLMClient:
             base_url=self.config.base_url,
             api_version=getattr(self.config, "api_version", None),
             binding=getattr(self.config, "binding", "openai"),
+            source=getattr(self.config, "source", "platform"),
             reasoning_effort=getattr(self.config, "reasoning_effort", None),
             extra_headers=getattr(self.config, "extra_headers", None),
             messages=messages,
@@ -205,6 +214,7 @@ class LLMClient:
                 base_url=sanitize_url(self.config.base_url) if self.config.base_url else None,
                 api_version=getattr(self.config, "api_version", None),
                 binding=getattr(self.config, "binding", "openai"),
+                source=getattr(self.config, "source", "platform"),
                 reasoning_effort=getattr(self.config, "reasoning_effort", None),
                 extra_headers=getattr(self.config, "extra_headers", None),
                 messages=resolved_messages,
@@ -227,6 +237,10 @@ def get_llm_client(config: LLMConfig | None = None) -> LLMClient:
     Returns:
         LLMClient instance
     """
+    scoped = get_scoped_llm_config() if config is None else None
+    if scoped is not None:
+        return LLMClient(scoped)
+
     global _client
     if _client is None:
         _client = LLMClient(config)

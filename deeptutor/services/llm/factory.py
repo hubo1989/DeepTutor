@@ -159,6 +159,7 @@ def _resolve_call_config(
     base_url: str | None,
     api_version: str | None,
     binding: str | None,
+    source: str | None,
     extra_headers: dict[str, str] | None,
     reasoning_effort: str | None,
 ) -> tuple[LLMConfig, Any]:
@@ -204,6 +205,13 @@ def _resolve_call_config(
             api_version=api_version,
             extra_headers=merged_headers,
             reasoning_effort=resolved_reasoning_effort,
+            source=(
+                "byok"
+                if source == "byok"
+                else getattr(current, "source", "platform")
+                if current is not None
+                else "platform"
+            ),
         )
         return config, provider_spec
 
@@ -243,6 +251,7 @@ def _resolve_call_config(
             "reasoning_effort": (
                 reasoning_effort if reasoning_effort is not None else current.reasoning_effort
             ),
+            "source": "byok" if source == "byok" else getattr(current, "source", "platform"),
         }
     )
     return config, provider_spec
@@ -274,19 +283,12 @@ def _build_messages(
     ]
 
 
-def _reserve_factory_quota(
+def _estimate_factory_request_tokens(
     messages: list[dict[str, Any]],
     *,
     max_tokens: int,
-) -> tuple[Any, int]:
-    """Reserve a bounded user's tokens for the services-layer factory path."""
-    from deeptutor.multi_user.token_quota import (
-        TokenQuotaExceeded,
-        TokenQuotaUnavailable,
-        reserve_current_user_tokens,
-    )
-    from .exceptions import LLMProviderError, LLMRateLimitError
-
+) -> tuple[int, int]:
+    """Return conservative total and prompt estimates shared by both ledgers."""
     try:
         prompt_estimate = max(
             1,
@@ -297,8 +299,28 @@ def _reserve_factory_quota(
         )
     except (TypeError, ValueError):
         prompt_estimate = max(1, math.ceil(len(str(messages)) / 3.5))
-    output_estimate = max(1, int(max_tokens))
-    requested = prompt_estimate + output_estimate
+    return prompt_estimate + max(1, int(max_tokens)), prompt_estimate
+
+
+def _reserve_factory_quota(
+    config: LLMConfig,
+    messages: list[dict[str, Any]],
+    *,
+    max_tokens: int,
+) -> tuple[Any, int]:
+    """Reserve a bounded user's tokens for the services-layer factory path."""
+    if getattr(config, "source", "platform") != "platform":
+        return None, 0
+    from deeptutor.multi_user.token_quota import (
+        TokenQuotaExceeded,
+        TokenQuotaUnavailable,
+        reserve_current_user_tokens,
+    )
+
+    from .exceptions import LLMProviderError, LLMRateLimitError
+
+    requested, prompt_estimate = _estimate_factory_request_tokens(messages, max_tokens=max_tokens)
+    output_estimate = requested - prompt_estimate
     try:
         lease = reserve_current_user_tokens(
             requested_tokens=requested,
@@ -308,6 +330,51 @@ def _reserve_factory_quota(
     except TokenQuotaExceeded as exc:
         raise LLMRateLimitError(str(exc), provider="deeptutor") from exc
     except TokenQuotaUnavailable as exc:
+        raise LLMProviderError(str(exc), provider="deeptutor") from exc
+    return lease, requested
+
+
+def _start_byok_factory_usage(
+    config: LLMConfig,
+    messages: list[dict[str, Any]],
+    *,
+    max_tokens: int,
+) -> tuple[Any, int]:
+    """Apply BYOK safety limits without entering the platform quota ledger."""
+    from deeptutor.multi_user.execution_source import get_execution_source
+
+    if getattr(config, "source", "platform") == "platform":
+        return None, 0
+    from deeptutor.multi_user.byok_usage import (
+        ByokUsageLimitExceeded,
+        ByokUsageUnavailable,
+        start_byok_usage,
+    )
+
+    from .exceptions import LLMProviderError, LLMRateLimitError
+
+    requested, _prompt_estimate = _estimate_factory_request_tokens(messages, max_tokens=max_tokens)
+    source = get_execution_source()
+    if source is None:
+        from deeptutor.multi_user.context import get_current_user
+
+        user_id = get_current_user().id
+        profile_id = "unknown"
+    else:
+        user_id = source.user_id
+        profile_id = source.profile_id or "unknown"
+    try:
+        lease = start_byok_usage(
+            service="llm",
+            user_id=user_id,
+            profile_id=profile_id,
+            provider=config.provider_name or config.binding or "openai-compatible",
+            model=config.model,
+            estimated_units=requested,
+        )
+    except ByokUsageLimitExceeded as exc:
+        raise LLMRateLimitError(str(exc), provider="deeptutor") from exc
+    except ByokUsageUnavailable as exc:
         raise LLMProviderError(str(exc), provider="deeptutor") from exc
     return lease, requested
 
@@ -392,6 +459,7 @@ async def complete(
     base_url: str | None = None,
     api_version: str | None = None,
     binding: str | None = None,
+    source: str | None = None,
     messages: list[dict[str, Any]] | None = None,
     max_retries: int = DEFAULT_MAX_RETRIES,
     retry_delay: float = DEFAULT_RETRY_DELAY,
@@ -410,6 +478,7 @@ async def complete(
         base_url=base_url,
         api_version=api_version,
         binding=binding,
+        source=source,
         extra_headers=caller_extra_headers,
         reasoning_effort=reasoning_effort,
     )
@@ -429,6 +498,12 @@ async def complete(
         binding=capability_binding, model=config.model, kwargs=kwargs
     )
     quota_lease, quota_reservation = _reserve_factory_quota(
+        config,
+        request_messages,
+        max_tokens=_configured_max_tokens(config, extra_kwargs),
+    )
+    byok_lease, byok_reservation = _start_byok_factory_usage(
+        config,
         request_messages,
         max_tokens=_configured_max_tokens(config, extra_kwargs),
     )
@@ -445,11 +520,19 @@ async def complete(
     except Exception as exc:
         if quota_lease is not None:
             quota_lease.release()
+        if byok_lease is not None:
+            byok_lease.release()
         raise map_error(exc, provider=config.provider_name) from exc
 
     if quota_lease is not None:
         actual = int((response.usage or {}).get("total_tokens") or 0)
         quota_lease.finalize(actual or quota_reservation)
+    if byok_lease is not None:
+        actual = int((response.usage or {}).get("total_tokens") or 0)
+        byok_lease.finalize(
+            actual or byok_reservation,
+            status="failed" if response.finish_reason == "error" else "success",
+        )
     if response.finish_reason == "error":
         raise map_error(
             RuntimeError(response.content or "LLM request failed"), provider=config.provider_name
@@ -465,6 +548,7 @@ async def stream(
     base_url: str | None = None,
     api_version: str | None = None,
     binding: str | None = None,
+    source: str | None = None,
     messages: list[dict[str, Any]] | None = None,
     max_retries: int = DEFAULT_MAX_RETRIES,
     retry_delay: float = DEFAULT_RETRY_DELAY,
@@ -489,6 +573,7 @@ async def stream(
         base_url=base_url,
         api_version=api_version,
         binding=binding,
+        source=source,
         extra_headers=caller_extra_headers,
         reasoning_effort=reasoning_effort,
     )
@@ -508,6 +593,12 @@ async def stream(
         binding=capability_binding, model=config.model, kwargs=kwargs
     )
     quota_lease, quota_reservation = _reserve_factory_quota(
+        config,
+        request_messages,
+        max_tokens=_configured_max_tokens(config, extra_kwargs),
+    )
+    byok_lease, byok_reservation = _start_byok_factory_usage(
+        config,
         request_messages,
         max_tokens=_configured_max_tokens(config, extra_kwargs),
     )
@@ -574,12 +665,25 @@ async def stream(
         except Exception as exc:
             if quota_lease is not None:
                 quota_lease.release()
+            if byok_lease is not None:
+                byok_lease.release()
             await queue.put(map_error(exc, provider=config.provider_name))
         finally:
             if quota_lease is not None:
                 usage = getattr(response, "usage", None) or {}
                 usage_total = int(usage.get("total_tokens") or 0)
                 quota_lease.finalize(usage_total or quota_reservation)
+            if byok_lease is not None:
+                usage = getattr(response, "usage", None) or {}
+                usage_total = int(usage.get("total_tokens") or 0)
+                byok_lease.finalize(
+                    usage_total or byok_reservation,
+                    status=(
+                        "failed"
+                        if response is not None and response.finish_reason == "error"
+                        else "success" if response is not None else "cancelled"
+                    ),
+                )
             await queue.put(None)
 
     task = asyncio.create_task(_runner())

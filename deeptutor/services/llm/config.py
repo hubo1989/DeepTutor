@@ -39,6 +39,7 @@ class LLMConfigUpdate(TypedDict, total=False):
     extra_headers: dict[str, str]
     reasoning_effort: str | None
     context_window: int | None
+    source: str
     max_tokens: int
     temperature: float
     max_concurrency: int
@@ -107,6 +108,11 @@ class LLMConfig:
     extra_headers: dict[str, str] | None = None
     reasoning_effort: str | None = None
     context_window: int | None = None
+    # Whether this config resolves credentials from the platform catalog or a
+    # request-scoped BYOK profile.  Consumers must use this durable marker
+    # instead of inferring the source from ContextVars, which do not propagate
+    # across every async/thread boundary.
+    source: str = "platform"
     max_tokens: int = 4096
     temperature: float = 0.7
     max_concurrency: int = 20
@@ -182,6 +188,7 @@ def _get_llm_config_from_resolver() -> LLMConfig:
         extra_headers=resolved.extra_headers,
         reasoning_effort=resolved.reasoning_effort,
         context_window=resolved.context_window,
+        source=getattr(resolved, "source", "platform"),
     )
 
 
@@ -206,6 +213,11 @@ def get_llm_config() -> LLMConfig:
 
     _LLM_CONFIG_CACHE = _get_llm_config_from_resolver()
     return _LLM_CONFIG_CACHE
+
+
+def get_scoped_llm_config() -> LLMConfig | None:
+    """Return the request-local config without falling back to the catalog."""
+    return _SCOPED_LLM_CONFIG.get()
 
 
 async def get_llm_config_async() -> LLMConfig:
@@ -285,6 +297,7 @@ def get_token_limit_kwargs(model: str, max_tokens: int) -> dict[str, int]:
 __all__ = [
     "LLMConfig",
     "get_llm_config",
+    "get_scoped_llm_config",
     "get_llm_config_async",
     "clear_llm_config_cache",
     "reload_config",

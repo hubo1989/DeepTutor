@@ -46,18 +46,54 @@ def _pdf_page_count(pdf_path: Path) -> int:
     return count
 
 
-def _reserve_mineru_pages(pdf_path: Path):
+def _reserve_mineru_pages(pdf_path: Path, config: MinerUConfig):
     """Reserve this user's MinerU page allowance, if the user is bounded."""
+    from deeptutor.multi_user.byok_policy import load_policy
     from deeptutor.multi_user.token_quota import (
         QuotaExceeded,
         TokenQuotaUnavailable,
-        current_user_resource_quota_policy,
         reserve_current_user_units,
     )
 
-    if current_user_resource_quota_policy("mineru") is None:
+    policy_limits = load_policy().get("limits") or {}
+    global_max_pages = max(1, int(policy_limits.get("max_pages_per_file", 50)))
+    if config.source == "byok":
+        # BYOK does not consume platform page credits, but the administrator's
+        # per-file safety ceiling remains mandatory for untrusted users.
+        pages = _pdf_page_count(pdf_path)
+        if pages > global_max_pages:
+            raise MinerUError(
+                f"MinerU file exceeds the per-file safety limit of {global_max_pages} pages."
+            )
+        from deeptutor.multi_user.byok_usage import start_byok_usage
+        from deeptutor.multi_user.context import get_current_user
+        from deeptutor.multi_user.execution_source import get_execution_source
+
+        source = get_execution_source()
+        source_for_service = source if source and source.service == "mineru" else None
+        lease = start_byok_usage(
+            service="mineru",
+            user_id=source_for_service.user_id if source_for_service else get_current_user().id,
+            profile_id=(
+                source_for_service.profile_id
+                if source_for_service and source_for_service.profile_id
+                else config.profile_id or "unknown"
+            ),
+            provider="mineru",
+            model=config.model_version,
+            estimated_units=pages,
+        )
+        return lease, pages
+    from deeptutor.multi_user.token_quota import current_user_resource_quota_policy
+
+    policy = current_user_resource_quota_policy("mineru")
+    if policy is None:
         return None, 0
     pages = _pdf_page_count(pdf_path)
+    if pages > global_max_pages:
+        raise MinerUError(
+            f"MinerU file exceeds the per-file safety limit of {global_max_pages} pages."
+        )
     try:
         return reserve_current_user_units(resource="mineru", requested_units=pages), pages
     except (QuotaExceeded, TokenQuotaUnavailable) as exc:
@@ -85,7 +121,7 @@ def parse_pdf_to_workdir(
     output_base = Path(output_base)
     output_base.mkdir(parents=True, exist_ok=True)
 
-    lease, page_count = _reserve_mineru_pages(pdf_path)
+    lease, page_count = _reserve_mineru_pages(pdf_path, cfg)
     try:
         if cfg.is_cloud:
             from .cloud import parse_cloud
