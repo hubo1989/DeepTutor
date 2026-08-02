@@ -60,9 +60,7 @@ def activate_llm_selection(selection: Any) -> tuple[LLMConfig, LLMSelectionScope
 
     normalized = LLMSelection.from_payload(selection)
     if normalized is not None and not get_current_user().is_admin:
-        normalized = LLMSelection.from_payload(
-            apply_allowed_llm_selection(normalized.to_dict())
-        )
+        normalized = LLMSelection.from_payload(apply_allowed_llm_selection(normalized.to_dict()))
     if normalized is None and not get_current_user().is_admin:
         from deeptutor.multi_user.model_access import default_llm_selection
 

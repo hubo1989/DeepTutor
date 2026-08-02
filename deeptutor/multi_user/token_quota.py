@@ -113,11 +113,7 @@ class ResourceQuotaPolicy:
 
     @property
     def bounded(self) -> bool:
-        return (
-            self.daily_limit > 0
-            or self.monthly_limit > 0
-            or self.per_request_limit > 0
-        )
+        return self.daily_limit > 0 or self.monthly_limit > 0 or self.per_request_limit > 0
 
 
 @dataclass

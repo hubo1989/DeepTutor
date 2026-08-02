@@ -59,8 +59,11 @@ def test_retrieved_page_images_cannot_escape_runtime_data_root(tmp_path: Path, m
     pipeline = AgenticChatPipeline.__new__(AgenticChatPipeline)
     context = UnifiedContext(session_id="s1", user_message="q", metadata={})
 
-    assert pipeline._attach_rag_images(
-        context,
-        [{"image_paths": [str(outside)]}],
-    ) == []
+    assert (
+        pipeline._attach_rag_images(
+            context,
+            [{"image_paths": [str(outside)]}],
+        )
+        == []
+    )
     assert context.attachments == []

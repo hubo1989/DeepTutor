@@ -87,7 +87,9 @@ def current_source_is_platform(
     return source.is_platform
 
 
-def _profile_for(preferences: dict[str, Any], service: str, profiles: list[dict[str, Any]]) -> dict[str, Any] | None:
+def _profile_for(
+    preferences: dict[str, Any], service: str, profiles: list[dict[str, Any]]
+) -> dict[str, Any] | None:
     preferred = preferences.get(service)
     preferred_id = preferred.get("profile_id") if isinstance(preferred, dict) else None
     if preferred_id:
@@ -139,7 +141,9 @@ def resolve_execution_source(
         source = "platform"
 
     if source == "byok":
-        if not byok_runtime_enabled(service) or not grant_service_enabled(active_grant, "byok", service):
+        if not byok_runtime_enabled(service) or not grant_service_enabled(
+            active_grant, "byok", service
+        ):
             raise PermissionError("BYOK is not enabled for this account")
         if selected_profile is None:
             raise PermissionError("Configure a BYOK profile before selecting BYOK")

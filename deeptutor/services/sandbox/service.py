@@ -81,16 +81,20 @@ class SandboxService:
         # when the grant denies it, but any path that reaches the sandbox
         # directly still answers to the same policy.
         try:
-            from deeptutor.multi_user.tool_access import exec_override
             from deeptutor.multi_user.context import get_current_user
+            from deeptutor.multi_user.tool_access import exec_override
             from deeptutor.services.config import load_system_settings
             from deeptutor.services.partners.scope import is_partner_user_id
 
             current_user = get_current_user()
             is_partner = is_partner_user_id(current_user.id)
-            if not current_user.is_admin and not is_partner and (
-                self._backend.level is not IsolationLevel.SYSTEM
-                or not load_system_settings().get("sandbox_allow_untrusted_users", False)
+            if (
+                not current_user.is_admin
+                and not is_partner
+                and (
+                    self._backend.level is not IsolationLevel.SYSTEM
+                    or not load_system_settings().get("sandbox_allow_untrusted_users", False)
+                )
             ):
                 return ExecResult(error=t("sandbox.disabled_for_account"))
             if exec_override() is False:

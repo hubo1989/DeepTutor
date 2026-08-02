@@ -326,9 +326,7 @@ class AgentLoop:
             # A rag call may discover page images after the initial seed. Add
             # only the newly loaded attachments to the next LLM request; the
             # initial user message already contains any seed images.
-            new_rag_images = self.pipeline._attach_rag_images(
-                self.context, dispatch.sources
-            )
+            new_rag_images = self.pipeline._attach_rag_images(self.context, dispatch.sources)
             if new_rag_images:
                 messages = self.pipeline._prepare_messages_with_attachments(
                     messages,

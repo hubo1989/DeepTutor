@@ -185,9 +185,7 @@ def test_admin_default_quota_api_normalizes_and_persists(tmp_path, monkeypatch):
             "monthly_tokens": 20_000_000_000,
         }
     )
-    saved = asyncio.run(
-        multi_user_router.put_default_token_quota(payload, object())
-    )
+    saved = asyncio.run(multi_user_router.put_default_token_quota(payload, object()))
     assert saved["default_token_quota"] == {
         "daily_tokens": 0,
         "monthly_tokens": 10_000_000_000,

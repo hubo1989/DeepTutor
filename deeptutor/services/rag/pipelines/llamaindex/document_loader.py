@@ -180,7 +180,10 @@ class LlamaIndexDocumentLoader:
                     continue
             except OSError:
                 continue
-            if not resolved.is_file() or resolved.suffix.lower() not in FileTypeRouter.IMAGE_EXTENSIONS:
+            if (
+                not resolved.is_file()
+                or resolved.suffix.lower() not in FileTypeRouter.IMAGE_EXTENSIONS
+            ):
                 continue
 
             page_label = str(page_idx + 1)

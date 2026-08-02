@@ -276,9 +276,7 @@ def issue_challenge(email: str, password_hash: str, client_ip: str) -> Verificat
         # Keep the local anti-abuse ledger bounded even if an attacker rotates
         # through many addresses. Expired challenges and old limiter windows
         # are no longer useful for enforcement.
-        connection.execute(
-            "DELETE FROM pending_registrations WHERE expires_at <= ?", (now,)
-        )
+        connection.execute("DELETE FROM pending_registrations WHERE expires_at <= ?", (now,))
         connection.execute(
             "DELETE FROM verification_rate_limits WHERE last_sent_at <= ?",
             (now - 2 * _WINDOW_SECONDS,),
@@ -372,9 +370,7 @@ def consume_challenge(email: str, code: str) -> str | None:
             return None
 
         password_hash = str(row["password_hash"])
-        connection.execute(
-            "DELETE FROM pending_registrations WHERE email = ?", (canonical_email,)
-        )
+        connection.execute("DELETE FROM pending_registrations WHERE email = ?", (canonical_email,))
         connection.execute("COMMIT")
         return password_hash
     except Exception:
@@ -435,8 +431,9 @@ def send_verification_email(challenge: VerificationChallenge) -> None:
         "你的 DeepTutor 注册验证码是：{code}\n\n"
         "验证码 {minutes} 分钟内有效，最多可尝试 5 次。若不是你本人操作，请忽略此邮件。\n\n"
         "Your DeepTutor verification code is: {code}\n\n"
-        "It expires in {minutes} minutes. If you did not request this, you can ignore this email."
-        .format(code=challenge.code, minutes=remaining_minutes)
+        "It expires in {minutes} minutes. If you did not request this, you can ignore this email.".format(
+            code=challenge.code, minutes=remaining_minutes
+        )
     )
 
     try:

@@ -321,9 +321,7 @@ def decode_token(token: str) -> TokenPayload | None:
             return None
         # A disabled account or an account whose verification state was
         # revoked must lose access even if an older JWT has not expired.
-        if bool(record.get("disabled", False)) or not bool(
-            record.get("email_verified", True)
-        ):
+        if bool(record.get("disabled", False)) or not bool(record.get("email_verified", True)):
             return None
         role = str(record.get("role") or payload.get("role", "user"))
         user_id = str(record.get("id") or payload.get("uid") or "")
