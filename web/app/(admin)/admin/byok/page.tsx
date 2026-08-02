@@ -193,7 +193,7 @@ export default function AdminByokPage() {
 
   if (loading) {
     return (
-      <div className="flex min-h-screen items-center justify-center gap-2 text-sm text-[var(--muted-foreground)]">
+      <div className="flex min-h-dvh items-center justify-center gap-2 text-sm text-[var(--muted-foreground)]">
         <Loader2 className="animate-spin" size={18} />
         {copy.loading}
       </div>
@@ -202,7 +202,7 @@ export default function AdminByokPage() {
 
   if (!policy) {
     return (
-      <main className="flex min-h-screen items-center justify-center bg-[var(--background)] px-4 py-10">
+      <main className="flex min-h-dvh items-center justify-center bg-[var(--background)] px-4 py-10">
         <div className="max-w-md rounded-2xl border border-red-500/30 bg-red-500/10 p-5 text-sm text-red-700 dark:text-red-200">
           <p>{message || copy.loadFailed}</p>
           <button
@@ -218,7 +218,7 @@ export default function AdminByokPage() {
   }
 
   return (
-    <main className="min-h-screen bg-[var(--background)] px-4 py-10">
+    <main className="min-h-dvh bg-[var(--background)] px-3 py-6 lg:px-4 lg:py-10">
       <div className="mx-auto max-w-3xl">
         <Link
           href="/admin/users"
@@ -226,7 +226,7 @@ export default function AdminByokPage() {
         >
           <ArrowLeft size={16} /> {copy.back}
         </Link>
-        <div className="mb-6 flex items-start justify-between gap-4">
+        <div className="mb-6 flex flex-col items-stretch justify-between gap-4 lg:flex-row lg:items-start">
           <div className="flex items-start gap-3">
             <div className="rounded-xl bg-fuchsia-500/10 p-2.5 text-fuchsia-600 dark:text-fuchsia-400">
               <KeyRound size={20} />
@@ -244,7 +244,7 @@ export default function AdminByokPage() {
             type="button"
             onClick={() => void save()}
             disabled={saving}
-            className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--foreground)] px-3 py-2 text-xs font-medium text-[var(--background)] disabled:opacity-50"
+            className="inline-flex min-h-10 items-center justify-center gap-1.5 rounded-lg bg-[var(--foreground)] px-3 py-2 text-xs font-medium text-[var(--background)] disabled:opacity-50 lg:w-auto"
           >
             <Save size={14} /> {saving ? copy.saving : copy.save}
           </button>
@@ -255,7 +255,7 @@ export default function AdminByokPage() {
             {copy.authDisabled}
           </div>
         ) : null}
-        <div className="mb-4 grid gap-3 sm:grid-cols-2">
+        <div className="mb-4 grid gap-3 lg:grid-cols-2">
           <div
             className={`rounded-xl border px-4 py-3 text-sm ${
               vaultAvailable
@@ -268,7 +268,7 @@ export default function AdminByokPage() {
               {vaultAvailable ? copy.ready : copy.masterKeyMissing}
             </span>
           </div>
-          <label className="flex items-center justify-between rounded-xl border border-[var(--border)] bg-[var(--card)] px-4 py-3 text-sm text-[var(--foreground)]">
+          <label className="flex min-h-12 items-center justify-between rounded-xl border border-[var(--border)] bg-[var(--card)] px-4 py-3 text-sm text-[var(--foreground)]">
             <span>{copy.globalByok}</span>
             <input
               type="checkbox"
@@ -368,7 +368,7 @@ export default function AdminByokPage() {
           <p className="mb-4 text-xs text-[var(--muted-foreground)]">
             {copy.safetyHelp}
           </p>
-          <div className="grid gap-3 sm:grid-cols-3">
+          <div className="grid gap-3 lg:grid-cols-3">
             <label className="text-xs text-[var(--muted-foreground)]">
               {copy.requestsPerMinute}
               <input

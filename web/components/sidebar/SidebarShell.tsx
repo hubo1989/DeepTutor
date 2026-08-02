@@ -148,13 +148,13 @@ export function SidebarShell({
   const { t } = useTranslation();
   const { has } = useCapabilityAccess();
   const { sidebarCollapsed, setSidebarCollapsed: setCollapsed } = useAppShell();
-  const { isMobile } = useDevice();
+  const { isCompact } = useDevice();
   const drawer = useSidebarDrawer();
 
-  // Inside the mobile drawer the icon-only rail is pointless — the panel is
+  // Inside a compact drawer the icon-only rail is pointless — the panel is
   // already hidden when you don't want it, so it always opens fully expanded
   // regardless of the persisted desktop preference.
-  const collapsed = sidebarCollapsed && !isMobile;
+  const collapsed = sidebarCollapsed && !isCompact;
 
   /** Dismiss the drawer on nav clicks that actually navigate in-place. */
   const closeDrawerOnNav = (event: React.MouseEvent) => {
@@ -361,7 +361,7 @@ export function SidebarShell({
             top-bar toggle already own "make this go away". */}
         <button
           onClick={() => setCollapsed(true)}
-          className="rounded-md p-1 text-[var(--muted-foreground)] transition-colors hover:text-[var(--foreground)] max-md:hidden"
+          className="rounded-md p-1 text-[var(--muted-foreground)] transition-colors hover:text-[var(--foreground)] max-lg:hidden"
           aria-label={t("Collapse sidebar")}
         >
           <PanelLeftClose size={15} />

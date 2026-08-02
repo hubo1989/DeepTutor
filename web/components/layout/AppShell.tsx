@@ -5,6 +5,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useRef,
   useState,
 } from "react";
 import Image from "next/image";
@@ -36,22 +37,27 @@ interface AppShellProps {
  *
  * Two layouts, picked by width:
  *
- *   >= 768px  sidebar and content are siblings in a flex row — unchanged from
- *             what this app has always rendered.
- *   <  768px  the sidebar leaves the flow entirely and becomes an overlay
+ *   >= 1024px  sidebar and content are siblings in a flex row — unchanged from
+ *              what this app has always rendered.
+ *   <  1024px  the sidebar leaves the flow entirely and becomes an overlay
  *             drawer behind a scrim, with a compact top bar owning the toggle.
- *             A 220px fixed column against a 390px viewport leaves 170px of
- *             content, and the overflow is clipped rather than scrollable.
+ *             This keeps both phones and portrait tablets from sacrificing the
+ *             conversation column to a fixed 220px rail.
  *
- * The split is expressed in CSS (`max-md:` / `md:`), not in `useDevice()`, so
- * the very first server-rendered paint is already correct on a phone. JS only
- * owns the part that is stateful anyway: whether the drawer is open.
+ * The split is expressed in CSS (`max-lg:` / `lg:`), not in `useDevice()`, so
+ * the very first server-rendered paint is already correct on a narrow screen.
+ * JS owns stateful behaviour: whether the drawer is open and where keyboard
+ * focus should live while it is open.
  */
 export default function AppShell({ sidebar, children }: AppShellProps) {
   const { t } = useTranslation();
   const pathname = usePathname();
-  const { isMobile } = useDevice();
+  const { isCompact } = useDevice();
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const drawerRef = useRef<HTMLDivElement>(null);
+  const menuButtonRef = useRef<HTMLButtonElement>(null);
+  const wasDrawerOpenRef = useRef(false);
+  const restoreFocusRef = useRef<HTMLElement | null>(null);
 
   const close = useCallback(() => setDrawerOpen(false), []);
 
@@ -65,13 +71,62 @@ export default function AppShell({ sidebar, children }: AppShellProps) {
   }
 
   useEffect(() => {
-    if (!drawerOpen) return;
+    if (!isCompact || !drawerOpen) return;
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") setDrawerOpen(false);
+      if (event.key !== "Tab") return;
+
+      const focusable = drawerRef.current
+        ? Array.from(
+            drawerRef.current.querySelectorAll<HTMLElement>(
+              'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+            ),
+          ).filter((element) => !element.hasAttribute("aria-hidden"))
+        : [];
+      if (focusable.length === 0) return;
+
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [drawerOpen]);
+  }, [drawerOpen, isCompact]);
+
+  useEffect(() => {
+    if (!isCompact) {
+      if (wasDrawerOpenRef.current) {
+        wasDrawerOpenRef.current = false;
+        const resetFrame = requestAnimationFrame(() => setDrawerOpen(false));
+        return () => cancelAnimationFrame(resetFrame);
+      }
+      return;
+    }
+
+    if (drawerOpen && !wasDrawerOpenRef.current) {
+      const active = document.activeElement;
+      restoreFocusRef.current =
+        active instanceof HTMLElement ? active : menuButtonRef.current;
+      requestAnimationFrame(() => {
+        const first = drawerRef.current?.querySelector<HTMLElement>(
+          'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+        );
+        first?.focus();
+      });
+    } else if (!drawerOpen && wasDrawerOpenRef.current) {
+      requestAnimationFrame(() => {
+        (restoreFocusRef.current ?? menuButtonRef.current)?.focus();
+      });
+      restoreFocusRef.current = null;
+    }
+    wasDrawerOpenRef.current = drawerOpen;
+  }, [drawerOpen, isCompact]);
 
   return (
     <SidebarDrawerContext.Provider value={{ close }}>
@@ -82,26 +137,36 @@ export default function AppShell({ sidebar, children }: AppShellProps) {
           <div
             onClick={close}
             aria-hidden
-            className="fixed inset-0 z-40 bg-black/40 md:hidden"
+            className="fixed inset-0 z-40 bg-black/40 lg:hidden"
           />
         ) : null}
 
         {/* `inert` (not just translate-x) while closed: a drawer parked
             off-screen still holds ~20 focusable nav items, and without this
             Tab walks the user into a sidebar they cannot see. This is the
-            half `max-md:` cannot express, hence useDevice(). */}
+            half `max-lg:` cannot express, hence useDevice(). */}
         <div
-          inert={isMobile && !drawerOpen ? true : undefined}
-          className={`max-md:fixed max-md:inset-y-0 max-md:left-0 max-md:z-50 max-md:shadow-xl max-md:transition-transform max-md:duration-200 max-md:ease-out ${
-            drawerOpen ? "max-md:translate-x-0" : "max-md:-translate-x-full"
+          ref={drawerRef}
+          data-testid="responsive-sidebar-drawer"
+          role={isCompact ? "dialog" : undefined}
+          aria-modal={isCompact && drawerOpen ? true : undefined}
+          aria-label={isCompact ? t("Open navigation") : undefined}
+          inert={isCompact && !drawerOpen ? true : undefined}
+          className={`max-lg:fixed max-lg:inset-y-0 max-lg:left-0 max-lg:z-50 max-lg:shadow-xl max-lg:transition-transform max-lg:duration-200 max-lg:ease-out ${
+            drawerOpen ? "max-lg:translate-x-0" : "max-lg:-translate-x-full"
           }`}
         >
           {sidebar}
         </div>
 
-        <main className="flex min-w-0 flex-1 flex-col overflow-hidden bg-[var(--background)]">
-          <div className="flex h-11 shrink-0 items-center gap-1 border-b border-[var(--border)] px-2 md:hidden">
+        <main
+          inert={isCompact && drawerOpen ? true : undefined}
+          className="flex min-w-0 flex-1 flex-col overflow-hidden bg-[var(--background)]"
+        >
+          <div className="flex h-11 shrink-0 items-center gap-1 border-b border-[var(--border)] px-2 lg:hidden">
             <button
+              ref={menuButtonRef}
+              data-testid="mobile-nav-toggle"
               type="button"
               onClick={() => setDrawerOpen(true)}
               aria-label={t("Open navigation")}

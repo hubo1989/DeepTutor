@@ -466,7 +466,7 @@ export function GrantEditor({ userId }: { userId: string }) {
   if (loading && !resources) {
     return (
       <div className="border-t border-[var(--border)] bg-[var(--background)]/40 p-4">
-        <div className="flex h-[420px] items-center justify-center rounded-2xl border border-[var(--border)] bg-[var(--card)] text-sm text-[var(--muted-foreground)]">
+        <div className="flex h-[min(420px,calc(100dvh-6rem))] min-h-[280px] items-center justify-center rounded-2xl border border-[var(--border)] bg-[var(--card)] text-sm text-[var(--muted-foreground)]">
           <Loader2 className="mr-2 h-4 w-4 animate-spin" />
           Loading assignments...
         </div>
@@ -476,8 +476,8 @@ export function GrantEditor({ userId }: { userId: string }) {
 
   return (
     <div className="border-t border-[var(--border)] bg-[var(--background)]/40 p-4">
-      <div className="flex h-[620px] max-h-[calc(100vh-170px)] min-h-[420px] flex-col overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--card)] shadow-sm">
-        <div className="shrink-0 border-b border-[var(--border)] px-5 py-4">
+      <div className="flex h-[min(620px,calc(100dvh-6rem))] min-h-[360px] flex-col overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--card)] shadow-sm">
+        <div className="shrink-0 border-b border-[var(--border)] px-4 py-4 lg:px-5">
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div>
               <h2 className="text-sm font-semibold text-[var(--foreground)]">
@@ -511,8 +511,8 @@ export function GrantEditor({ userId }: { userId: string }) {
           </div>
         </div>
 
-        <div className="min-h-0 flex-1 overflow-y-auto px-5 py-5 [scrollbar-gutter:stable]">
-          <div className="grid gap-5 md:grid-cols-3">
+        <div className="min-h-0 flex-1 overflow-y-auto px-4 py-5 [scrollbar-gutter:stable] lg:px-5">
+          <div className="grid gap-5 lg:grid-cols-3">
             <section className="min-w-0">
               <SectionTitle>Models</SectionTitle>
               <div className="space-y-1.5 text-xs">
@@ -555,7 +555,7 @@ export function GrantEditor({ userId }: { userId: string }) {
                 profile. Platform permissions control administrator-provided
                 spend. Sandbox and tool permissions are unchanged.
               </p>
-              <div className="grid gap-2 sm:grid-cols-3">
+                  <div className="grid gap-2 lg:grid-cols-3">
                 {(["llm", "embedding", "mineru"] as const).map((service) => (
                   <div key={service} className="rounded-lg border border-[var(--border)]/60 p-2">
                     <p className="mb-2 text-xs font-medium text-[var(--foreground)]">{service === "mineru" ? "MinerU" : service === "embedding" ? "Embedding" : "LLM"}</p>
@@ -872,7 +872,7 @@ export function GrantEditor({ userId }: { userId: string }) {
           </div>
         </div>
 
-        <div className="flex shrink-0 items-center justify-between gap-3 border-t border-[var(--border)] bg-[var(--card)] px-5 py-3">
+        <div className="flex shrink-0 flex-col items-stretch justify-between gap-3 border-t border-[var(--border)] bg-[var(--card)] px-4 py-3 lg:flex-row lg:items-center lg:px-5">
           <div
             aria-live="polite"
             className={`flex min-w-0 items-center gap-1.5 text-xs ${statusTone}`}
@@ -887,7 +887,7 @@ export function GrantEditor({ userId }: { userId: string }) {
           <button
             onClick={save}
             disabled={controlsDisabled || !dirty}
-            className="inline-flex shrink-0 items-center gap-1.5 rounded-lg bg-[var(--foreground)] px-3 py-1.5 text-xs font-medium text-[var(--background)] transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-45"
+            className="inline-flex min-h-10 w-full shrink-0 items-center justify-center gap-1.5 rounded-lg bg-[var(--foreground)] px-3 py-1.5 text-xs font-medium text-[var(--background)] transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-45 lg:w-auto"
           >
             {saving ? (
               <Loader2 className="h-3 w-3 animate-spin" />

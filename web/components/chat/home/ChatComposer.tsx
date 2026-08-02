@@ -654,7 +654,7 @@ export default memo(function ChatComposer({
   return (
     <div
       ref={composerRef}
-      className={`relative z-20 mx-auto w-full shrink-0 px-6 pb-5 ${hasMessages ? "pt-1 max-w-[960px]" : "max-w-[768px]"}`}
+      className={`relative z-20 mx-auto w-full shrink-0 px-3 pb-[calc(0.75rem+env(safe-area-inset-bottom))] lg:px-6 lg:pb-5 ${hasMessages ? "pt-1 max-w-[960px]" : "max-w-[768px]"}`}
       style={{
         transition: "max-width 650ms cubic-bezier(0.16, 1, 0.3, 1)",
       }}
@@ -770,7 +770,7 @@ export default memo(function ChatComposer({
                         type="button"
                         onClick={() => onPreviewAttachment?.(i)}
                         aria-label={previewLabel}
-                        className="relative block h-16 w-16 overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--card)] transition-shadow hover:shadow-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--primary)]/40"
+                  className="relative block h-16 w-16 overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--card)] transition-shadow hover:shadow-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--primary)]/40"
                       >
                         {/* Native <img> is safe for SVG: scripts inside an
                             SVG don't execute under <img> context. Next.js
@@ -789,7 +789,7 @@ export default memo(function ChatComposer({
                           onRemoveAttachment(i);
                         }}
                         aria-label={removeLabel}
-                        className="absolute -right-1.5 -top-1.5 flex h-4 w-4 items-center justify-center rounded-full bg-[var(--foreground)] text-[var(--background)] opacity-0 shadow-sm transition-opacity group-hover:opacity-100"
+                        className="absolute -right-1.5 -top-1.5 flex h-5 w-5 items-center justify-center rounded-full bg-[var(--foreground)] text-[var(--background)] opacity-100 shadow-sm transition-opacity lg:h-4 lg:w-4 lg:opacity-0 lg:group-hover:opacity-100"
                       >
                         <X size={10} />
                       </button>
@@ -836,7 +836,7 @@ export default memo(function ChatComposer({
                         onRemoveAttachment(i);
                       }}
                       aria-label={removeLabel}
-                      className="absolute -right-1.5 -top-1.5 flex h-4 w-4 items-center justify-center rounded-full bg-[var(--foreground)] text-[var(--background)] opacity-0 shadow-sm transition-opacity group-hover:opacity-100"
+                      className="absolute -right-1.5 -top-1.5 flex h-5 w-5 items-center justify-center rounded-full bg-[var(--foreground)] text-[var(--background)] opacity-100 shadow-sm transition-opacity lg:h-4 lg:w-4 lg:opacity-0 lg:group-hover:opacity-100"
                     >
                       <X size={10} />
                     </button>
@@ -861,7 +861,7 @@ export default memo(function ChatComposer({
                 <button
                   ref={capBtnRef}
                   onClick={() => onSetCapMenuOpen((v) => !v)}
-                  className={`inline-flex h-8 shrink-0 items-center gap-1.5 rounded-lg px-2 text-[14px] font-medium transition-[background-color,color,transform] duration-150 active:scale-[0.97] ${
+                  className={`inline-flex h-10 shrink-0 items-center gap-1.5 rounded-lg px-2 text-[14px] font-medium transition-[background-color,color,transform] duration-150 active:scale-[0.97] lg:h-8 ${
                     capMenuOpen
                       ? "bg-[var(--primary)]/10 text-[var(--primary)]"
                       : "text-[var(--foreground)] hover:bg-[var(--muted)]/55"
@@ -988,7 +988,7 @@ export default memo(function ChatComposer({
                   onClick={() => onSetSpaceMenuOpen((v) => !v)}
                   title={t("Add files & context")}
                   aria-label={t("Add files & context")}
-                  className={`relative flex h-8 w-8 shrink-0 items-center justify-center rounded-lg transition-[background-color,color,transform] duration-150 active:scale-90 ${
+                  className={`relative flex h-10 w-10 shrink-0 items-center justify-center rounded-lg transition-[background-color,color,transform] duration-150 active:scale-90 lg:h-8 lg:w-8 ${
                     spaceMenuOpen
                       ? "bg-[var(--muted)] text-[var(--foreground)]"
                       : "text-[var(--muted-foreground)] hover:bg-[var(--muted)]/55 hover:text-[var(--foreground)]"
@@ -1079,7 +1079,7 @@ export default memo(function ChatComposer({
                   type="button"
                   onClick={recorder.toggle}
                   disabled={recorder.state === "transcribing" || isStreaming}
-                  className={`group relative inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-[10px] transition-[background-color,color,transform] duration-150 active:scale-90 disabled:opacity-40 ${
+                  className={`group relative inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-[10px] transition-[background-color,color,transform] duration-150 active:scale-90 disabled:opacity-40 lg:h-8 lg:w-8 ${
                     recorder.state === "recording"
                       ? "bg-red-500/15 text-red-500"
                       : "text-[var(--muted-foreground)] hover:bg-[var(--muted)]/55 hover:text-[var(--foreground)]"
@@ -1121,7 +1121,7 @@ export default memo(function ChatComposer({
                   type="button"
                   onClick={handleSendButtonClick}
                   disabled={sendState === "idle"}
-                  className={`group relative ml-1 inline-grid h-8 w-8 shrink-0 place-items-center rounded-full transition-[background-color,box-shadow,transform] duration-200 active:scale-95 ${SEND_STATE_CLASS[sendState]}`}
+                  className={`group relative ml-1 inline-grid h-10 w-10 shrink-0 place-items-center rounded-full transition-[background-color,box-shadow,transform] duration-200 active:scale-95 lg:h-8 lg:w-8 ${SEND_STATE_CLASS[sendState]}`}
                   aria-label={sendLabel}
                   title={sendTitle}
                 >

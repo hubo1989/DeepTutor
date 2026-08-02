@@ -38,6 +38,13 @@ export interface DeviceState {
   isCompact: boolean;
 }
 
+/** Keep the viewport policy testable without a browser or a MediaQueryList. */
+export function classifyDeviceWidth(width: number): DeviceClass {
+  if (width < DEVICE_BREAKPOINTS.tablet) return "mobile";
+  if (width < DEVICE_BREAKPOINTS.desktop) return "tablet";
+  return "desktop";
+}
+
 const MOBILE_QUERY = `(max-width: ${DEVICE_BREAKPOINTS.tablet - 1}px)`;
 const DESKTOP_QUERY = `(min-width: ${DEVICE_BREAKPOINTS.desktop}px)`;
 
