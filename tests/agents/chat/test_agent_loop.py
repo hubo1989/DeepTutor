@@ -1013,3 +1013,61 @@ def test_build_llm_tool_schemas_kb_name_enum_matches_attached() -> None:
     )
 
     assert schemas[0]["function"]["parameters"]["additionalProperties"] is False
+
+
+@pytest.mark.asyncio
+async def test_forced_finish_reasoning_only_recovers_via_targeted_nudge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When _forced_finish is reached (budget exhausted or mid-loop error) and
+    the salvage call writes only to the reasoning channel (empty content), the
+    loop must reuse the reasoning-only nudge and retry once instead of degrading
+    to the generic 'could not produce a useful response' fallback.
+
+    Mirrors the main-loop recovery (test_reasoning_only_finish_...) but on the
+    forced-finish path, which has its own salvage call."""
+    registry = _Registry()
+    client = _ScriptedChatClient(
+        [
+            # Round 1: a tool call so the loop does real work first (otherwise
+            # _forced_finish isn't reached — a first-round failure propagates).
+            [
+                _llm_chunk(
+                    tool_calls=[
+                        {
+                            "id": "call-1",
+                            "name": "web_search",
+                            "arguments": json.dumps({"query": "q"}),
+                        }
+                    ]
+                )
+            ],
+            # Round 2: budget-exhausted forced-finish call — reasoning only,
+            # content channel empty (the GLM trap).
+            [_llm_chunk(reasoning_content="drafting the final answer...")],
+            # Round 3 (after the targeted nudge): real content.
+            [_llm_chunk(content="Here is the salvaged answer.")],
+        ]
+    )
+    pipeline = AgenticChatPipeline(language="en")
+    pipeline.registry = registry
+    # Force the loop budget to 1 round so round 2 is the forced finish.
+    monkeypatch.setattr(pipeline, "effective_max_rounds", lambda _ctx: 1)
+    monkeypatch.setattr(pipeline, "_compose_enabled_tools", lambda _context: ["web_search"])
+    monkeypatch.setattr(pipeline, "_build_openai_client", lambda: client)
+
+    events = await _run(
+        pipeline,
+        UnifiedContext(session_id="s1", user_message="Look up", enabled_tools=["web_search"]),
+    )
+
+    # 1 tool round + 1 forced-finish (reasoning-only) + 1 nudge retry = 3 calls.
+    assert client.call_count == 3
+    # The nudge sent on the forced-finish path is the reasoning-channel one.
+    retry_messages = client.calls[2]["messages"]
+    assert retry_messages[-1]["role"] == "user"
+    assert "reasoning channel" in retry_messages[-1]["content"]
+    # The retry's content becomes the answer, not the fallback banner.
+    result = _result(events)
+    assert result.metadata["response"] == "Here is the salvaged answer."
+    assert result.metadata["completed"] is True
