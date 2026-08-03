@@ -61,6 +61,10 @@ loop:
   finish_empty_nudge: |-
     你上一轮只输出了内部推理——既没有调用工具，也没有写出面向用户的回答。
     现在继续：要么调用工具执行你计划好的步骤，要么直接写出最终回答。
+  finish_empty_nudge_reasoning_channel: |-
+    你上一轮的回复只出现在了推理（reasoning）通道里——正文（content）通道为空，
+    用户什么也没收到。现在请直接在正文通道写出最终的、面向用户的回答，
+    不要调用任何工具，也不要重复刚才的推理过程。
 
 knowledge_base_seed:
   header: |-

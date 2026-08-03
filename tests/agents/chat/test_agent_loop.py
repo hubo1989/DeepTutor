@@ -35,6 +35,7 @@ def _llm_chunk(
     tool_calls: list[dict[str, Any]] | None = None,
     usage: Any = None,
     finish_reason: str | None = None,
+    reasoning_content: str | None = None,
 ) -> SimpleNamespace:
     delta_fields: dict[str, Any] = {"content": content}
     if tool_calls is not None:
@@ -51,6 +52,11 @@ def _llm_chunk(
         ]
     else:
         delta_fields["tool_calls"] = None
+    # Reasoning models (GLM / DeepSeek-R1 / QwQ) route their chain-of-thought
+    # to a separate ``reasoning_content`` channel. Populated only when set so
+    # the delta mirrors what those providers actually emit.
+    if reasoning_content is not None:
+        delta_fields["reasoning_content"] = reasoning_content
     return SimpleNamespace(
         choices=[
             SimpleNamespace(
@@ -357,6 +363,44 @@ async def test_empty_finish_gets_one_nudge_then_recovers(
     )
     result = _result(events)
     assert result.metadata["response"] == "Here is the real answer."
+    assert result.metadata["completed"] is True
+
+
+@pytest.mark.asyncio
+async def test_reasoning_only_finish_uses_targeted_nudge_then_recovers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reasoning model (GLM-5.2 / DeepSeek-R1 / QwQ) that writes its whole
+    reply to the ``reasoning_content`` channel — leaving ``content`` empty —
+    must be nudged with the channel-specific instruction, not the generic one,
+    so the model moves its output into the content channel on the retry."""
+    registry = _Registry()
+    client = _ScriptedChatClient(
+        [
+            # Round 1: GLM thinks in reasoning_content but emits no content
+            # and no tool call — the "empty_final_response" trap.
+            [_llm_chunk(reasoning_content="Let me design the next quiz question...")],
+            # Round 2 (after the targeted nudge): a real answer in content.
+            [_llm_chunk(content="Here is your next question: what is 12 × 15?")],
+        ]
+    )
+    pipeline = AgenticChatPipeline(language="en")
+    pipeline.registry = registry
+    monkeypatch.setattr(pipeline, "_compose_enabled_tools", lambda _context: [])
+    monkeypatch.setattr(pipeline, "_build_openai_client", lambda: client)
+
+    events = await _run(pipeline, UnifiedContext(session_id="s1", user_message="Next question"))
+
+    assert client.call_count == 2
+    # The nudge must be the reasoning-channel-specific one, naming the empty
+    # content channel explicitly so GLM knows where to write its answer.
+    nudge_message = client.calls[1]["messages"][-1]
+    assert nudge_message["role"] == "user"
+    assert "reasoning channel" in nudge_message["content"]
+    assert "content channel" in nudge_message["content"]
+    # And the recovery round's content becomes the answer (not the fallback).
+    result = _result(events)
+    assert result.metadata["response"] == "Here is your next question: what is 12 × 15?"
     assert result.metadata["completed"] is True
 
 

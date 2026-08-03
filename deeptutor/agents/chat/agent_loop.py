@@ -132,6 +132,11 @@ class LLMCallResult:
     text: str
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     finish_reason: str = ""
+    # Reasoning-model output routed to the ``reasoning_content`` channel
+    # (GLM / DeepSeek-R1 / QwQ ...). Tracked so a finish round that produced
+    # *only* reasoning (empty ``content``) can be recovered instead of
+    # degrading to the generic "could not produce a useful response" banner.
+    reasoning_text: str = ""
 
 
 @dataclass(slots=True)
@@ -274,11 +279,19 @@ class AgentLoop:
             if not result.tool_calls:
                 final_text = self._clean(result.text)
                 if not final_text and not nudged_empty_finish:
-                    # The round produced only internal reasoning (e.g. the
-                    # whole reply inside <think>) — the model planned but
-                    # never acted. Keep its raw text in-conversation (the
-                    # plan/script lives there) and nudge it once to act
-                    # instead of falling back to an empty answer.
+                    # The round produced no user-facing text. Two shapes:
+                    #  (a) inline <think> only — the model planned but never
+                    #      acted; or
+                    #  (b) a reasoning model (GLM / DeepSeek-R1 / QwQ) that
+                    #      wrote its whole reply to the ``reasoning_content``
+                    #      channel and left ``content`` empty.
+                    # Both look identical to the rest of the loop (empty text,
+                    # no tool calls). Nudge once with a targeted instruction:
+                    # case (b) needs to be told explicitly to move its output
+                    # into the content channel, not just "continue".
+                    reasoning_only = (
+                        not result.text.strip() and bool(result.reasoning_text.strip())
+                    )
                     nudged_empty_finish = True
                     await self.stream.progress(
                         self.pipeline._t(
@@ -298,13 +311,27 @@ class AgentLoop:
                         {
                             "role": "user",
                             "content": self.pipeline._t(
-                                "loop.finish_empty_nudge",
+                                "loop.finish_empty_nudge_reasoning_channel"
+                                if reasoning_only
+                                else "loop.finish_empty_nudge",
                                 default=(
-                                    "Your previous round produced only internal "
-                                    "reasoning — no tool call and no user-facing "
-                                    "answer. Continue now: either call the tools "
-                                    "to execute your plan, or write the final "
-                                    "user-facing answer directly."
+                                    # Targeted at reasoning models: their
+                                    # conclusion landed in the thinking channel
+                                    # and the content channel stayed empty.
+                                    "Your previous reply arrived only in the "
+                                    "reasoning channel — the content channel "
+                                    "was empty, so nothing reached the user. "
+                                    "Write your final user-facing answer now in "
+                                    "the content channel, without any tool call. "
+                                    "Do not repeat the reasoning."
+                                    if reasoning_only
+                                    else (
+                                        "Your previous round produced only internal "
+                                        "reasoning — no tool call and no user-facing "
+                                        "answer. Continue now: either call the tools "
+                                        "to execute your plan, or write the final "
+                                        "user-facing answer directly."
+                                    )
                                 ),
                             ),
                         }
@@ -508,6 +535,7 @@ class AgentLoop:
         # after the stream via ``record_streamed_usage``.
         usage_seen: Any = None
         text_parts: list[str] = []
+        reasoning_parts: list[str] = []
         tool_acc: dict[int, dict[str, str]] = {}
         output_chars = 0
         finish_reason = ""
@@ -553,6 +581,7 @@ class AgentLoop:
                 )
                 if reasoning_text:
                     output_chars += len(reasoning_text)
+                    reasoning_parts.append(reasoning_text)
                     await self.stream.thinking(
                         reasoning_text, source="chat", stage=stage, metadata=chunk_meta
                     )
@@ -644,7 +673,12 @@ class AgentLoop:
                 },
             ),
         )
-        return LLMCallResult(text=text, tool_calls=tool_calls, finish_reason=finish_reason)
+        return LLMCallResult(
+            text=text,
+            tool_calls=tool_calls,
+            finish_reason=finish_reason,
+            reasoning_text="".join(reasoning_parts),
+        )
 
     async def _create_response_stream(
         self,

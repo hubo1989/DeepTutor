@@ -88,6 +88,11 @@ loop:
     Your previous round produced only internal reasoning — no tool call and
     no user-facing answer. Continue now: either call the tools to execute
     your plan, or write the final user-facing answer directly.
+  finish_empty_nudge_reasoning_channel: |-
+    Your previous reply arrived only in the reasoning channel — the content
+    channel was empty, so nothing reached the user. Write your final
+    user-facing answer now in the content channel, without any tool call.
+    Do not repeat the reasoning.
 
 knowledge_base_seed:
   header: |-
