@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
   ArrowLeft,
@@ -8,6 +8,7 @@ import {
   FileText,
   Layers,
   Loader2,
+  Lock,
   RefreshCw,
   Settings as SettingsIcon,
   Star,
@@ -16,6 +17,7 @@ import {
 import type { KnowledgeUploadPolicy } from "@/lib/knowledge-api";
 import {
   formatKnowledgeTimestamp,
+  isConnectedKb,
   resolveKbStatus,
   type KnowledgeBase,
 } from "@/lib/knowledge-helpers";
@@ -76,6 +78,21 @@ export default function KnowledgeBaseDetail({
   const [section, setSection] = useState<DetailSection>("files");
   const [retrySubmitting, setRetrySubmitting] = useState(false);
 
+  // Connected KBs (obsidian / linked / subagent / lightrag_server / ima) are
+  // read-only pointers: their index lives elsewhere, so "Add documents" and
+  // "Index versions" tabs and retry/reindex actions don't apply. Computed
+  // before the early return so the effect below respects the rules of hooks.
+  const connected = kb ? isConnectedKb(kb) : false;
+  // A connected KB only exposes Files and Settings. If the user was on the
+  // "add" or "versions" tab of an ordinary KB and then opens a connected one
+  // (or the KB's type changes after a refresh), fall back to Files so the body
+  // never renders a tab that isn't in the nav.
+  useEffect(() => {
+    if (connected && (section === "add" || section === "versions")) {
+      setSection("files");
+    }
+  }, [connected, section]);
+
   if (!kb) {
     return (
       <main className="flex flex-1 items-center justify-center bg-[var(--background)] p-6">
@@ -118,7 +135,7 @@ export default function KnowledgeBaseDetail({
     (task?.kind === "reindex" || task?.kind === "retry") &&
     task.executing === true;
   const status = resolveKbStatus(kb);
-  const canRetry = status === "error" && !kb.read_only;
+  const canRetry = status === "error" && !kb.read_only && !connected;
 
   const handleRetry = async () => {
     if (!canRetry || retrySubmitting || isReindexingLocally) return;
@@ -159,8 +176,19 @@ export default function KnowledgeBaseDetail({
                 </span>
               )}
               {kb.assigned && (
-                <span className="inline-flex items-center rounded-full bg-emerald-500/10 px-2 py-0.5 text-[10px] font-medium text-emerald-700 dark:text-emerald-300">
+                <span className="inline-flex items-center rounded-full bg-emerald-500/10 px-2 py-0.5 text-[10px] font-medium text-emerald-700 dark:bg-emerald-300/10 dark:text-emerald-300">
                   {kb.provenance_label || t("Assigned by admin")}
+                </span>
+              )}
+              {connected && (
+                <span
+                  className="inline-flex items-center gap-1 rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-medium text-slate-600 dark:bg-slate-800/50 dark:text-slate-300"
+                  title={t(
+                    "This knowledge base is read-only. Documents are managed in its connected source; DeepTutor only searches it.",
+                  )}
+                >
+                  <Lock className="h-3 w-3" />
+                  {t("Read-only")}
                 </span>
               )}
               <KbStatusBadge
@@ -198,26 +226,35 @@ export default function KnowledgeBaseDetail({
         </div>
 
         {/* Section nav */}
-        <nav className="-mb-3 mt-3 flex gap-1 overflow-x-auto">
-          {SECTIONS.map(({ key, label, Icon }) => {
-            const active = section === key;
-            return (
-              <button
-                key={key}
-                type="button"
-                onClick={() => setSection(key)}
-                className={`inline-flex shrink-0 items-center gap-1.5 rounded-t-md px-3 py-2 text-[12.5px] font-medium transition-colors ${
-                  active
-                    ? "border-b-2 border-[var(--primary)] text-[var(--foreground)]"
-                    : "border-b-2 border-transparent text-[var(--muted-foreground)] hover:text-[var(--foreground)]"
-                }`}
-              >
-                <Icon size={13} />
-                {t(label)}
-              </button>
-            );
-          })}
-        </nav>
+        {/* Connected KBs have no local index, so "Add documents" and
+            "Index versions" don't apply — only Files and Settings are shown. */}
+        {(() => {
+          const visibleSections = connected
+            ? SECTIONS.filter((s) => s.key === "files" || s.key === "settings")
+            : SECTIONS;
+          return (
+            <nav className="-mb-3 mt-3 flex gap-1 overflow-x-auto">
+              {visibleSections.map(({ key, label, Icon }) => {
+                const active = section === key;
+                return (
+                  <button
+                    key={key}
+                    type="button"
+                    onClick={() => setSection(key)}
+                    className={`inline-flex shrink-0 items-center gap-1.5 rounded-t-md px-3 py-2 text-[12.5px] font-medium transition-colors ${
+                      active
+                        ? "border-b-2 border-[var(--primary)] text-[var(--foreground)]"
+                        : "border-b-2 border-transparent text-[var(--muted-foreground)] hover:text-[var(--foreground)]"
+                    }`}
+                  >
+                    <Icon size={13} />
+                    {t(label)}
+                  </button>
+                );
+              })}
+            </nav>
+          );
+        })()}
       </div>
 
       {/* Body */}
