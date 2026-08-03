@@ -524,45 +524,48 @@ export interface KnowledgeTaskResponse {
  * Extract a human-readable error message from a non-OK ``Response``.
  *
  * Always includes the HTTP status. If the body is JSON with a ``detail``
- * field (the FastAPI convention), that wins. Otherwise — notably when the
- * body is HTML (a reverse-proxy 502 page, a crashed worker, or a login
- * redirect) — we note that JSON was expected so the banner never shows the
- * cryptic raw ``Unexpected token '<'`` parse error.
- */
-/**
- * Extract a human-readable error message from a non-OK ``Response``.
+ * field (the FastAPI convention), that wins and is returned verbatim so
+ * callers can pattern-match on it (e.g. :func:`withDockerUpgradeHint`).
+ * Otherwise — notably when the body is HTML (a reverse-proxy 502 page, a
+ * crashed worker, or a login redirect) — we note that JSON was expected so
+ * the banner never shows the cryptic raw ``Unexpected token '<'`` parse
+ * error.
  *
- * If the body is JSON with a ``detail`` field (the FastAPI convention), that
- * wins and is returned verbatim so callers can pattern-match on it (e.g.
- * :func:`withDockerUpgradeHint`). Otherwise — notably when the body is HTML
- * (a reverse-proxy 502 page, a crashed worker, or a login redirect) — we
- * build a message from the fallback label plus the HTTP status, noting that
- * JSON was expected, so the banner never shows the cryptic raw
- * ``Unexpected token '<'`` parse error.
+ * The body is read once as text and JSON-parsed from that, because calling
+ * ``res.json()`` then ``res.text()`` would drain the stream twice.
  */
 async function readErrorDetail(
   res: Response,
   fallback: string,
 ): Promise<string> {
+  const withStatus = `${fallback} (HTTP ${res.status})`;
+  // Read the body once as text. Calling res.json() then res.text() would
+  // consume the stream twice: once res.json() throws, the body is already
+  // drained and res.text() returns "" — so the HTML/empty-body branch below
+  // never fired. Reading text first lets us try JSON parsing without losing
+  // the raw body for the HTML / truncation fallbacks.
+  let raw = "";
   try {
-    const body = await res.json();
-    if (body?.detail) return String(body.detail);
-    return `${fallback} (HTTP ${res.status})`;
+    raw = (await res.text()).trim();
   } catch {
-    // Body wasn't JSON. Peek at the text to tell the user what happened
-    // (HTML error page, empty body, etc.) instead of surfacing the JSON
-    // parse exception verbatim.
-    const withStatus = `${fallback} (HTTP ${res.status})`;
-    try {
-      const text = (await res.text()).trim();
-      if (!text) return withStatus;
-      const looksLikeHtml = /^<\w/.test(text) || /<!doctype/i.test(text);
-      return looksLikeHtml
-        ? `${withStatus} — server returned HTML instead of JSON`
-        : `${withStatus} — ${text.length > 120 ? `${text.slice(0, 120)}…` : text}`;
-    } catch {
-      return withStatus;
-    }
+    return withStatus;
+  }
+  if (!raw) return withStatus;
+
+  // Try JSON first (FastAPI's {detail: "..."} convention); preserve detail
+  // verbatim so callers can pattern-match on it (e.g. withDockerUpgradeHint).
+  try {
+    const body = JSON.parse(raw);
+    if (body?.detail) return String(body.detail);
+    return withStatus;
+  } catch {
+    // Not JSON — usually an HTML error page from a reverse proxy or a
+    // crashed worker. Surface that JSON was expected instead of the raw
+    // "Unexpected token '<'" parse exception.
+    const looksLikeHtml = /^<\w/.test(raw) || /<!doctype/i.test(raw);
+    return looksLikeHtml
+      ? `${withStatus} — server returned HTML instead of JSON`
+      : `${withStatus} — ${raw.length > 120 ? `${raw.slice(0, 120)}…` : raw}`;
   }
 }
 
