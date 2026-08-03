@@ -496,9 +496,7 @@ def test_auth_settings_persist_and_normalize_default_token_quota(tmp_path: Path)
 
     # A malformed value falls back to the configured default for that period,
     # rather than silently becoming unlimited.
-    saved = service.save_auth(
-        {"default_token_quota": {"daily_tokens": "not-a-number"}}
-    )
+    saved = service.save_auth({"default_token_quota": {"daily_tokens": "not-a-number"}})
     assert saved["default_quota"]["llm"] == {
         "daily_tokens": 100_000,
         "monthly_tokens": 1_000_000,

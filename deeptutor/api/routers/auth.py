@@ -1,7 +1,7 @@
 """Auth router — login, logout, status, registration, profile, and user-management endpoints."""
 
-from contextvars import Token as _CtxToken
 import asyncio
+from contextvars import Token as _CtxToken
 import logging
 import re
 
@@ -32,6 +32,7 @@ _SAMESITE = "none" if _SECURE else "lax"
 
 from deeptutor.multi_user.context import set_current_user, user_from_token_payload
 from deeptutor.multi_user.paths import local_admin_user
+from deeptutor.services import email_verification
 from deeptutor.services.auth import (
     AUTH_ENABLED,
     POCKETBASE_ENABLED,
@@ -53,7 +54,6 @@ from deeptutor.services.auth import (
 )
 from deeptutor.services.codex_auth.contracts import CodexAuthError
 from deeptutor.services.codex_auth.service import deliver_codex_oauth_callback
-from deeptutor.services import email_verification
 
 logger = logging.getLogger(__name__)
 
@@ -166,6 +166,7 @@ class VerifyRegistrationRequest(BaseModel):
         if not re.fullmatch(r"\d{6}", v):
             raise ValueError("Verification code must be 6 digits")
         return v
+
 
 class SetRoleRequest(BaseModel):
     """Payload for the PUT /users/{username}/role endpoint."""

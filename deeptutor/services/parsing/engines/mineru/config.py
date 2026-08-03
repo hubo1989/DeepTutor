@@ -109,7 +109,11 @@ def resolve_mineru_config() -> MinerUConfig:
         if resolved_source.is_byok:
             profile, secret = vault.load_secret(user.id, str(resolved_source.profile_id))
             provider = str(profile.get("provider") or "mineru").strip().lower()
-            if provider != "mineru" or not byok_runtime_enabled("mineru") or not allowed_binding("mineru", provider):
+            if (
+                provider != "mineru"
+                or not byok_runtime_enabled("mineru")
+                or not allowed_binding("mineru", provider)
+            ):
                 raise MinerUError("MinerU BYOK is not enabled for this provider")
             endpoint = str(profile.get("base_url") or "https://mineru.net").strip().rstrip("/")
             try:

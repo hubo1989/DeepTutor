@@ -30,9 +30,7 @@ def verification_store(tmp_path, monkeypatch):
 
 
 def test_code_is_hashed_and_is_one_time(verification_store) -> None:
-    challenge = email_verification.issue_challenge(
-        "User@example.com", "$2b$12$hash", "127.0.0.1"
-    )
+    challenge = email_verification.issue_challenge("User@example.com", "$2b$12$hash", "127.0.0.1")
 
     db = verification_store / "email_verification.sqlite3"
     with sqlite3.connect(db) as connection:

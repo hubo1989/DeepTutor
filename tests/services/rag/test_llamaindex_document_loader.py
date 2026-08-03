@@ -168,7 +168,9 @@ def test_loader_keeps_page_image_paths_in_text_document_metadata(
     async def _skip_image_nodes(self, _sources):
         return []
 
-    monkeypatch.setattr(loader_module.LlamaIndexDocumentLoader, "_load_image_nodes", _skip_image_nodes)
+    monkeypatch.setattr(
+        loader_module.LlamaIndexDocumentLoader, "_load_image_nodes", _skip_image_nodes
+    )
     documents = asyncio.run(loader_module.LlamaIndexDocumentLoader().load([str(pdf_path)]))
 
     assert len(documents) == 1

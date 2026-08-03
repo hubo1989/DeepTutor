@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import pytest
 from fastapi import HTTPException, Response
+import pytest
 
 from deeptutor.api.routers import auth as auth_router
 from deeptutor.services import email_verification
@@ -57,9 +57,7 @@ def auth_registration_env(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_registration_requires_code_and_then_auto_logs_in(auth_registration_env) -> None:
     system_root, sent_challenges = auth_registration_env
-    body = auth_router.EmailRegistrationRequest(
-        email="User@Example.com", password="password1234"
-    )
+    body = auth_router.EmailRegistrationRequest(email="User@Example.com", password="password1234")
     result = await auth_router.request_registration_code(body, _request())
     assert result["ok"] is True
 
@@ -83,9 +81,7 @@ async def test_registration_requires_code_and_then_auto_logs_in(auth_registratio
     challenge = sent_challenges[0]
     response = Response()
     registered = await auth_router.register(
-        auth_router.VerifyRegistrationRequest(
-            email="user@example.com", code=challenge.code
-        ),
+        auth_router.VerifyRegistrationRequest(email="user@example.com", code=challenge.code),
         response,
     )
     assert registered["ok"] is True
@@ -94,16 +90,16 @@ async def test_registration_requires_code_and_then_auto_logs_in(auth_registratio
 
     with pytest.raises(HTTPException) as replay:
         await auth_router.register(
-            auth_router.VerifyRegistrationRequest(
-                email="user@example.com", code=challenge.code
-            ),
+            auth_router.VerifyRegistrationRequest(email="user@example.com", code=challenge.code),
             Response(),
         )
     assert replay.value.status_code == 400
 
 
 @pytest.mark.asyncio
-async def test_registration_request_does_not_send_for_existing_account(auth_registration_env) -> None:
+async def test_registration_request_does_not_send_for_existing_account(
+    auth_registration_env,
+) -> None:
     _, sent_challenges = auth_registration_env
     from deeptutor.services.auth import add_user
 

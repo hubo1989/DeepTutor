@@ -362,7 +362,7 @@ export default function AdminUsersPage() {
   const filteredUsers = filterUsersByQuery(users, query);
 
   return (
-    <div className="h-screen overflow-y-auto bg-[var(--background)] px-4 py-10 [scrollbar-gutter:stable]">
+    <div className="min-h-dvh overflow-y-auto bg-[var(--background)] px-3 py-6 lg:px-4 lg:py-10 [scrollbar-gutter:stable]">
       <div className="mx-auto max-w-3xl">
         {/* Header */}
         <div className="mb-8">
@@ -373,7 +373,7 @@ export default function AdminUsersPage() {
             <ArrowLeft size={16} />
             {t("Back")}
           </Link>
-          <div className="flex items-start justify-between gap-4">
+          <div className="flex flex-col items-stretch justify-between gap-4 lg:flex-row lg:items-start">
             <div>
               <h1 className="font-serif text-xl font-semibold text-[var(--foreground)]">
                 {t("User Management")}
@@ -382,17 +382,17 @@ export default function AdminUsersPage() {
                 {t("Manage registered accounts")}
               </p>
             </div>
-            <div className="flex shrink-0 items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
               <Link
                 href="/admin/byok"
-                className="flex items-center gap-1.5 rounded-lg border border-[var(--border)] px-3 py-1.5 text-sm text-[var(--muted-foreground)] transition-colors hover:bg-[var(--card)] hover:text-[var(--foreground)]"
+                className="flex min-h-10 items-center gap-1.5 rounded-lg border border-[var(--border)] px-3 py-1.5 text-sm text-[var(--muted-foreground)] transition-colors hover:bg-[var(--card)] hover:text-[var(--foreground)]"
               >
                 <KeyRound size={14} />
                 BYOK
               </Link>
               <button
                 onClick={openCreateDialog}
-                className="flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm
+                className="flex min-h-10 items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm
                            border border-[var(--border)] text-[var(--foreground)]
                            hover:bg-[var(--card)] transition-colors"
               >
@@ -402,7 +402,7 @@ export default function AdminUsersPage() {
               <button
                 onClick={load}
                 disabled={loading}
-                className="flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm
+                className="flex min-h-10 items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm
                            border border-[var(--border)] text-[var(--muted-foreground)]
                            hover:text-[var(--foreground)] hover:bg-[var(--card)]
                            disabled:opacity-50 transition-colors"
@@ -425,7 +425,7 @@ export default function AdminUsersPage() {
 
         <form
           onSubmit={handleDefaultQuotaSubmit}
-          className="mb-6 rounded-2xl border border-[var(--border)] bg-[var(--card)] p-5 shadow-sm"
+          className="mb-6 rounded-2xl border border-[var(--border)] bg-[var(--card)] p-4 shadow-sm lg:p-5"
         >
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div>
@@ -440,7 +440,7 @@ export default function AdminUsersPage() {
             </div>
           </div>
 
-          <div className="mt-4 grid gap-4 md:grid-cols-3">
+          <div className="mt-4 grid gap-4 lg:grid-cols-3">
             <div className="rounded-xl border border-[var(--border)]/60 p-3">
               <h3 className="mb-3 text-xs font-semibold text-[var(--foreground)]">
                 LLM
@@ -579,7 +579,7 @@ export default function AdminUsersPage() {
                 defaultQuotaLoading ||
                 defaultQuotaSaving
               }
-              className="rounded-lg bg-[var(--foreground)] px-3 py-1.5 text-sm font-medium text-[var(--background)] hover:opacity-90 disabled:opacity-40"
+              className="min-h-10 rounded-lg bg-[var(--foreground)] px-3 py-1.5 text-sm font-medium text-[var(--background)] hover:opacity-90 disabled:opacity-40"
             >
               {defaultQuotaSaving
                 ? t("Saving…")
@@ -594,8 +594,8 @@ export default function AdminUsersPage() {
         </form>
 
         {!loading && !error && users.length > 0 && (
-          <div className="mb-4 flex items-center gap-3">
-            <div className="relative flex-1">
+          <div className="mb-4 flex flex-col items-stretch gap-3 sm:flex-row sm:items-center">
+            <div className="relative min-w-0 flex-1">
               <Search
                 size={14}
                 className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-[var(--muted-foreground)]"
@@ -688,7 +688,127 @@ export default function AdminUsersPage() {
               </button>
             </div>
           ) : (
-            <table className="w-full text-sm">
+            <>
+              <div className="divide-y divide-[var(--border)] lg:hidden">
+              {filteredUsers.map((user) => {
+                const isSelf = user.username === currentUser;
+                const isAdmin = user.role === "admin";
+                const canManageAssignments = !isAdmin && Boolean(user.id);
+                return (
+                  <Fragment key={user.username}>
+                    <article className="space-y-3 p-4">
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="flex min-w-0 items-center gap-3">
+                          <UserAvatar
+                            username={user.username}
+                            userId={user.id}
+                            avatar={user.avatar}
+                            role={user.role}
+                            size={36}
+                          />
+                          <div className="min-w-0">
+                            <p className="truncate text-sm font-medium text-[var(--foreground)]">
+                              {user.username}
+                              {isSelf && (
+                                <span className="ml-2 text-xs font-normal text-[var(--muted-foreground)]">
+                                  {t("(you)")}
+                                </span>
+                              )}
+                            </p>
+                            <p className="mt-0.5 text-xs text-[var(--muted-foreground)]">
+                              {t("Joined")} · {formatDate(user.created_at, lang)}
+                            </p>
+                          </div>
+                        </div>
+                        <span
+                          className={`inline-flex min-h-7 shrink-0 items-center gap-1 rounded-full px-2.5 py-0.5 text-xs font-medium ${
+                            isAdmin
+                              ? "bg-amber-500/15 text-amber-600 dark:text-amber-400"
+                              : "bg-[var(--muted)]/50 text-[var(--muted-foreground)]"
+                          }`}
+                        >
+                          {isAdmin && <ShieldCheck size={11} strokeWidth={2} />}
+                          {isAdmin ? t("Admin") : t("User")}
+                        </span>
+                      </div>
+                      <div className="flex flex-wrap justify-end gap-2">
+                        {canManageAssignments && (
+                          <button
+                            onClick={() =>
+                              setExpandedUserId((current) =>
+                                current === user.id ? null : user.id,
+                              )
+                            }
+                            title={t("Manage assignments")}
+                            aria-label={t("Manage assignments")}
+                            className="min-h-10 min-w-10 rounded-lg border border-[var(--border)] p-1.5 text-[var(--muted-foreground)] hover:bg-[var(--background)] hover:text-[var(--foreground)] transition-colors"
+                          >
+                            <SlidersHorizontal size={15} />
+                          </button>
+                        )}
+                        <button
+                          onClick={() =>
+                            setConfirmTarget({
+                              kind: isAdmin ? "demote" : "promote",
+                              user,
+                            })
+                          }
+                          disabled={isSelf}
+                          title={
+                            isSelf
+                              ? t("Cannot change your own role")
+                              : user.role === "admin"
+                                ? t("Demote to user")
+                                : t("Promote to admin")
+                          }
+                          aria-label={
+                            isSelf
+                              ? t("Cannot change your own role")
+                              : user.role === "admin"
+                                ? t("Demote to user")
+                                : t("Promote to admin")
+                          }
+                          className="min-h-10 min-w-10 rounded-lg border border-[var(--border)] p-1.5 text-[var(--muted-foreground)] hover:bg-[var(--background)] hover:text-[var(--foreground)] disabled:cursor-not-allowed disabled:opacity-30 transition-colors"
+                        >
+                          {isAdmin ? <ShieldOff size={15} /> : <Shield size={15} />}
+                        </button>
+                        <button
+                          onClick={() =>
+                            setConfirmTarget({ kind: "delete", user })
+                          }
+                          disabled={isSelf}
+                          title={
+                            isSelf
+                              ? t("Cannot delete your own account")
+                              : t("Delete {{username}}", {
+                                  username: user.username,
+                                })
+                          }
+                          aria-label={
+                            isSelf
+                              ? t("Cannot delete your own account")
+                              : t("Delete {{username}}", {
+                                  username: user.username,
+                                })
+                          }
+                          className="min-h-10 min-w-10 rounded-lg border border-[var(--border)] p-1.5 text-[var(--muted-foreground)] hover:bg-red-500/10 hover:text-red-500 disabled:cursor-not-allowed disabled:opacity-30 transition-colors"
+                        >
+                          <Trash2 size={15} />
+                        </button>
+                      </div>
+                    </article>
+                    {canManageAssignments && expandedUserId === user.id && (
+                      <div className="p-0">
+                        <GrantEditor key={user.id} userId={user.id} />
+                      </div>
+                    )}
+                  </Fragment>
+                );
+              })}
+              </div>
+
+              <div className="hidden overflow-x-auto overscroll-x-contain lg:block">
+              <table className="w-full min-w-[640px] text-sm">
               <thead>
                 <tr className="border-b border-[var(--border)] text-left text-xs text-[var(--muted-foreground)] uppercase tracking-wider">
                   <th className="px-5 py-3 font-medium">{t("Username")}</th>
@@ -754,7 +874,7 @@ export default function AdminUsersPage() {
                                   )
                                 }
                                 title={t("Manage assignments")}
-                                className="rounded-lg p-1.5 text-[var(--muted-foreground)]
+                                className="min-h-10 min-w-10 rounded-lg p-1.5 text-[var(--muted-foreground)]
                                          hover:bg-[var(--background)] hover:text-[var(--foreground)]
                                          transition-colors"
                               >
@@ -776,7 +896,7 @@ export default function AdminUsersPage() {
                                     ? t("Demote to user")
                                     : t("Promote to admin")
                               }
-                              className="rounded-lg p-1.5 text-[var(--muted-foreground)]
+                              className="min-h-10 min-w-10 rounded-lg p-1.5 text-[var(--muted-foreground)]
                                        hover:bg-[var(--background)] hover:text-[var(--foreground)]
                                        disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
                             >
@@ -798,7 +918,7 @@ export default function AdminUsersPage() {
                                       username: user.username,
                                     })
                               }
-                              className="rounded-lg p-1.5 text-[var(--muted-foreground)]
+                              className="min-h-10 min-w-10 rounded-lg p-1.5 text-[var(--muted-foreground)]
                                        hover:bg-red-500/10 hover:text-red-500
                                        disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
                             >
@@ -818,7 +938,9 @@ export default function AdminUsersPage() {
                   );
                 })}
               </tbody>
-            </table>
+              </table>
+              </div>
+            </>
           )}
         </div>
 

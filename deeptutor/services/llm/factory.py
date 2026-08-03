@@ -681,7 +681,9 @@ async def stream(
                     status=(
                         "failed"
                         if response is not None and response.finish_reason == "error"
-                        else "success" if response is not None else "cancelled"
+                        else "success"
+                        if response is not None
+                        else "cancelled"
                     ),
                 )
             await queue.put(None)

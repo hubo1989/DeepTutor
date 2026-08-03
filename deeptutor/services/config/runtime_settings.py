@@ -552,15 +552,9 @@ class RuntimeSettingsService:
             "AUTH_PASSWORD_HASH": auth["password_hash"],
             "AUTH_TOKEN_EXPIRE_HOURS": str(auth["token_expire_hours"]),
             "AUTH_COOKIE_SECURE": _bool_env(auth["cookie_secure"]),
-            "DEEPTUTOR_SELF_REGISTRATION_ENABLED": _bool_env(
-                auth["self_registration_enabled"]
-            ),
-            "DEEPTUTOR_EMAIL_VERIFICATION_REQUIRED": _bool_env(
-                auth["email_verification_required"]
-            ),
-            "DEEPTUTOR_VERIFICATION_CODE_TTL_MINUTES": str(
-                auth["verification_code_ttl_minutes"]
-            ),
+            "DEEPTUTOR_SELF_REGISTRATION_ENABLED": _bool_env(auth["self_registration_enabled"]),
+            "DEEPTUTOR_EMAIL_VERIFICATION_REQUIRED": _bool_env(auth["email_verification_required"]),
+            "DEEPTUTOR_VERIFICATION_CODE_TTL_MINUTES": str(auth["verification_code_ttl_minutes"]),
             "DEEPTUTOR_VERIFICATION_RESEND_COOLDOWN_SECONDS": str(
                 auth["verification_resend_cooldown_seconds"]
             ),
@@ -568,9 +562,7 @@ class RuntimeSettingsService:
             "DEEPTUTOR_VERIFICATION_MAX_PER_EMAIL_HOUR": str(
                 auth["verification_max_per_email_hour"]
             ),
-            "DEEPTUTOR_VERIFICATION_MAX_PER_IP_HOUR": str(
-                auth["verification_max_per_ip_hour"]
-            ),
+            "DEEPTUTOR_VERIFICATION_MAX_PER_IP_HOUR": str(auth["verification_max_per_ip_hour"]),
             "NEXT_PUBLIC_AUTH_ENABLED": _bool_env(auth["enabled"]),
             # Consumed server-side by the Next.js middleware (web/proxy.ts) at
             # request time — NOT inlined into the browser bundle. The proxy

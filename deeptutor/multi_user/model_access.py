@@ -237,9 +237,7 @@ def default_llm_selection() -> dict[str, Any] | None:
     requested_source = str(preference.get("source") or "").strip().lower()
     policy = load_policy()
     valid_profiles = [
-        item
-        for item in profiles
-        if allowed_binding("llm", str(item.get("provider") or ""), policy)
+        item for item in profiles if allowed_binding("llm", str(item.get("provider") or ""), policy)
     ]
     if requested_source == "byok" or (
         not requested_source

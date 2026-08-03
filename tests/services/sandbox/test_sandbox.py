@@ -102,9 +102,9 @@ async def test_service_runs_with_subprocess() -> None:
 async def test_non_admin_exec_is_fail_closed_without_per_user_isolation(
     monkeypatch,
 ) -> None:
-    from deeptutor.services import config as config_module
     from deeptutor.multi_user.context import reset_current_user, set_current_user
     from deeptutor.multi_user.models import CurrentUser, UserScope
+    from deeptutor.services import config as config_module
 
     monkeypatch.setattr(
         config_module,
@@ -131,9 +131,9 @@ async def test_non_admin_exec_is_fail_closed_without_per_user_isolation(
 
 @pytest.mark.asyncio
 async def test_non_admin_cannot_use_application_sandbox_even_when_opted_in(monkeypatch) -> None:
-    from deeptutor.services import config as config_module
     from deeptutor.multi_user.context import reset_current_user, set_current_user
     from deeptutor.multi_user.models import CurrentUser, UserScope
+    from deeptutor.services import config as config_module
 
     monkeypatch.setattr(
         config_module,

@@ -56,9 +56,7 @@ def _get_byok_embedding_config() -> EmbeddingConfig | None:
     vault = UserByokCredentialVault()
     profiles = vault.list_profiles(current.id, service="embedding")
     if not profiles:
-        if not current.is_admin and not grant_service_enabled(
-            grant, "platform", "embedding"
-        ):
+        if not current.is_admin and not grant_service_enabled(grant, "platform", "embedding"):
             raise ValueError(
                 "No embedding source is enabled for your account. Configure BYOK or contact an administrator."
             )
@@ -74,16 +72,14 @@ def _get_byok_embedding_config() -> EmbeddingConfig | None:
                 byok_profiles=profiles,
             )
         if not resolved_source.is_byok:
-            if not current.is_admin and not grant_service_enabled(
-                grant, "platform", "embedding"
-            ):
-                raise ValueError(
-                    "Platform embedding access is not enabled for your account."
-                )
+            if not current.is_admin and not grant_service_enabled(grant, "platform", "embedding"):
+                raise ValueError("Platform embedding access is not enabled for your account.")
             return None
         profile, secret = vault.load_secret(current.id, str(resolved_source.profile_id))
     except ByokVaultError as exc:
-        raise ValueError("The selected BYOK embedding profile is unavailable; update your BYOK settings.") from exc
+        raise ValueError(
+            "The selected BYOK embedding profile is unavailable; update your BYOK settings."
+        ) from exc
 
     raw_provider = str(profile.get("provider") or "").strip().lower()
     provider = canonical_provider_name(raw_provider) or raw_provider

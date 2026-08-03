@@ -23,5 +23,20 @@ export default defineConfig({
       testMatch: "**/*.audit.ts",
       use: { ...devices["Desktop Chrome"] },
     },
+    {
+      name: "responsive-phone",
+      testMatch: "**/responsive.audit.ts",
+      use: { ...devices["Pixel 5"] },
+    },
+    {
+      name: "responsive-tablet",
+      testMatch: "**/responsive.audit.ts",
+      use: { viewport: { width: 768, height: 1024 }, isMobile: true },
+    },
+    {
+      name: "responsive-desktop",
+      testMatch: "**/responsive.audit.ts",
+      use: { viewport: { width: 1280, height: 800 } },
+    },
   ],
 });
