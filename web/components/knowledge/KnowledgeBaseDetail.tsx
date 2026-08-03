@@ -147,7 +147,12 @@ export default function KnowledgeBaseDetail({
     }
   };
 
-  const fullBleed = FULL_BLEED_SECTIONS.has(section);
+  // Synchronous view of the active section: a connected KB clamps "add" /
+  // "versions" to "files" immediately, so the body never renders a hidden tab
+  // in the render that precedes the useEffect below resetting `section`.
+  const activeSection: DetailSection =
+    connected && (section === "add" || section === "versions") ? "files" : section;
+  const fullBleed = FULL_BLEED_SECTIONS.has(activeSection);
 
   return (
     <main className="flex h-full flex-1 flex-col overflow-hidden bg-[var(--background)]">
@@ -235,7 +240,7 @@ export default function KnowledgeBaseDetail({
           return (
             <nav className="-mb-3 mt-3 flex gap-1 overflow-x-auto">
               {visibleSections.map(({ key, label, Icon }) => {
-                const active = section === key;
+                const active = activeSection === key;
                 return (
                   <button
                     key={key}
@@ -259,12 +264,12 @@ export default function KnowledgeBaseDetail({
 
       {/* Body */}
       <div className="min-h-0 flex-1 overflow-hidden">
-        {section === "files" ? (
+        {activeSection === "files" ? (
           <KbFilesTab key={kb.name} kb={kb} task={task} />
         ) : (
           <div className="h-full overflow-y-auto px-6 py-5">
             <div className={fullBleed ? "" : "mx-auto max-w-3xl"}>
-              {section === "add" && (
+              {activeSection === "add" && (
                 <KbDocumentsSection
                   kb={kb}
                   uploadPolicy={uploadPolicy}
@@ -277,7 +282,7 @@ export default function KnowledgeBaseDetail({
                   }
                 />
               )}
-              {section === "versions" && (
+              {activeSection === "versions" && (
                 <KbIndexVersionsSection
                   kb={kb}
                   task={task}
@@ -290,7 +295,7 @@ export default function KnowledgeBaseDetail({
                   }
                 />
               )}
-              {section === "settings" && (
+              {activeSection === "settings" && (
                 <KbSettingsSection
                   kb={kb}
                   onSetDefault={() =>
