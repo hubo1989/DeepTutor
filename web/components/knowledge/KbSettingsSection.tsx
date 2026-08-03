@@ -4,6 +4,7 @@ import { useTranslation } from "react-i18next";
 import { Star, Trash2 } from "lucide-react";
 import {
   formatKnowledgeTimestamp,
+  isConnectedKb,
   type KnowledgeBase,
 } from "@/lib/knowledge-helpers";
 
@@ -29,6 +30,7 @@ export default function KbSettingsSection({
   const created = formatKnowledgeTimestamp(meta.created_at);
   const updated = formatKnowledgeTimestamp(meta.last_updated);
   const lastIndexed = formatKnowledgeTimestamp(meta.last_indexed_at);
+  const connected = isConnectedKb(kb);
 
   return (
     <div className="space-y-6">
@@ -38,7 +40,11 @@ export default function KbSettingsSection({
             {t("Overview")}
           </div>
           <p className="mt-0.5 text-[11.5px] text-[var(--muted-foreground)]">
-            {t("Read-only metadata. Use the actions below to manage this KB.")}
+            {connected
+              ? t(
+                  "This knowledge base is read-only. Documents are managed in its connected source; DeepTutor only searches it.",
+                )
+              : t("Read-only metadata. Use the actions below to manage this KB.")}
           </p>
         </div>
 

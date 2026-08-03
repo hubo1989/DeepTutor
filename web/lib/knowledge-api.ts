@@ -170,6 +170,11 @@ export async function listKnowledgeBases(options?: { force?: boolean }) {
       const response = await apiFetch(apiUrl("/api/v1/knowledge/list"), {
         cache: "no-store",
       });
+      if (!response.ok) {
+        throw new Error(
+          await readErrorDetail(response, "Failed to load knowledge bases"),
+        );
+      }
       const data = await response.json();
       return Array.isArray(data)
         ? data
@@ -193,6 +198,11 @@ export async function listRagProviders(options?: { force?: boolean }) {
           cache: "no-store",
         },
       );
+      if (!response.ok) {
+        throw new Error(
+          await readErrorDetail(response, "Failed to load retrieval engines"),
+        );
+      }
       const data = await response.json();
       return Array.isArray(data?.providers) ? data.providers : [];
     },
@@ -212,6 +222,11 @@ export async function getKnowledgeUploadPolicy(options?: { force?: boolean }) {
           cache: "no-store",
         },
       );
+      if (!response.ok) {
+        throw new Error(
+          await readErrorDetail(response, "Failed to load upload policy"),
+        );
+      }
       const data = await response.json();
       return normalizeUploadPolicy(data);
     },
@@ -461,10 +476,7 @@ export async function listKnowledgeBaseFiles(
         { cache: "no-store" },
       );
       if (!response.ok) {
-        const detail = await readErrorDetail(
-          response,
-          `Failed to list files (${response.status})`,
-        );
+        const detail = await readErrorDetail(response, "Failed to list files");
         throw new Error(
           withDockerUpgradeHint(
             detail,
@@ -508,17 +520,53 @@ export interface KnowledgeTaskResponse {
   noop?: boolean;
 }
 
+/**
+ * Extract a human-readable error message from a non-OK ``Response``.
+ *
+ * Always includes the HTTP status. If the body is JSON with a ``detail``
+ * field (the FastAPI convention), that wins and is returned verbatim so
+ * callers can pattern-match on it (e.g. :func:`withDockerUpgradeHint`).
+ * Otherwise — notably when the body is HTML (a reverse-proxy 502 page, a
+ * crashed worker, or a login redirect) — we note that JSON was expected so
+ * the banner never shows the cryptic raw ``Unexpected token '<'`` parse
+ * error.
+ *
+ * The body is read once as text and JSON-parsed from that, because calling
+ * ``res.json()`` then ``res.text()`` would drain the stream twice.
+ */
 async function readErrorDetail(
   res: Response,
   fallback: string,
 ): Promise<string> {
+  const withStatus = `${fallback} (HTTP ${res.status})`;
+  // Read the body once as text. Calling res.json() then res.text() would
+  // consume the stream twice: once res.json() throws, the body is already
+  // drained and res.text() returns "" — so the HTML/empty-body branch below
+  // never fired. Reading text first lets us try JSON parsing without losing
+  // the raw body for the HTML / truncation fallbacks.
+  let raw = "";
   try {
-    const body = await res.json();
-    if (body?.detail) return String(body.detail);
+    raw = (await res.text()).trim();
   } catch {
-    // body wasn't JSON; fall through
+    return withStatus;
   }
-  return fallback;
+  if (!raw) return withStatus;
+
+  // Try JSON first (FastAPI's {detail: "..."} convention); preserve detail
+  // verbatim so callers can pattern-match on it (e.g. withDockerUpgradeHint).
+  try {
+    const body = JSON.parse(raw);
+    if (body?.detail) return String(body.detail);
+    return withStatus;
+  } catch {
+    // Not JSON — usually an HTML error page from a reverse proxy or a
+    // crashed worker. Surface that JSON was expected instead of the raw
+    // "Unexpected token '<'" parse exception.
+    const looksLikeHtml = /^<\w/.test(raw) || /<!doctype/i.test(raw);
+    return looksLikeHtml
+      ? `${withStatus} — server returned HTML instead of JSON`
+      : `${withStatus} — ${raw.length > 120 ? `${raw.slice(0, 120)}…` : raw}`;
+  }
 }
 
 // A folder upload's File objects carry `webkitRelativePath` (e.g.

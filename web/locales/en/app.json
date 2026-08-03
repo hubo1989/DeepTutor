@@ -1268,6 +1268,7 @@
   "Pick a knowledge base from the list, or create a new one to get started.": "Pick a knowledge base from the list, or create a new one to get started.",
   "Create your first knowledge base": "Create your first knowledge base",
   "Read-only metadata. Use the actions below to manage this KB.": "Read-only metadata. Use the actions below to manage this KB.",
+  "This knowledge base is read-only. Documents are managed in its connected source; DeepTutor only searches it.": "This knowledge base is read-only. Documents are managed in its connected source; DeepTutor only searches it.",
   "RAG provider": "RAG provider",
   "On-disk path": "On-disk path",
   "Default knowledge base": "Default knowledge base",

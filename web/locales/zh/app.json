@@ -1386,6 +1386,7 @@
   "Pick a knowledge base from the list, or create a new one to get started.": "从左侧列表选择一个知识库，或新建一个以开始。",
   "Create your first knowledge base": "创建你的第一个知识库",
   "Read-only metadata. Use the actions below to manage this KB.": "只读元数据。使用下方操作来管理此知识库。",
+  "This knowledge base is read-only. Documents are managed in its connected source; DeepTutor only searches it.": "此知识库为只读连接。文档在其连接的来源处管理，DeepTutor 仅作检索。",
   "RAG provider": "RAG 提供商",
   "On-disk path": "磁盘路径",
   "Default knowledge base": "默认知识库",
