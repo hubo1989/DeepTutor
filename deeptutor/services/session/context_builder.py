@@ -13,6 +13,7 @@ from deeptutor.core.trace import build_trace_metadata, merge_trace_metadata, new
 from deeptutor.services.llm.config import LLMConfig
 from deeptutor.services.llm.context_window import resolve_effective_context_window
 
+from .ask_user_trace import extract_ask_user_clarifications
 from .protocol import SessionStoreProtocol
 
 #: When the summarizer's output lands within this fraction of its hard token
