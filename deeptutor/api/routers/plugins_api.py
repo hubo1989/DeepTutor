@@ -14,7 +14,7 @@ import re
 import time
 from typing import Any, AsyncGenerator
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -29,9 +29,16 @@ from deeptutor.logging import (
 from deeptutor.runtime.registry.capability_registry import get_capability_registry
 from deeptutor.runtime.registry.tool_registry import get_tool_registry
 
+from .auth import require_admin
+
 logger = logging.getLogger(__name__)
 
-router = APIRouter()
+# Playground endpoints operate on process-wide registries and can execute tools
+# with platform credentials (including partner/cron surfaces).  Keep the guard
+# on the router itself so any future mount inherits the same security boundary.
+# ``require_admin`` preserves the legacy local mode by treating requests as the
+# synthetic local administrator when authentication is disabled.
+router = APIRouter(dependencies=[Depends(require_admin)])
 ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 
 
@@ -120,7 +127,10 @@ async def execute_tool(tool_name: str, body: ToolExecuteRequest):
         raise HTTPException(status_code=404, detail=t("api.tool_not_found", name=tool_name))
 
     try:
-        result = await tool.execute(**body.params)
+        from deeptutor.commercial.concurrency import commercial_turn_lease
+
+        async with commercial_turn_lease():
+            result = await tool.execute(**body.params)
         return {
             "success": result.success,
             "content": result.content,
@@ -230,15 +240,20 @@ async def _execute_stream(tool_name: str, params: dict[str, Any]) -> AsyncGenera
         try:
             import sys
 
+            from deeptutor.commercial.concurrency import commercial_turn_lease
+
             stdout_stream._stream = sys.stdout
             stderr_stream._stream = sys.stderr
-            with bind_log_context(task_id=task_id, capability="playground", sink="ui"):
-                with capture_process_logs(_queue_process_emit(event_queue, loop), task_id=task_id):
-                    with (
-                        contextlib.redirect_stdout(stdout_stream),
-                        contextlib.redirect_stderr(stderr_stream),
+            async with commercial_turn_lease():
+                with bind_log_context(task_id=task_id, capability="playground", sink="ui"):
+                    with capture_process_logs(
+                        _queue_process_emit(event_queue, loop), task_id=task_id
                     ):
-                        result = await tool.execute(**params)
+                        with (
+                            contextlib.redirect_stdout(stdout_stream),
+                            contextlib.redirect_stderr(stderr_stream),
+                        ):
+                            result = await tool.execute(**params)
             result_holder["data"] = {
                 "success": result.success,
                 "content": result.content,
@@ -276,6 +291,10 @@ async def _execute_stream(tool_name: str, params: dict[str, Any]) -> AsyncGenera
     finally:
         if not task.done():
             task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
 
 @router.post("/tools/{tool_name}/execute-stream")
@@ -304,19 +323,22 @@ async def _execute_capability_stream(
         if not body.content.strip():
             yield _sse("error", {"detail": "content is required"})
             return
-        try:
-            await _ensure_running_partner(partner_id)
-        except HTTPException as exc:
-            yield _sse("error", {"detail": exc.detail, "status_code": exc.status_code})
-            return
         request = ChatMessageRequest(
             content=body.content,
             session_id=body.session_id,
             chat_id=body.chat_id,
             llm_selection=body.llm_selection,
         )
-        async for chunk in _partner_chat_stream(partner_id, request):
-            yield chunk
+        from deeptutor.commercial.concurrency import commercial_turn_lease
+
+        async with commercial_turn_lease(capability="chat"):
+            try:
+                await _ensure_running_partner(partner_id)
+            except HTTPException as exc:
+                yield _sse("error", {"detail": exc.detail, "status_code": exc.status_code})
+                return
+            async for chunk in _partner_chat_stream(partner_id, request):
+                yield chunk
         return
 
     from deeptutor.core.context import Attachment, UnifiedContext
@@ -367,23 +389,30 @@ async def _execute_capability_stream(
         try:
             import sys
 
+            from deeptutor.commercial.concurrency import commercial_turn_lease
+
             stdout_stream._stream = sys.stdout
             stderr_stream._stream = sys.stderr
-            with bind_log_context(
-                task_id=task_id,
-                capability=capability_name,
-                sink="ui",
-            ):
-                with capture_process_logs(_queue_process_emit(event_queue, loop), task_id=task_id):
-                    with (
-                        contextlib.redirect_stdout(stdout_stream),
-                        contextlib.redirect_stderr(stderr_stream),
+            async with commercial_turn_lease(capability=capability_name):
+                with bind_log_context(
+                    task_id=task_id,
+                    capability=capability_name,
+                    sink="ui",
+                ):
+                    with capture_process_logs(
+                        _queue_process_emit(event_queue, loop), task_id=task_id
                     ):
-                        async for event in orch.handle(ctx):
-                            if event.type.value == "result":
-                                final_result = dict(event.metadata)
-                                continue
-                            await event_queue.put({"kind": "stream", "payload": event.to_dict()})
+                        with (
+                            contextlib.redirect_stdout(stdout_stream),
+                            contextlib.redirect_stderr(stderr_stream),
+                        ):
+                            async for event in orch.handle(ctx):
+                                if event.type.value == "result":
+                                    final_result = dict(event.metadata)
+                                    continue
+                                await event_queue.put(
+                                    {"kind": "stream", "payload": event.to_dict()}
+                                )
         except Exception as exc:
             error_holder["detail"] = str(exc)
         finally:
@@ -417,6 +446,10 @@ async def _execute_capability_stream(
     finally:
         if not task.done():
             task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
 
 @router.post("/capabilities/{capability_name}/execute-stream")

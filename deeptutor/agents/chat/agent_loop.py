@@ -319,9 +319,7 @@ class AgentLoop:
             # A rag call may discover page images after the initial seed. Add
             # only the newly loaded attachments to the next LLM request; the
             # initial user message already contains any seed images.
-            new_rag_images = self.pipeline._attach_rag_images(
-                self.context, dispatch.sources
-            )
+            new_rag_images = self.pipeline._attach_rag_images(self.context, dispatch.sources)
             if new_rag_images:
                 messages = self.pipeline._prepare_messages_with_attachments(
                     messages,
@@ -462,6 +460,7 @@ class AgentLoop:
             trace_role=trace_role,
             trace_group="stage",
         )
+        turn_id = str(self.context.metadata.get("turn_id") or self.context.session_id).strip()
         await self.stream.progress(
             label,
             source="chat",
@@ -476,6 +475,9 @@ class AgentLoop:
             "model": self.pipeline.model,
             "messages": messages,
             "stream": True,
+            # Reused unchanged by the compatibility retry branches below;
+            # the accounting wrapper removes it before provider dispatch.
+            "_commercial_request_id": f"chat:{turn_id}:{call_id}",
             **self.pipeline._completion_kwargs(max_tokens=max_tokens),
         }
         if self.pipeline.usage is not None:
@@ -639,6 +641,9 @@ class AgentLoop:
             if "stream_options" in kwargs and is_stream_options_unsupported(exc):
                 retry_kwargs = dict(kwargs)
                 retry_kwargs.pop("stream_options", None)
+                retry_kwargs["_commercial_request_id"] = (
+                    f"{kwargs['_commercial_request_id']}:compat-no-stream-options"
+                )
                 return await self.client.chat.completions.create(**retry_kwargs)
             if kwargs.get("tools") and is_tool_schema_unsupported(exc):
                 await self.stream.progress(
@@ -656,6 +661,9 @@ class AgentLoop:
                 retry_kwargs = dict(kwargs)
                 retry_kwargs.pop("tools", None)
                 retry_kwargs.pop("tool_choice", None)
+                retry_kwargs["_commercial_request_id"] = (
+                    f"{kwargs['_commercial_request_id']}:compat-no-tools"
+                )
                 self.tool_schemas = None
                 return await self.client.chat.completions.create(**retry_kwargs)
             if is_image_input_unsupported(exc) and should_degrade_to_text(
@@ -675,6 +683,9 @@ class AgentLoop:
                         trace_meta,
                         {"trace_kind": "warning", "image_fallback": True},
                     ),
+                )
+                kwargs["_commercial_request_id"] = (
+                    f"{kwargs['_commercial_request_id']}:compat-text-only"
                 )
                 return await self.client.chat.completions.create(**kwargs)
             raise

@@ -10,9 +10,9 @@ URL shape::
 
     GET /api/attachments/{session_id}/{attachment_id}/{filename}
 
-The session id functions as the ACL boundary, mirroring how the rest of
-the app treats sessions today (single-tenant, session ownership is local
-trust). Once multi-user auth lands we should swap this for signed URLs.
+Authentication installs the current user's storage scope before this router
+runs. Session and attachment identifiers are therefore resolved only inside
+that owner's attachment root, even when another user chooses the same ids.
 """
 
 from __future__ import annotations
@@ -32,6 +32,17 @@ from deeptutor.services.storage import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+_ACTIVE_CONTENT_SUFFIXES = {
+    ".htm",
+    ".html",
+    ".mht",
+    ".mhtml",
+    ".svg",
+    ".xhtml",
+    ".xml",
+}
+_RESTRICTIVE_CSP = "sandbox; default-src 'none'"
 
 
 def _content_disposition(filename: str, *, disposition: str = "inline") -> str:
@@ -57,10 +68,9 @@ async def get_attachment(
 ):
     """Serve a previously uploaded chat attachment.
 
-    Responds with ``Content-Disposition: inline`` so browsers preview PDFs
-    and images directly in an ``<iframe>`` / ``<img>``. For unknown types
-    the browser still falls back to download, which is fine for the
-    drawer's "Download" button path.
+    Safe preview types use ``Content-Disposition: inline``. Active document
+    formats such as HTML, SVG and XML are download-only and every response is
+    protected by ``nosniff`` plus a sandboxed CSP.
     """
     store = get_attachment_store()
     if not isinstance(store, LocalDiskAttachmentStore):
@@ -83,9 +93,12 @@ async def get_attachment(
 
     # ``inline`` lets the browser preview the file when possible while still
     # honouring the suggested filename for the drawer's download action.
+    disposition = "attachment" if target.suffix.lower() in _ACTIVE_CONTENT_SUFFIXES else "inline"
     headers = {
-        "Content-Disposition": _content_disposition(target.name),
+        "Content-Disposition": _content_disposition(target.name, disposition=disposition),
         # User-uploaded data; do not let intermediaries cache it.
         "Cache-Control": "private, max-age=0, must-revalidate",
+        "X-Content-Type-Options": "nosniff",
+        "Content-Security-Policy": _RESTRICTIVE_CSP,
     }
     return FileResponse(path=str(target), media_type=media_type, headers=headers)

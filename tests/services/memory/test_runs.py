@@ -77,6 +77,41 @@ async def test_cancel_marks_run_cancelled(manager: RunManager) -> None:
 
 
 @pytest.mark.asyncio
+async def test_cancel_all_for_owner_awaits_only_that_owners_runs(
+    manager: RunManager,
+) -> None:
+    started = {"alice": asyncio.Event(), "bob": asyncio.Event()}
+
+    def runner_for(owner: str):
+        async def runner(_on_event):
+            started[owner].set()
+            await asyncio.Event().wait()
+
+        return runner
+
+    alice = await manager.start(
+        owner_id="u_alice",
+        layer="L2",
+        key="chat",
+        mode="update",
+        runner=runner_for("alice"),
+    )
+    bob = await manager.start(
+        owner_id="u_bob",
+        layer="L2",
+        key="chat",
+        mode="update",
+        runner=runner_for("bob"),
+    )
+    await asyncio.gather(started["alice"].wait(), started["bob"].wait())
+
+    assert await manager.cancel_all_for_owner("u_alice") == 1
+    assert alice.status == "cancelled"
+    assert bob.active is True
+    await manager.cancel_all_for_owner("u_bob")
+
+
+@pytest.mark.asyncio
 async def test_wait_for_events_replays_from_cursor(manager: RunManager) -> None:
     async def runner(on_event):
         for i in range(5):
@@ -147,3 +182,48 @@ async def test_undo_last_restores_previous_document(manager: RunManager, tmp_pat
     assert event is not None
     assert path.read_text(encoding="utf-8") == "before"
     assert event.payload["stage"] == "undo_applied"
+
+
+@pytest.mark.asyncio
+async def test_owner_scopes_active_runs_lookup_list_cancel_and_undo(tmp_path) -> None:
+    manager = RunManager()
+    alice_started = asyncio.Event()
+
+    async def blocking_runner(_on_event):
+        alice_started.set()
+        await asyncio.Event().wait()
+
+    alice_run = await manager.start(
+        owner_id="u_alice",
+        layer="L2",
+        key="chat",
+        mode="update",
+        runner=blocking_runner,
+    )
+    await alice_started.wait()
+
+    # A different owner can run the same logical document key because the
+    # actual memory documents live under different workspace roots.
+    async def finished_runner(_on_event):
+        return None
+
+    bob_run = await manager.start(
+        owner_id="u_bob",
+        layer="L2",
+        key="chat",
+        mode="update",
+        runner=finished_runner,
+    )
+    if bob_run._task is not None:
+        await bob_run._task
+
+    assert manager.get(alice_run.id, owner_id="u_bob") is None
+    assert manager.active_for("L2", "chat", owner_id="u_bob") is None
+    assert manager.list_for(owner_id="u_bob") == [bob_run]
+    assert await manager.cancel(alice_run.id, owner_id="u_bob") is False
+    with pytest.raises(KeyError):
+        await manager.undo_last(alice_run.id, owner_id="u_bob")
+
+    assert await manager.cancel(alice_run.id, owner_id="u_alice") is True
+    if alice_run._task is not None:
+        await asyncio.gather(alice_run._task, return_exceptions=True)

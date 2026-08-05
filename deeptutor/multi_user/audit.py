@@ -6,21 +6,28 @@ from datetime import datetime, timezone
 import json
 from typing import Any
 
+from deeptutor.services.private_state import chmod_private, exclusive_path_lock
+
+from . import paths
 from .context import get_current_user
-from .paths import SYSTEM_ROOT, ensure_system_dirs
+from .paths import ensure_system_dirs
 
 
 def _audit_file():
     # Resolved per call so monkey-patched SYSTEM_ROOT (e.g. in tests) takes
     # effect without a module reload.
-    return SYSTEM_ROOT / "audit" / "usage.jsonl"
+    return paths.SYSTEM_ROOT / "audit" / "usage.jsonl"
 
 
 def _write(payload: dict[str, Any]) -> None:
     try:
         ensure_system_dirs()
-        with _audit_file().open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        audit_file = _audit_file()
+        with exclusive_path_lock(audit_file):
+            with audit_file.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+                handle.flush()
+            chmod_private(audit_file)
     except Exception:
         # Auditing must never break a request.
         return

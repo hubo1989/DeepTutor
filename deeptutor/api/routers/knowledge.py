@@ -6,7 +6,10 @@ Handles knowledge base CRUD operations, file uploads, and initialization.
 """
 
 import asyncio
+from contextvars import ContextVar
 from datetime import datetime
+from functools import wraps
+import inspect
 import json
 import logging
 import mimetypes
@@ -20,6 +23,7 @@ from uuid import uuid4
 from fastapi import (
     APIRouter,
     BackgroundTasks,
+    Depends,
     File,
     Form,
     HTTPException,
@@ -30,9 +34,25 @@ from fastapi import (
 from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
 
+from deeptutor.api.routers.auth import require_admin
 from deeptutor.api.utils.progress_broadcaster import ProgressBroadcaster
 from deeptutor.api.utils.task_id_manager import TaskIDManager
 from deeptutor.api.utils.task_log_stream import capture_task_logs, get_task_stream_manager
+from deeptutor.commercial.entitlement_context import (
+    CommercialAccessDenied,
+    require_active_commercial_access,
+)
+from deeptutor.commercial.storage_limits import (
+    CommercialResourceLimitDenied,
+    commercial_owner_resource_lock,
+    commit_staged_files_with_storage_limits,
+    create_staging_directory,
+    enforce_kb_count_limit,
+    enforce_path_batch_storage_limits,
+    enforce_staging_scratch_limit,
+    enforce_upload_size_limits,
+    measure_upload_batch,
+)
 from deeptutor.knowledge.add_documents import DocumentAdder, remove_raw_document
 from deeptutor.knowledge.initializer import KnowledgeBaseInitializer
 from deeptutor.knowledge.kb_types import is_connected_kb
@@ -84,6 +104,98 @@ router = APIRouter()
 # Constants for byte conversions
 BYTES_PER_GB = 1024**3
 BYTES_PER_MB = 1024**2
+
+_kb_background_owner: ContextVar[str] = ContextVar("kb_background_owner", default="")
+
+
+def _commercial_denial_detail(
+    exc: CommercialAccessDenied | CommercialResourceLimitDenied,
+) -> dict[str, object]:
+    detail: dict[str, object] = {"code": exc.code, "message": str(exc)}
+    if isinstance(exc, CommercialResourceLimitDenied):
+        detail.update(exc.details)
+    return detail
+
+
+def _raise_commercial_http_denial(
+    exc: CommercialAccessDenied | CommercialResourceLimitDenied,
+) -> None:
+    raise HTTPException(status_code=402, detail=_commercial_denial_detail(exc)) from exc
+
+
+def _require_active_commercial_http() -> None:
+    try:
+        require_active_commercial_access()
+    except CommercialAccessDenied as exc:
+        _raise_commercial_http_denial(exc)
+
+
+def _enforce_upload_limits_http(files: list[UploadFile]) -> None:
+    try:
+        enforce_upload_size_limits(files)
+    except (CommercialAccessDenied, CommercialResourceLimitDenied) as exc:
+        _raise_commercial_http_denial(exc)
+
+
+def _enforce_kb_count_http(current_count: int) -> None:
+    try:
+        enforce_kb_count_limit(current_count)
+    except (CommercialAccessDenied, CommercialResourceLimitDenied) as exc:
+        _raise_commercial_http_denial(exc)
+
+
+def _enforce_path_batch_limits_http(paths: list[str]) -> None:
+    try:
+        enforce_path_batch_storage_limits(paths)
+    except (CommercialAccessDenied, CommercialResourceLimitDenied) as exc:
+        _raise_commercial_http_denial(exc)
+
+
+def _commercial_task_error(exc: Exception) -> str:
+    if isinstance(exc, (CommercialAccessDenied, CommercialResourceLimitDenied)):
+        return f"{exc.code}: {exc}"
+    return str(exc)
+
+
+def _owner_deletion_fenced(owner_id: str) -> bool:
+    from deeptutor.multi_user.models import LOCAL_ADMIN_ID
+    from deeptutor.services.account_lifecycle import is_account_deletion_fenced
+
+    return bool(owner_id and owner_id != LOCAL_ADMIN_ID and is_account_deletion_fenced(owner_id))
+
+
+def _ensure_kb_background_write_allowed() -> None:
+    if _owner_deletion_fenced(_kb_background_owner.get()):
+        raise asyncio.CancelledError("account_deletion_in_progress")
+
+
+def _tracked_kb_background_task(function):
+    """Register an ASGI background coroutine so account deletion can await it."""
+    signature = inspect.signature(function)
+
+    @wraps(function)
+    async def wrapped(*args, **kwargs):
+        bound = signature.bind_partial(*args, **kwargs)
+        task_id = str(bound.arguments.get("task_id") or "")
+        owner_id = get_current_user().id
+        manager = TaskIDManager.get_instance()
+        task = manager.register_current_task(task_id, owner_id)
+        token = _kb_background_owner.set(owner_id)
+        try:
+            if _owner_deletion_fenced(owner_id):
+                manager.update_task_status(task_id, "cancelled")
+                get_task_stream_manager().emit_failed(task_id, "Account deletion is in progress")
+                return None
+            return await function(*args, **kwargs)
+        except asyncio.CancelledError:
+            manager.update_task_status(task_id, "cancelled")
+            get_task_stream_manager().emit_failed(task_id, "Background task was cancelled")
+            raise
+        finally:
+            _kb_background_owner.reset(token)
+            manager.unregister_current_task(owner_id, task)
+
+    return wrapped
 
 
 def format_bytes_human_readable(size_bytes: int) -> str:
@@ -194,7 +306,11 @@ IMAGE_ACCEPT_MIME_TYPES = {
 def _build_unique_task_id(task_type: str, task_key_prefix: str) -> str:
     task_manager = TaskIDManager.get_instance()
     task_key = f"{task_key_prefix}_{datetime.now().isoformat()}_{uuid4().hex[:8]}"
-    return task_manager.generate_task_id(task_type, task_key)
+    return task_manager.generate_task_id(
+        task_type,
+        task_key,
+        owner_id=get_current_user().id,
+    )
 
 
 def _mark_kb_queued_for_processing(
@@ -349,6 +465,8 @@ def _save_uploaded_files(
     uploaded_files: list[str] = []
     uploaded_file_paths: list[str] = []
     written_file_paths: list[Path] = []
+    staging_dir = create_staging_directory(target_dir)
+    upload_sizes = measure_upload_batch(files).file_sizes
 
     from deeptutor.services.pocketbase_client import is_pocketbase_enabled
 
@@ -375,7 +493,7 @@ def _save_uploaded_files(
                     else ""
                 )
                 subdir = _sanitize_rel_subdir(rel.rsplit("/", 1)[0]) if "/" in rel else ""
-                dest_dir = target_dir / subdir if subdir else target_dir
+                dest_dir = staging_dir / subdir if subdir else staging_dir
                 if subdir:
                     dest_dir.mkdir(parents=True, exist_ok=True)
                 rel_name = f"{subdir}/{sanitized_filename}" if subdir else sanitized_filename
@@ -387,17 +505,12 @@ def _save_uploaded_files(
                         file, sanitized_filename, dest_dir, allowed_extensions
                     ):
                         written_file_paths.append(dest)
-                        uploaded_files.append(dest.relative_to(target_dir).as_posix())
+                        uploaded_files.append(dest.relative_to(staging_dir).as_posix())
                         uploaded_file_paths.append(str(dest))
-                        if _pb_sync and kb_name:
-                            try:
-                                _upload_file_to_pb(kb_name, dest.name, dest)
-                            except Exception as pb_exc:
-                                logger.debug(
-                                    "PocketBase file upload failed for '%s': %s",
-                                    dest.name,
-                                    pb_exc,
-                                )
+                    enforce_staging_scratch_limit(
+                        staging_dir,
+                        replacing_paths=(target_dir / name for name in uploaded_files),
+                    )
                     continue
 
                 file_path = dest_dir / sanitized_filename
@@ -425,17 +538,12 @@ def _save_uploaded_files(
                 written_file_paths.append(file_path)
                 uploaded_files.append(rel_name)
                 uploaded_file_paths.append(str(file_path))
-
-                # Mirror file to PocketBase when enabled (best-effort, non-blocking).
-                if _pb_sync and kb_name:
-                    try:
-                        _upload_file_to_pb(kb_name, sanitized_filename, file_path)
-                    except Exception as pb_exc:
-                        logger.debug(
-                            "PocketBase file upload failed for '%s': %s",
-                            sanitized_filename,
-                            pb_exc,
-                        )
+                enforce_staging_scratch_limit(
+                    staging_dir,
+                    replacing_paths=(target_dir / name for name in uploaded_files),
+                )
+            except (CommercialAccessDenied, CommercialResourceLimitDenied):
+                raise
             except Exception as e:
                 if file_path and file_path.exists():
                     try:
@@ -453,7 +561,28 @@ def _save_uploaded_files(
                     os.unlink(written_path)
                 except OSError:
                     pass
+        shutil.rmtree(staging_dir, ignore_errors=True)
         raise
+
+    committed_paths = commit_staged_files_with_storage_limits(
+        staging_dir,
+        target_dir,
+        upload_file_sizes=upload_sizes,
+    )
+    uploaded_file_paths = [str(path) for path in committed_paths]
+
+    # Mirror only committed files to PocketBase. A remote failure remains
+    # best-effort and can no longer leave a partially committed local batch.
+    if _pb_sync and kb_name:
+        for committed in committed_paths:
+            try:
+                _upload_file_to_pb(kb_name, committed.name, committed)
+            except Exception as pb_exc:
+                logger.debug(
+                    "PocketBase file upload failed for '%s': %s",
+                    committed.name,
+                    pb_exc,
+                )
 
     return uploaded_files, uploaded_file_paths
 
@@ -721,6 +850,7 @@ def _matching_index_is_valid(kb_name: str, matching_version: dict | None) -> boo
         return False
 
 
+@_tracked_kb_background_task
 async def run_initialization_task(initializer: KnowledgeBaseInitializer, task_id: str):
     """Background task for knowledge base initialization"""
     task_manager = TaskIDManager.get_instance()
@@ -729,6 +859,7 @@ async def run_initialization_task(initializer: KnowledgeBaseInitializer, task_id
 
     with capture_task_logs(task_id):
         try:
+            require_active_commercial_access()
             if not initializer.progress_tracker:
                 initializer.progress_tracker = ProgressTracker(
                     initializer.kb_name, initializer.base_dir
@@ -738,7 +869,11 @@ async def run_initialization_task(initializer: KnowledgeBaseInitializer, task_id
 
             _task_log(task_id, f"Initializing knowledge base '{initializer.kb_name}'")
 
+            # This is the route-level boundary immediately before document
+            # parsing and the selected provider's indexing calls.
+            require_active_commercial_access()
             await initializer.process_documents()
+            _ensure_kb_background_write_allowed()
             _task_log(task_id, "Document processing complete")
             _task_log(task_id, "Finalizing initialization")
             indexed_count = len(
@@ -783,7 +918,7 @@ async def run_initialization_task(initializer: KnowledgeBaseInitializer, task_id
         except Exception as e:
             import traceback as _tb
 
-            error_msg = str(e)
+            error_msg = _commercial_task_error(e)
             trace = _tb.format_exc()
 
             _task_log(task_id, f"Initialization failed: {error_msg}", level="error")
@@ -812,6 +947,7 @@ async def run_initialization_task(initializer: KnowledgeBaseInitializer, task_id
             task_stream_manager.emit_failed(task_id, error_msg, details=trace)
 
 
+@_tracked_kb_background_task
 async def run_upload_processing_task(
     kb_name: str,
     base_dir: str,
@@ -838,6 +974,7 @@ async def run_upload_processing_task(
 
     with capture_task_logs(task_id):
         try:
+            require_active_commercial_access()
             _task_log(task_id, f"Processing {len(uploaded_file_paths)} file(s) for KB '{kb_name}'")
             progress_tracker.update(
                 ProgressStage.PROCESSING_DOCUMENTS,
@@ -846,17 +983,23 @@ async def run_upload_processing_task(
                 total=len(uploaded_file_paths),
             )
 
-            adder = DocumentAdder(
-                kb_name=kb_name,
-                base_dir=base_dir,
-                progress_tracker=progress_tracker,
-                rag_provider=rag_provider,
-            )
-
-            staged_files = adder.add_documents(uploaded_file_paths, allow_duplicates=False)
+            async with commercial_owner_resource_lock():
+                # A folder sync copies external files into raw/. Re-measure
+                # under the same owner lock used by HTTP uploads so another
+                # concurrent write cannot make both checks pass independently.
+                require_active_commercial_access()
+                enforce_path_batch_storage_limits(uploaded_file_paths)
+                adder = DocumentAdder(
+                    kb_name=kb_name,
+                    base_dir=base_dir,
+                    progress_tracker=progress_tracker,
+                    rag_provider=rag_provider,
+                )
+                staged_files = adder.add_documents(uploaded_file_paths, allow_duplicates=False)
             _task_log(task_id, f"Staged {len(staged_files)} new file(s)")
 
             if not staged_files:
+                _ensure_kb_background_write_allowed()
                 _task_log(task_id, "No new files to process (all duplicates or invalid)")
                 progress_tracker.update(
                     ProgressStage.COMPLETED,
@@ -870,7 +1013,12 @@ async def run_upload_processing_task(
                 )
                 return
 
+            # The plan may expire while this task waits in the ASGI background
+            # queue or while large files are staged. Never enter a provider
+            # call using only the request-time access decision.
+            require_active_commercial_access()
             index_result = await adder.process_new_documents(staged_files)
+            _ensure_kb_background_write_allowed()
             processed_files = index_result.processed_files
             _task_log(task_id, f"Indexed {index_result.processed_count} file(s)")
 
@@ -908,6 +1056,7 @@ async def run_upload_processing_task(
                 return
 
             adder.update_metadata(index_result.processed_count)
+            _ensure_kb_background_write_allowed()
 
             if folder_id and processed_files:
                 try:
@@ -942,7 +1091,7 @@ async def run_upload_processing_task(
         except Exception as e:
             import traceback as _tb
 
-            error_msg = f"Upload processing failed (KB '{kb_name}'): {e}"
+            error_msg = f"Upload processing failed (KB '{kb_name}'): {_commercial_task_error(e)}"
             trace = _tb.format_exc()
             _task_log(task_id, error_msg, level="error")
             _task_log(task_id, f"Stack trace:\n{trace}", level="error")
@@ -999,14 +1148,14 @@ async def get_rag_providers():
 
 
 class ProviderModeUpdate(BaseModel):
-    """Set an engine's global default retrieval mode (from its engine card)."""
+    """Set the current workspace's default retrieval mode for one engine."""
 
     mode: str
 
 
 @router.put("/rag-providers/{provider}/mode")
 async def set_rag_provider_mode(provider: str, payload: ProviderModeUpdate):
-    """Persist the default retrieval mode for a mode-aware engine.
+    """Persist this workspace's default mode for a mode-aware engine.
 
     The mode must be one the engine supports; a KB's own ``search_mode`` still
     overrides this per-KB default.
@@ -1050,7 +1199,7 @@ def _pageindex_config_payload() -> dict:
 
 
 @router.get("/rag-pipelines/pageindex/config")
-async def get_pageindex_pipeline_config():
+async def get_pageindex_pipeline_config(_: object = Depends(require_admin)):
     """Read the PageIndex credential state (key redacted to a boolean)."""
     try:
         return _pageindex_config_payload()
@@ -1060,8 +1209,11 @@ async def get_pageindex_pipeline_config():
 
 
 @router.put("/rag-pipelines/pageindex/config")
-async def update_pageindex_pipeline_config(payload: PageIndexConfigUpdate):
-    """Persist the PageIndex API key / base URL for this user's account."""
+async def update_pageindex_pipeline_config(
+    payload: PageIndexConfigUpdate,
+    _: object = Depends(require_admin),
+):
+    """Persist the deployment-wide PageIndex API key / base URL."""
     try:
         from deeptutor.services.config import get_runtime_settings_service
         from deeptutor.services.rag.pipelines.pageindex.config import DEFAULT_API_BASE_URL
@@ -1106,7 +1258,7 @@ class LlamaIndexConfigUpdate(BaseModel):
 
 
 @router.get("/rag-pipelines/llamaindex/config")
-async def get_llamaindex_pipeline_config():
+async def get_llamaindex_pipeline_config(_: object = Depends(require_admin)):
     """Read the LlamaIndex engine's retrieval + chunking knobs."""
     try:
         from deeptutor.services.config import get_runtime_settings_service
@@ -1118,7 +1270,10 @@ async def get_llamaindex_pipeline_config():
 
 
 @router.put("/rag-pipelines/llamaindex/config")
-async def update_llamaindex_pipeline_config(payload: LlamaIndexConfigUpdate):
+async def update_llamaindex_pipeline_config(
+    payload: LlamaIndexConfigUpdate,
+    _: object = Depends(require_admin),
+):
     """Persist the LlamaIndex engine knobs.
 
     Retrieval knobs take effect on the next query; chunk geometry only changes
@@ -1146,7 +1301,7 @@ class GraphRagConfigUpdate(BaseModel):
 
 
 @router.get("/rag-pipelines/graphrag/config")
-async def get_graphrag_pipeline_config():
+async def get_graphrag_pipeline_config(_: object = Depends(require_admin)):
     """Read GraphRAG's query knobs (response style, community granularity)."""
     try:
         from deeptutor.services.config import get_runtime_settings_service
@@ -1158,7 +1313,10 @@ async def get_graphrag_pipeline_config():
 
 
 @router.put("/rag-pipelines/graphrag/config")
-async def update_graphrag_pipeline_config(payload: GraphRagConfigUpdate):
+async def update_graphrag_pipeline_config(
+    payload: GraphRagConfigUpdate,
+    _: object = Depends(require_admin),
+):
     """Persist GraphRAG's query knobs. Takes effect on the next query."""
     try:
         from deeptutor.services.config import get_runtime_settings_service
@@ -1180,7 +1338,7 @@ class LightRagConfigUpdate(BaseModel):
 
 
 @router.get("/rag-pipelines/lightrag/config")
-async def get_lightrag_pipeline_config():
+async def get_lightrag_pipeline_config(_: object = Depends(require_admin)):
     """Read LightRAG's query knobs (top_k, response style)."""
     try:
         from deeptutor.services.config import get_runtime_settings_service
@@ -1192,7 +1350,10 @@ async def get_lightrag_pipeline_config():
 
 
 @router.put("/rag-pipelines/lightrag/config")
-async def update_lightrag_pipeline_config(payload: LightRagConfigUpdate):
+async def update_lightrag_pipeline_config(
+    payload: LightRagConfigUpdate,
+    _: object = Depends(require_admin),
+):
     """Persist LightRAG's query knobs. Takes effect on the next query."""
     try:
         from deeptutor.services.config import get_runtime_settings_service
@@ -1207,7 +1368,10 @@ async def update_lightrag_pipeline_config(payload: LightRagConfigUpdate):
 
 
 @router.get("/rag-pipelines/{provider}/preflight")
-async def get_rag_pipeline_preflight(provider: str):
+async def get_rag_pipeline_preflight(
+    provider: str,
+    _: object = Depends(require_admin),
+):
     """Check whether ``provider`` can run in the current environment.
 
     Returns ``{ok, checks:[{key,label,ok,detail,optional}]}`` — package
@@ -1270,7 +1434,10 @@ def _model_options_payload(kinds: list[str]) -> dict:
 
 
 @router.get("/rag-pipelines/model-options")
-async def get_rag_model_options(kinds: str = "llm,embedding"):
+async def get_rag_model_options(
+    kinds: str = "llm,embedding",
+    _: object = Depends(require_admin),
+):
     """List configured models (secret-free) for the requested model kinds."""
     try:
         requested = [
@@ -1291,7 +1458,10 @@ class ActiveModelUpdate(BaseModel):
 
 
 @router.put("/rag-pipelines/active-model")
-async def set_rag_active_model(payload: ActiveModelUpdate):
+async def set_rag_active_model(
+    payload: ActiveModelUpdate,
+    _: object = Depends(require_admin),
+):
     """Set the active model for an engine's required kind, applied immediately.
 
     This is the same active selection the model catalog manages; switching it
@@ -1472,7 +1642,10 @@ class ConnectObsidianRequest(BaseModel):
 
 
 @router.post("/connect-obsidian")
-async def connect_obsidian_vault(payload: ConnectObsidianRequest):
+async def connect_obsidian_vault(
+    payload: ConnectObsidianRequest,
+    _: object = Depends(require_admin),
+):
     """Connect an existing Obsidian vault as a knowledge base.
 
     Registers a pointer to the user's vault directory (``type: obsidian``) — no
@@ -1510,7 +1683,10 @@ class ConnectFolderRequest(BaseModel):
 
 
 @router.post("/probe-folder")
-async def probe_linked_folder_route(payload: ProbeFolderRequest):
+async def probe_linked_folder_route(
+    payload: ProbeFolderRequest,
+    _: object = Depends(require_admin),
+):
     """Inspect a local folder for a ready engine index before linking it.
 
     Returns the probe verdict (ready index? embedding compatible? warnings?) so
@@ -1529,7 +1705,10 @@ async def probe_linked_folder_route(payload: ProbeFolderRequest):
 
 
 @router.post("/connect-folder")
-async def connect_linked_folder_route(payload: ConnectFolderRequest):
+async def connect_linked_folder_route(
+    payload: ConnectFolderRequest,
+    _: object = Depends(require_admin),
+):
     """Mount an existing engine index as a read-only ``linked`` knowledge base.
 
     Re-probes server-side (never trusts the client's verdict), then registers a
@@ -1592,7 +1771,10 @@ class ConnectLightRagServerRequest(BaseModel):
 
 
 @router.post("/probe-lightrag-server")
-async def probe_lightrag_server_route(payload: ProbeLightRagServerRequest):
+async def probe_lightrag_server_route(
+    payload: ProbeLightRagServerRequest,
+    _: object = Depends(require_admin),
+):
     """Test-connect to an external LightRAG server before binding a KB to it.
 
     Returns the verdict (reachable? is it a LightRAG server? API key accepted?)
@@ -1608,7 +1790,10 @@ async def probe_lightrag_server_route(payload: ProbeLightRagServerRequest):
 
 
 @router.post("/connect-lightrag-server")
-async def connect_lightrag_server_route(payload: ConnectLightRagServerRequest):
+async def connect_lightrag_server_route(
+    payload: ConnectLightRagServerRequest,
+    _: object = Depends(require_admin),
+):
     """Connect an external LightRAG server as a retrieval-only knowledge base.
 
     Re-probes server-side (never trusts the client's verdict), then registers a
@@ -1671,7 +1856,10 @@ class ConnectImaRequest(BaseModel):
 
 
 @router.post("/probe-ima")
-async def probe_ima_route(payload: ProbeImaRequest):
+async def probe_ima_route(
+    payload: ProbeImaRequest,
+    _: object = Depends(require_admin),
+):
     """Test-connect to a Tencent IMA knowledge base before binding a KB to it.
 
     Returns the verdict (credentials accepted? does the library id resolve, and
@@ -1689,7 +1877,10 @@ async def probe_ima_route(payload: ProbeImaRequest):
 
 
 @router.post("/connect-ima")
-async def connect_ima_route(payload: ConnectImaRequest):
+async def connect_ima_route(
+    payload: ConnectImaRequest,
+    _: object = Depends(require_admin),
+):
     """Connect a Tencent IMA knowledge base as a retrieval-only knowledge base.
 
     Re-probes server-side (never trusts the client's verdict), then registers a
@@ -2130,6 +2321,17 @@ async def delete_knowledge_base(kb_name: str):
 @router.get("/tasks/{task_id}/stream")
 async def stream_task_logs(task_id: str):
     """Stream task-specific logs for knowledge-base operations."""
+    task_metadata = TaskIDManager.get_instance().get_task_metadata(task_id)
+    if task_metadata is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    user = get_current_user()
+    task_owner = str(task_metadata.get("owner_id") or "")
+    if not user.is_admin and task_owner != user.id:
+        # Use the same response as an unknown task so callers cannot enumerate
+        # another account's background work from task ids.
+        raise HTTPException(status_code=404, detail="Task not found")
+
     manager = get_task_stream_manager()
     manager.ensure_task(task_id)
     return StreamingResponse(
@@ -2148,68 +2350,80 @@ async def upload_files(
     rel_paths: list[str] = Form(None),
 ):
     """Upload files to a knowledge base and process them in background."""
+    _require_active_commercial_http()
     try:
-        manager, kb_name, kb_base_dir = _writable_kb(kb_name)
-        kb_path = manager.get_knowledge_base_path(kb_name)
-        raw_dir = kb_path / "raw"
-        raw_dir.mkdir(parents=True, exist_ok=True)
+        async with commercial_owner_resource_lock():
+            # Re-check after waiting for another owner mutation: a Trial can
+            # expire while this request is queued behind a large upload.
+            _require_active_commercial_http()
+            _enforce_upload_limits_http(files)
 
-        requested_provider = None
-        if rag_provider is not None and str(rag_provider).strip():
-            requested_provider = _validate_registered_provider(rag_provider)
+            manager, kb_name, kb_base_dir = _writable_kb(kb_name)
+            kb_path = manager.get_knowledge_base_path(kb_name)
+            raw_dir = kb_path / "raw"
+            raw_dir.mkdir(parents=True, exist_ok=True)
+            requested_provider = None
+            if rag_provider is not None and str(rag_provider).strip():
+                requested_provider = _validate_registered_provider(rag_provider)
 
-        kb_entry = _load_kb_entry_or_404(manager, kb_name)
-        _assert_kb_writable_or_409(kb_name, kb_entry)
-        kb_provider = _validate_registered_provider(
-            kb_entry.get("rag_provider") or DEFAULT_PROVIDER
-        )
-        if requested_provider and requested_provider != kb_provider:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"Requested provider '{requested_provider}' does not match KB provider '{kb_provider}'. "
-                    "A knowledge base is locked to the engine it was created with."
-                ),
+            kb_entry = _load_kb_entry_or_404(manager, kb_name)
+            _assert_kb_writable_or_409(kb_name, kb_entry)
+            kb_provider = _validate_registered_provider(
+                kb_entry.get("rag_provider") or DEFAULT_PROVIDER
             )
-        _assert_provider_ready(kb_provider)
-        _enforce_provider_formats(kb_provider, files)
-        allowed_extensions = FileTypeRouter.get_supported_extensions()
-        # ``.zip`` is accepted as an upload container; its members are
-        # validated against ``allowed_extensions`` during extraction and the
-        # archive itself is never indexed (``safe_extract_zip`` skips ``.zip``).
-        upload_extensions = allowed_extensions | {".zip"}
-        _validate_upload_batch(files, allowed_extensions=upload_extensions, rel_paths=rel_paths)
-        uploaded_files, uploaded_file_paths = _save_uploaded_files(
-            files, raw_dir, allowed_extensions=upload_extensions, rel_paths=rel_paths
-        )
-        task_id = _build_unique_task_id("kb_upload", kb_name)
-        get_task_stream_manager().ensure_task(task_id)
+            if requested_provider and requested_provider != kb_provider:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Requested provider '{requested_provider}' does not match KB provider '{kb_provider}'. "
+                        "A knowledge base is locked to the engine it was created with."
+                    ),
+                )
+            _assert_provider_ready(kb_provider)
+            _enforce_provider_formats(kb_provider, files)
+            allowed_extensions = FileTypeRouter.get_supported_extensions()
+            # ``.zip`` is accepted as an upload container; its members are
+            # validated against ``allowed_extensions`` during extraction and the
+            # archive itself is never indexed (``safe_extract_zip`` skips ``.zip``).
+            upload_extensions = allowed_extensions | {".zip"}
+            _validate_upload_batch(
+                files,
+                allowed_extensions=upload_extensions,
+                rel_paths=rel_paths,
+            )
+            uploaded_files, uploaded_file_paths = _save_uploaded_files(
+                files, raw_dir, allowed_extensions=upload_extensions, rel_paths=rel_paths
+            )
+            task_id = _build_unique_task_id("kb_upload", kb_name)
+            get_task_stream_manager().ensure_task(task_id)
 
-        logger.info(f"Uploading {len(uploaded_files)} files to KB '{kb_name}'")
+            logger.info(f"Uploading {len(uploaded_files)} files to KB '{kb_name}'")
 
-        _mark_kb_queued_for_processing(
-            manager,
-            kb_name,
-            task_id,
-            f"Processing {len(uploaded_files)} uploaded file(s)...",
-        )
+            _mark_kb_queued_for_processing(
+                manager,
+                kb_name,
+                task_id,
+                f"Processing {len(uploaded_files)} uploaded file(s)...",
+            )
 
-        background_tasks.add_task(
-            run_upload_processing_task,
-            kb_name=kb_name,
-            base_dir=str(kb_base_dir),
-            uploaded_file_paths=uploaded_file_paths,
-            task_id=task_id,
-            rag_provider=kb_provider,
-        )
+            background_tasks.add_task(
+                run_upload_processing_task,
+                kb_name=kb_name,
+                base_dir=str(kb_base_dir),
+                uploaded_file_paths=uploaded_file_paths,
+                task_id=task_id,
+                rag_provider=kb_provider,
+            )
 
-        return {
-            "message": f"Uploaded {len(uploaded_files)} files. Processing in background.",
-            "files": uploaded_files,
-            "task_id": task_id,
-        }
+            return {
+                "message": f"Uploaded {len(uploaded_files)} files. Processing in background.",
+                "files": uploaded_files,
+                "task_id": task_id,
+            }
     except HTTPException:
         raise
+    except (CommercialAccessDenied, CommercialResourceLimitDenied) as exc:
+        _raise_commercial_http_denial(exc)
     except ValueError:
         raise HTTPException(status_code=404, detail=f"Knowledge base '{kb_name}' not found")
     except Exception as e:
@@ -2227,95 +2441,111 @@ async def create_knowledge_base(
     rel_paths: list[str] = Form(None),
 ):
     """Create a new knowledge base and initialize it with files."""
+    _require_active_commercial_http()
     try:
-        try:
-            name = validate_knowledge_base_name(name)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        async with commercial_owner_resource_lock():
+            _require_active_commercial_http()
+            _enforce_upload_limits_http(files)
+            try:
+                name = validate_knowledge_base_name(name)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        manager = get_kb_manager()
-        kb_base_dir = _current_kb_base_dir()
-        if name in manager.list_knowledge_bases():
-            raise HTTPException(status_code=400, detail=f"Knowledge base '{name}' already exists")
+            manager = get_kb_manager()
+            kb_base_dir = _current_kb_base_dir()
+            kb_names = manager.list_knowledge_bases()
+            if name in kb_names:
+                raise HTTPException(
+                    status_code=400, detail=f"Knowledge base '{name}' already exists"
+                )
+            _enforce_kb_count_http(len(kb_names))
 
-        rag_provider = _validate_registered_provider(rag_provider)
-        _assert_provider_ready(rag_provider)
-        _enforce_provider_formats(rag_provider, files)
-        allowed_extensions = FileTypeRouter.get_supported_extensions()
-        _validate_upload_batch(files, allowed_extensions=allowed_extensions, rel_paths=rel_paths)
+            rag_provider = _validate_registered_provider(rag_provider)
+            _assert_provider_ready(rag_provider)
+            _enforce_provider_formats(rag_provider, files)
+            allowed_extensions = FileTypeRouter.get_supported_extensions()
+            _validate_upload_batch(
+                files, allowed_extensions=allowed_extensions, rel_paths=rel_paths
+            )
 
-        logger.info(f"Creating KB: {name} (provider={rag_provider})")
-        task_id = _build_unique_task_id("kb_init", name)
-        get_task_stream_manager().ensure_task(task_id)
+            logger.info(f"Creating KB: {name} (provider={rag_provider})")
+            task_id = _build_unique_task_id("kb_init", name)
+            get_task_stream_manager().ensure_task(task_id)
 
-        # Register KB to kb_config.json immediately with "initializing" status
-        # This ensures the KB appears in the list right away
-        manager.update_kb_status(
-            name=name,
-            status="initializing",
-            progress={
-                "stage": "initializing",
-                "message": "Initializing knowledge base...",
-                "percent": 0,
-                "current": 0,
-                "total": len(files),
+            # Register KB to kb_config.json immediately with "initializing" status
+            # This ensures the KB appears in the list right away.
+            manager.update_kb_status(
+                name=name,
+                status="initializing",
+                progress={
+                    "stage": "initializing",
+                    "message": "Initializing knowledge base...",
+                    "percent": 0,
+                    "current": 0,
+                    "total": len(files),
+                    "task_id": task_id,
+                },
+            )
+            manager.config = manager._load_config()
+            if name in manager.config.get("knowledge_bases", {}):
+                manager.config["knowledge_bases"][name]["rag_provider"] = rag_provider
+                manager.config["knowledge_bases"][name]["needs_reindex"] = False
+                manager._save_config()
+
+            progress_tracker = ProgressTracker(name, kb_base_dir)
+            initializer = KnowledgeBaseInitializer(
+                kb_name=name,
+                base_dir=str(kb_base_dir),
+                progress_tracker=progress_tracker,
+                rag_provider=rag_provider,
+            )
+
+            initializer.create_directory_structure()
+            progress_tracker.task_id = task_id
+
+            manager = get_kb_manager()
+            if name not in manager.list_knowledge_bases():
+                logger.warning(f"KB {name} not found in config, registering manually")
+                initializer._register_to_config()
+
+            uploaded_files, _ = _save_uploaded_files(
+                files,
+                initializer.raw_dir,
+                allowed_extensions=allowed_extensions,
+                rel_paths=rel_paths,
+            )
+
+            progress_tracker.update(
+                ProgressStage.PROCESSING_DOCUMENTS,
+                f"Saved {len(uploaded_files)} files, preparing to process...",
+                current=0,
+                total=len(uploaded_files),
+            )
+
+            background_tasks.add_task(run_initialization_task, initializer, task_id)
+
+            logger.info(
+                f"KB '{name}' created, processing {len(uploaded_files)} files in background"
+            )
+
+            return {
+                "message": f"Knowledge base '{name}' created. Processing {len(uploaded_files)} files in background.",
+                "name": name,
+                "files": uploaded_files,
                 "task_id": task_id,
-            },
-        )
-        # Also store rag_provider in config (reload and update)
-        manager.config = manager._load_config()
-        if name in manager.config.get("knowledge_bases", {}):
-            manager.config["knowledge_bases"][name]["rag_provider"] = rag_provider
-            manager.config["knowledge_bases"][name]["needs_reindex"] = False
-            manager._save_config()
-
-        progress_tracker = ProgressTracker(name, kb_base_dir)
-
-        initializer = KnowledgeBaseInitializer(
-            kb_name=name,
-            base_dir=str(kb_base_dir),
-            progress_tracker=progress_tracker,
-            rag_provider=rag_provider,
-        )
-
-        initializer.create_directory_structure()
-        progress_tracker.task_id = task_id
-
-        manager = get_kb_manager()
-        if name not in manager.list_knowledge_bases():
-            logger.warning(f"KB {name} not found in config, registering manually")
-            initializer._register_to_config()
-
-        uploaded_files, _ = _save_uploaded_files(
-            files, initializer.raw_dir, allowed_extensions=allowed_extensions, rel_paths=rel_paths
-        )
-
-        progress_tracker.update(
-            ProgressStage.PROCESSING_DOCUMENTS,
-            f"Saved {len(uploaded_files)} files, preparing to process...",
-            current=0,
-            total=len(uploaded_files),
-        )
-
-        background_tasks.add_task(run_initialization_task, initializer, task_id)
-
-        logger.info(f"KB '{name}' created, processing {len(uploaded_files)} files in background")
-
-        return {
-            "message": f"Knowledge base '{name}' created. Processing {len(uploaded_files)} files in background.",
-            "name": name,
-            "files": uploaded_files,
-            "task_id": task_id,
-        }
+            }
 
     except HTTPException:
         raise
+    except (CommercialAccessDenied, CommercialResourceLimitDenied) as exc:
+        _raise_commercial_http_denial(exc)
     except Exception as e:
         logger.error(f"Failed to create KB: {e}")
         logger.debug(traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@_tracked_kb_background_task
 async def run_reindex_task(kb_name: str, base_dir: str, task_id: str, signature_hash: str) -> None:
     """Re-index a KB's raw documents against the currently-active embedding config.
 
@@ -2330,6 +2560,7 @@ async def run_reindex_task(kb_name: str, base_dir: str, task_id: str, signature_
 
     with capture_task_logs(task_id):
         try:
+            require_active_commercial_access()
             base_path = Path(base_dir)
             kb_dir = base_path / kb_name
             raw_dir = kb_dir / "raw"
@@ -2376,11 +2607,13 @@ async def run_reindex_task(kb_name: str, base_dir: str, task_id: str, signature_
             # rather than being swallowed into a generic wrapper. A False
             # return is reserved for "no documents to index" — surface that
             # specifically too.
+            require_active_commercial_access()
             success = await rag_service.initialize(
                 kb_name=kb_name,
                 file_paths=file_paths,
                 progress_callback=_on_progress,
             )
+            _ensure_kb_background_write_allowed()
             if not success:
                 raise RuntimeError(f"Re-index found no valid documents to index in '{kb_name}'.")
 
@@ -2441,7 +2674,7 @@ async def run_reindex_task(kb_name: str, base_dir: str, task_id: str, signature_
         except Exception as e:
             import traceback as _tb
 
-            error_msg = str(e)
+            error_msg = _commercial_task_error(e)
             trace = _tb.format_exc()
             _task_log(task_id, f"Re-index failed: {error_msg}", level="error")
             _task_log(task_id, f"Stack trace:\n{trace}", level="error")
@@ -2468,6 +2701,7 @@ async def reindex_knowledge_base(
     providers keep synthetic provider-keyed versions, so they should rebuild
     without requiring an embedding-signature precheck.
     """
+    _require_active_commercial_http()
     try:
         manager, kb_name, kb_base_dir = _writable_kb(kb_name)
         kb_entry = _load_kb_entry_or_404(manager, kb_name)
@@ -2549,6 +2783,7 @@ async def retry_knowledge_base(
     background_tasks: BackgroundTasks,
 ):
     """Retry a failed KB initialization/indexing run from its stored raw files."""
+    _require_active_commercial_http()
     try:
         manager, resolved_name, _ = _writable_kb(kb_name)
         kb_entry = _load_kb_entry_or_404(manager, resolved_name)
@@ -2606,21 +2841,35 @@ async def clear_progress(kb_name: str):
 @router.websocket("/{kb_name}/progress/ws")
 async def websocket_progress(websocket: WebSocket, kb_name: str):
     """WebSocket endpoint for real-time progress updates"""
-    from deeptutor.api.routers.auth import ws_auth_failed, ws_require_auth
+    from deeptutor.api.routers.auth import (
+        ws_auth_failed,
+        ws_require_auth,
+        ws_revalidate_identity,
+    )
     from deeptutor.multi_user.context import reset_current_user
 
     user_token = await ws_require_auth(websocket)
     if user_token is ws_auth_failed:
         return
 
+    try:
+        resource = resolve_kb(kb_name)
+    except HTTPException as exc:
+        code = 4004 if exc.status_code == 404 else 4003
+        await websocket.close(code=code)
+        reset_current_user(user_token)
+        return
+
     await websocket.accept()
 
     broadcaster = ProgressBroadcaster.get_instance()
+    channel_key = broadcaster.resource_key(resource.base_dir, resource.name)
 
     try:
-        await broadcaster.connect(kb_name, websocket)
+        await broadcaster.connect(channel_key, websocket)
 
-        base_dir = _current_kb_base_dir()
+        base_dir = resource.base_dir
+        kb_name = resource.name
         progress_tracker = ProgressTracker(kb_name, base_dir)
         initial_progress = progress_tracker.get_progress()
         expected_task_id = websocket.query_params.get("task_id")
@@ -2702,7 +2951,11 @@ async def websocket_progress(websocket: WebSocket, kb_name: str):
             try:
                 try:
                     await asyncio.wait_for(websocket.receive_text(), timeout=1.0)
+                    if not await ws_revalidate_identity(websocket):
+                        break
                 except asyncio.TimeoutError:
+                    if not await ws_revalidate_identity(websocket):
+                        break
                     current_progress = progress_tracker.get_progress()
                     if current_progress:
                         progress_task_id = current_progress.get("task_id")
@@ -2737,7 +2990,7 @@ async def websocket_progress(websocket: WebSocket, kb_name: str):
         except Exception:
             pass
     finally:
-        await broadcaster.disconnect(kb_name, websocket)
+        await broadcaster.disconnect(channel_key, websocket)
         try:
             await websocket.close()
         except Exception:
@@ -2750,7 +3003,11 @@ async def websocket_progress(websocket: WebSocket, kb_name: str):
 
 
 @router.post("/{kb_name}/link-folder", response_model=LinkedFolderInfo)
-async def link_folder(kb_name: str, request: LinkFolderRequest):
+async def link_folder(
+    kb_name: str,
+    request: LinkFolderRequest,
+    _: object = Depends(require_admin),
+):
     """
     Link a local folder to a knowledge base.
 
@@ -2780,7 +3037,10 @@ async def link_folder(kb_name: str, request: LinkFolderRequest):
 
 
 @router.get("/{kb_name}/linked-folders", response_model=list[LinkedFolderInfo])
-async def get_linked_folders(kb_name: str):
+async def get_linked_folders(
+    kb_name: str,
+    _: object = Depends(require_admin),
+):
     """Get list of linked folders for a knowledge base."""
     try:
         resource = resolve_kb(kb_name)
@@ -2796,7 +3056,11 @@ async def get_linked_folders(kb_name: str):
 
 
 @router.delete("/{kb_name}/linked-folders/{folder_id}")
-async def unlink_folder(kb_name: str, folder_id: str):
+async def unlink_folder(
+    kb_name: str,
+    folder_id: str,
+    _: object = Depends(require_admin),
+):
     """Unlink a folder from a knowledge base."""
     try:
         manager, resolved_name, _ = _writable_kb(kb_name)
@@ -2814,73 +3078,85 @@ async def unlink_folder(kb_name: str, folder_id: str):
 
 
 @router.post("/{kb_name}/sync-folder/{folder_id}")
-async def sync_folder(kb_name: str, folder_id: str, background_tasks: BackgroundTasks):
+async def sync_folder(
+    kb_name: str,
+    folder_id: str,
+    background_tasks: BackgroundTasks,
+    _: object = Depends(require_admin),
+):
     """
     Sync files from a linked folder to the knowledge base.
 
     This scans the linked folder for supported documents and processes
     any new files that haven't been added yet.
     """
+    _require_active_commercial_http()
     try:
-        manager, kb_name, kb_base_dir = _writable_kb(kb_name)
-        kb_entry = _load_kb_entry_or_404(manager, kb_name)
-        _assert_kb_writable_or_409(kb_name, kb_entry)
-        kb_provider = _validate_registered_provider(
-            kb_entry.get("rag_provider") or DEFAULT_PROVIDER
-        )
+        async with commercial_owner_resource_lock():
+            _require_active_commercial_http()
+            manager, kb_name, kb_base_dir = _writable_kb(kb_name)
+            kb_entry = _load_kb_entry_or_404(manager, kb_name)
+            _assert_kb_writable_or_409(kb_name, kb_entry)
+            kb_provider = _validate_registered_provider(
+                kb_entry.get("rag_provider") or DEFAULT_PROVIDER
+            )
 
-        # Get linked folders and find the one with matching ID
-        folders = manager.get_linked_folders(kb_name)
-        folder_info = next((f for f in folders if f["id"] == folder_id), None)
+            # Get linked folders and find the one with matching ID
+            folders = manager.get_linked_folders(kb_name)
+            folder_info = next((f for f in folders if f["id"] == folder_id), None)
 
-        if not folder_info:
-            raise HTTPException(status_code=404, detail=f"Linked folder '{folder_id}' not found")
+            if not folder_info:
+                raise HTTPException(
+                    status_code=404, detail=f"Linked folder '{folder_id}' not found"
+                )
 
-        folder_path = folder_info["path"]
+            folder_path = folder_info["path"]
 
-        # Check for changes (new or modified files)
-        changes = manager.detect_folder_changes(kb_name, folder_id)
-        files_to_process = changes["new_files"] + changes["modified_files"]
+            # Check for changes (new or modified files)
+            changes = manager.detect_folder_changes(kb_name, folder_id)
+            files_to_process = changes["new_files"] + changes["modified_files"]
 
-        if not files_to_process:
-            return {"message": "No new or modified files to sync", "files": [], "file_count": 0}
+            if not files_to_process:
+                return {
+                    "message": "No new or modified files to sync",
+                    "files": [],
+                    "file_count": 0,
+                }
 
-        logger.info(
-            f"Syncing {len(files_to_process)} files from folder '{folder_path}' to KB '{kb_name}'"
-        )
-        task_id = _build_unique_task_id("kb_upload", f"{kb_name}_folder_{folder_id}")
-        get_task_stream_manager().ensure_task(task_id)
+            _enforce_path_batch_limits_http(files_to_process)
+            logger.info(
+                f"Syncing {len(files_to_process)} files from folder "
+                f"'{folder_path}' to KB '{kb_name}'"
+            )
+            task_id = _build_unique_task_id("kb_upload", f"{kb_name}_folder_{folder_id}")
+            get_task_stream_manager().ensure_task(task_id)
 
-        # NOTE: We DO NOT update sync state here anymore.
-        # It is updated in run_upload_processing_task only after successful processing.
-        # This prevents marking files as synced if processing fails (race condition fix).
+            # Sync state is updated only after successful processing.
+            _mark_kb_queued_for_processing(
+                manager,
+                kb_name,
+                task_id,
+                f"Syncing {len(files_to_process)} file(s) from linked folder...",
+            )
 
-        _mark_kb_queued_for_processing(
-            manager,
-            kb_name,
-            task_id,
-            f"Syncing {len(files_to_process)} file(s) from linked folder...",
-        )
+            background_tasks.add_task(
+                run_upload_processing_task,
+                kb_name=kb_name,
+                base_dir=str(kb_base_dir),
+                uploaded_file_paths=files_to_process,
+                task_id=task_id,
+                rag_provider=kb_provider,
+                folder_id=folder_id,
+            )
 
-        # Add background task to process files
-        background_tasks.add_task(
-            run_upload_processing_task,
-            kb_name=kb_name,
-            base_dir=str(kb_base_dir),
-            uploaded_file_paths=files_to_process,
-            task_id=task_id,
-            rag_provider=kb_provider,
-            folder_id=folder_id,  # Pass folder_id to update state on success
-        )
-
-        return {
-            "message": f"Syncing {len(files_to_process)} files from linked folder",
-            "folder_path": folder_path,
-            "new_files": changes["new_count"],
-            "modified_files": changes["modified_count"],
-            "file_count": len(files_to_process),
-            "task_id": task_id,
-        }
+            return {
+                "message": f"Syncing {len(files_to_process)} files from linked folder",
+                "folder_path": folder_path,
+                "new_files": changes["new_count"],
+                "modified_files": changes["modified_count"],
+                "file_count": len(files_to_process),
+                "task_id": task_id,
+            }
     except HTTPException:
         raise
     except ValueError:

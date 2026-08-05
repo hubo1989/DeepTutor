@@ -23,6 +23,7 @@ from deeptutor.book import (
 )
 from deeptutor.book.models import ContentType
 from deeptutor.book.streaming import SOURCE as BOOK_SOURCE
+from deeptutor.commercial.concurrency import acquire_commercial_turn_lease, commercial_turn_lease
 from deeptutor.core.stream import StreamEventType
 from deeptutor.core.stream_bus import StreamBus
 
@@ -202,16 +203,17 @@ async def create_book(req: CreateBookRequest) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="user_intent is required")
     engine = get_book_engine()
     try:
-        book, proposal = await engine.create_book(
-            user_intent=req.user_intent,
-            chat_session_id=req.chat_session_id,
-            chat_selections=req.chat_selections,
-            notebook_refs=req.notebook_refs,
-            knowledge_bases=req.knowledge_bases,
-            question_categories=req.question_categories,
-            question_entries=req.question_entries,
-            language=req.language,
-        )
+        async with commercial_turn_lease():
+            book, proposal = await engine.create_book(
+                user_intent=req.user_intent,
+                chat_session_id=req.chat_session_id,
+                chat_selections=req.chat_selections,
+                notebook_refs=req.notebook_refs,
+                knowledge_bases=req.knowledge_bases,
+                question_categories=req.question_categories,
+                question_entries=req.question_entries,
+                language=req.language,
+            )
     except Exception as exc:  # noqa: BLE001
         logger.error(f"create_book failed: {exc}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(exc))
@@ -232,7 +234,8 @@ async def confirm_proposal(req: ConfirmProposalRequest) -> dict[str, Any]:
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"Invalid proposal: {exc}")
     try:
-        book, spine = await engine.confirm_proposal(book_id=req.book_id, edited_proposal=edited)
+        async with commercial_turn_lease():
+            book, spine = await engine.confirm_proposal(book_id=req.book_id, edited_proposal=edited)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except Exception as exc:  # noqa: BLE001
@@ -255,11 +258,16 @@ async def confirm_spine(req: ConfirmSpineRequest) -> dict[str, Any]:
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"Invalid spine: {exc}")
     try:
-        pages = await engine.confirm_spine(
-            book_id=req.book_id,
-            edited_spine=edited,
-            auto_compile=req.auto_compile,
-        )
+        lease = await acquire_commercial_turn_lease() if req.auto_compile else None
+        try:
+            pages = await engine.confirm_spine(
+                book_id=req.book_id,
+                edited_spine=edited,
+                auto_compile=req.auto_compile,
+            )
+        finally:
+            if lease is not None:
+                await lease.release()
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except Exception as exc:  # noqa: BLE001
@@ -273,7 +281,10 @@ async def compile_page(req: CompilePageRequest) -> dict[str, Any]:
     """Drive the compiler for the page the user just opened (current-page priority)."""
     engine = get_book_engine()
     try:
-        page = await engine.compile_page(book_id=req.book_id, page_id=req.page_id, force=req.force)
+        async with commercial_turn_lease():
+            page = await engine.compile_page(
+                book_id=req.book_id, page_id=req.page_id, force=req.force
+            )
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except Exception as exc:  # noqa: BLE001
@@ -286,12 +297,13 @@ async def compile_page(req: CompilePageRequest) -> dict[str, Any]:
 async def regenerate_block(req: RegenerateBlockRequest) -> dict[str, Any]:
     engine = get_book_engine()
     try:
-        block = await engine.regenerate_block(
-            book_id=req.book_id,
-            page_id=req.page_id,
-            block_id=req.block_id,
-            params_override=req.params_override,
-        )
+        async with commercial_turn_lease():
+            block = await engine.regenerate_block(
+                book_id=req.book_id,
+                page_id=req.page_id,
+                block_id=req.block_id,
+                params_override=req.params_override,
+            )
     except Exception as exc:  # noqa: BLE001
         logger.error(f"regenerate_block failed: {exc}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(exc))
@@ -318,7 +330,10 @@ def _coerce_content_type(name: str) -> ContentType:
 async def insert_block(req: InsertBlockRequest) -> dict[str, Any]:
     engine = get_book_engine()
     block_type = _coerce_block_type(req.block_type)
+    lease = None
     try:
+        if req.compile_now and block_type != BlockType.USER_NOTE:
+            lease = await acquire_commercial_turn_lease()
         block = await engine.insert_block(
             book_id=req.book_id,
             page_id=req.page_id,
@@ -330,6 +345,9 @@ async def insert_block(req: InsertBlockRequest) -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         logger.error(f"insert_block failed: {exc}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(exc))
+    finally:
+        if lease is not None:
+            await lease.release()
     if block is None:
         raise HTTPException(status_code=404, detail="Page or chapter not found")
     return {"block": block.model_dump(mode="json")}
@@ -363,13 +381,14 @@ async def change_block_type(req: ChangeBlockTypeRequest) -> dict[str, Any]:
     engine = get_book_engine()
     new_type = _coerce_block_type(req.new_type)
     try:
-        block = await engine.change_block_type(
-            book_id=req.book_id,
-            page_id=req.page_id,
-            block_id=req.block_id,
-            new_type=new_type,
-            params_override=req.params_override,
-        )
+        async with commercial_turn_lease():
+            block = await engine.change_block_type(
+                book_id=req.book_id,
+                page_id=req.page_id,
+                block_id=req.block_id,
+                new_type=new_type,
+                params_override=req.params_override,
+            )
     except Exception as exc:  # noqa: BLE001
         logger.error(f"change_block_type failed: {exc}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(exc))
@@ -383,13 +402,14 @@ async def deep_dive(req: DeepDiveRequest) -> dict[str, Any]:
     engine = get_book_engine()
     content_type = _coerce_content_type(req.content_type)
     try:
-        page = await engine.create_deep_dive_subpage(
-            book_id=req.book_id,
-            parent_page_id=req.parent_page_id,
-            topic=req.topic,
-            block_id=req.block_id,
-            content_type=content_type,
-        )
+        async with commercial_turn_lease():
+            page = await engine.create_deep_dive_subpage(
+                book_id=req.book_id,
+                parent_page_id=req.parent_page_id,
+                topic=req.topic,
+                block_id=req.block_id,
+                content_type=content_type,
+            )
     except Exception as exc:  # noqa: BLE001
         logger.error(f"deep_dive failed: {exc}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(exc))
@@ -433,11 +453,12 @@ async def refresh_fingerprints(book_id: str) -> dict[str, Any]:
 async def supplement(req: SupplementRequest) -> dict[str, Any]:
     engine = get_book_engine()
     try:
-        block = await engine.supplement_for_weakness(
-            book_id=req.book_id,
-            page_id=req.page_id,
-            topic=req.topic,
-        )
+        async with commercial_turn_lease():
+            block = await engine.supplement_for_weakness(
+                book_id=req.book_id,
+                page_id=req.page_id,
+                topic=req.topic,
+            )
     except Exception as exc:  # noqa: BLE001
         logger.error(f"supplement failed: {exc}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(exc))
@@ -463,7 +484,12 @@ async def set_page_chat_session(req: PageChatSessionRequest) -> dict[str, Any]:
 async def rebuild_book(req: RebuildBookRequest) -> dict[str, Any]:
     engine = get_book_engine()
     try:
-        pages = await engine.rebuild_book(book_id=req.book_id, auto_compile=req.auto_compile)
+        lease = await acquire_commercial_turn_lease() if req.auto_compile else None
+        try:
+            pages = await engine.rebuild_book(book_id=req.book_id, auto_compile=req.auto_compile)
+        finally:
+            if lease is not None:
+                await lease.release()
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except Exception as exc:  # noqa: BLE001
@@ -499,11 +525,19 @@ async def book_websocket(ws: WebSocket) -> None:
         {"type": "compile_page",     "book_id": "...", "page_id": "..."}
         {"type": "regenerate_block", "book_id": "...", "page_id": "...", "block_id": "...", "params_override": {}}
     """
-    from deeptutor.api.routers.auth import ws_auth_failed, ws_require_auth
+    from deeptutor.api.routers.auth import (
+        ws_auth_failed,
+        ws_authorize_message,
+        ws_require_auth,
+        ws_require_capability_access,
+    )
     from deeptutor.multi_user.context import reset_current_user
 
     user_token = await ws_require_auth(ws)
     if user_token is ws_auth_failed:
+        return
+    if not await ws_require_capability_access(ws):
+        reset_current_user(user_token)
         return
 
     await ws.accept()
@@ -543,16 +577,67 @@ async def book_websocket(ws: WebSocket) -> None:
             except Exception as exc:
                 await send({"type": "error", "content": f"Bad message: {exc}"})
                 continue
+            if not await ws_authorize_message(ws):
+                closed = True
+                break
 
             msg_type = str(data.get("type") or "").strip()
             if not msg_type:
                 await send({"type": "error", "content": "Missing 'type' field"})
                 continue
 
-            bus = StreamBus()
-            forward_task = await stream_into_socket(bus)
+            supported_types = {
+                "create",
+                "confirm_proposal",
+                "confirm_spine",
+                "compile_page",
+                "regenerate_block",
+            }
+            if msg_type not in supported_types:
+                await send({"type": "error", "content": f"Unknown message type: {msg_type}"})
+                continue
 
+            # Complete all frame-local coercion/model validation before taking
+            # the shared owner slot. Nothing below this point mutates book
+            # state or invokes a provider until acquisition succeeds.
             try:
+                question_categories = (
+                    [int(c) for c in (data.get("question_categories") or [])]
+                    if msg_type == "create"
+                    else []
+                )
+                question_entries = (
+                    [int(e) for e in (data.get("question_entries") or [])]
+                    if msg_type == "create"
+                    else []
+                )
+                edited_proposal = (
+                    BookProposal.model_validate(data["proposal"])
+                    if msg_type == "confirm_proposal" and data.get("proposal")
+                    else None
+                )
+                edited_spine = (
+                    Spine.model_validate(data["spine"])
+                    if msg_type == "confirm_spine" and data.get("spine")
+                    else None
+                )
+            except Exception as exc:
+                await send({"type": "error", "content": f"Invalid request: {exc}"})
+                continue
+
+            lease = None
+            try:
+                if msg_type != "confirm_spine" or bool(data.get("auto_compile", True)):
+                    lease = await acquire_commercial_turn_lease()
+            except Exception as exc:
+                await send({"type": "error", "content": str(exc)})
+                continue
+
+            bus = None
+            forward_task = None
+            try:
+                bus = StreamBus()
+                forward_task = await stream_into_socket(bus)
                 if msg_type == "create":
                     book, proposal = await engine.create_book(
                         user_intent=str(data.get("user_intent") or ""),
@@ -560,10 +645,8 @@ async def book_websocket(ws: WebSocket) -> None:
                         chat_selections=data.get("chat_selections") or [],
                         notebook_refs=data.get("notebook_refs") or [],
                         knowledge_bases=data.get("knowledge_bases") or [],
-                        question_categories=[
-                            int(c) for c in (data.get("question_categories") or [])
-                        ],
-                        question_entries=[int(e) for e in (data.get("question_entries") or [])],
+                        question_categories=question_categories,
+                        question_entries=question_entries,
                         language=str(data.get("language") or "en"),
                         stream=bus,
                     )
@@ -576,12 +659,9 @@ async def book_websocket(ws: WebSocket) -> None:
                     )
 
                 elif msg_type == "confirm_proposal":
-                    edited: BookProposal | None = None
-                    if data.get("proposal"):
-                        edited = BookProposal.model_validate(data["proposal"])
                     book, spine = await engine.confirm_proposal(
                         book_id=str(data.get("book_id") or ""),
-                        edited_proposal=edited,
+                        edited_proposal=edited_proposal,
                         stream=bus,
                     )
                     await send(
@@ -593,9 +673,6 @@ async def book_websocket(ws: WebSocket) -> None:
                     )
 
                 elif msg_type == "confirm_spine":
-                    edited_spine: Spine | None = None
-                    if data.get("spine"):
-                        edited_spine = Spine.model_validate(data["spine"])
                     pages = await engine.confirm_spine(
                         book_id=str(data.get("book_id") or ""),
                         edited_spine=edited_spine,
@@ -638,19 +715,20 @@ async def book_websocket(ws: WebSocket) -> None:
                         }
                     )
 
-                else:
-                    await send({"type": "error", "content": f"Unknown message type: {msg_type}"})
-
             except Exception as exc:
                 logger.error(f"book ws action {msg_type} failed: {exc}", exc_info=True)
                 await send({"type": "error", "content": str(exc)})
             finally:
-                await bus.close()
-                forward_task.cancel()
-                try:
-                    await forward_task
-                except (asyncio.CancelledError, Exception):
-                    pass
+                if bus is not None:
+                    await bus.close()
+                if forward_task is not None:
+                    forward_task.cancel()
+                    try:
+                        await forward_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                if lease is not None:
+                    await lease.release()
 
     except WebSocketDisconnect:
         pass

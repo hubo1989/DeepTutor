@@ -100,6 +100,26 @@ class VisualizeCapability(BaseCapability):
                 render_mode=render_mode,
                 attachments=context.attachments,
             )
+            # Trial v1 permits the lightweight visualization formats but not
+            # the subprocess-backed Manim renderer.  Explicit Manim requests
+            # are rejected before turn creation; when ``auto`` selected Manim
+            # internally, keep the allowed capability useful by falling back
+            # to a static SVG before any Manim stage or subprocess starts.
+            if analysis.render_type in _MANIM_RENDER_TYPES:
+                from deeptutor.commercial.entitlement_context import (
+                    get_commercial_access,
+                )
+
+                commercial_access = get_commercial_access()
+                if (
+                    commercial_access is not None
+                    and commercial_access.resolved.values.get("feature.manim") is not True
+                ):
+                    analysis.render_type = "svg"
+                    analysis.rationale = (
+                        f"{analysis.rationale} Manim is not included in the current plan; "
+                        "using SVG instead."
+                    ).strip()
             await stream.progress(
                 message=i18n.t(
                     "render_type_detected",

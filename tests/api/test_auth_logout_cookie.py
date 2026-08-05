@@ -14,6 +14,14 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 
+def test_commercial_cookie_policy_is_same_site_lax() -> None:
+    from deeptutor.api.routers import auth as auth_router
+
+    assert auth_router._cookie_samesite(secure=True, commercial=True) == "lax"
+    assert auth_router._cookie_samesite(secure=True, commercial=False) == "none"
+    assert auth_router._cookie_samesite(secure=False, commercial=False) == "lax"
+
+
 def test_logout_sets_secure_when_cookie_secure_enabled(monkeypatch) -> None:
     from deeptutor.api.routers import auth as auth_router
 

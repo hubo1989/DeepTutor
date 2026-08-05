@@ -15,6 +15,10 @@ import uuid
 
 from pydantic import BaseModel
 
+from deeptutor.commercial.storage_limits import (
+    atomic_write_batch_with_storage_limits,
+    atomic_write_bytes_with_storage_limits,
+)
 from deeptutor.services.llm import clean_thinking_tags
 from deeptutor.services.path_service import get_path_service
 
@@ -65,6 +69,14 @@ def _clean_record_summary(summary: str) -> str:
     return clean_thinking_tags(str(summary or "")).strip()
 
 
+def _json_bytes(payload: dict) -> bytes:
+    return json.dumps(payload, indent=2, ensure_ascii=False).encode("utf-8")
+
+
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    atomic_write_bytes_with_storage_limits(path, _json_bytes(payload))
+
+
 class NotebookManager:
     """Manage notebook files stored under ``data/user/workspace/notebook``."""
 
@@ -82,8 +94,7 @@ class NotebookManager:
 
     def _ensure_index(self) -> None:
         if not self.index_file.exists():
-            with open(self.index_file, "w", encoding="utf-8") as f:
-                json.dump({"notebooks": []}, f, indent=2, ensure_ascii=False)
+            _atomic_write_json(self.index_file, {"notebooks": []})
 
     def _load_index(self) -> dict:
         try:
@@ -93,8 +104,7 @@ class NotebookManager:
             return {"notebooks": []}
 
     def _save_index(self, index: dict) -> None:
-        with open(self.index_file, "w", encoding="utf-8") as f:
-            json.dump(index, f, indent=2, ensure_ascii=False)
+        _atomic_write_json(self.index_file, index)
 
     def _get_notebook_file(self, notebook_id: str) -> Path:
         return self.base_dir / f"{notebook_id}.json"
@@ -132,11 +142,10 @@ class NotebookManager:
 
     def _save_notebook(self, notebook: dict) -> None:
         filepath = self._get_notebook_file(notebook["id"])
-        with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(notebook, f, indent=2, ensure_ascii=False)
+        _atomic_write_json(filepath, notebook)
 
-    def _touch_index_entry(self, notebook_id: str, notebook: dict) -> None:
-        index = self._load_index()
+    @staticmethod
+    def _update_index_entry(index: dict, notebook_id: str, notebook: dict) -> None:
         for nb_info in index.get("notebooks", []):
             if nb_info["id"] != notebook_id:
                 continue
@@ -147,7 +156,21 @@ class NotebookManager:
             nb_info["color"] = notebook.get("color", nb_info.get("color", "#3B82F6"))
             nb_info["icon"] = notebook.get("icon", nb_info.get("icon", "book"))
             break
+
+    def _touch_index_entry(self, notebook_id: str, notebook: dict) -> None:
+        index = self._load_index()
+        self._update_index_entry(index, notebook_id, notebook)
         self._save_index(index)
+
+    def _save_notebook_and_index(self, notebook_id: str, notebook: dict) -> None:
+        index = self._load_index()
+        self._update_index_entry(index, notebook_id, notebook)
+        atomic_write_batch_with_storage_limits(
+            {
+                self._get_notebook_file(notebook_id): _json_bytes(notebook),
+                self.index_file: _json_bytes(index),
+            }
+        )
 
     # === Notebook Operations ===
 
@@ -168,8 +191,6 @@ class NotebookManager:
             "icon": icon,
         }
 
-        self._save_notebook(notebook)
-
         index = self._load_index()
         index["notebooks"].append(
             {
@@ -183,7 +204,12 @@ class NotebookManager:
                 "icon": icon,
             }
         )
-        self._save_index(index)
+        atomic_write_batch_with_storage_limits(
+            {
+                self._get_notebook_file(notebook_id): _json_bytes(notebook),
+                self.index_file: _json_bytes(index),
+            }
+        )
         return notebook
 
     def list_notebooks(self) -> list[dict]:
@@ -234,8 +260,7 @@ class NotebookManager:
             notebook["icon"] = icon
 
         notebook["updated_at"] = time.time()
-        self._save_notebook(notebook)
-        self._touch_index_entry(notebook_id, notebook)
+        self._save_notebook_and_index(notebook_id, notebook)
         return notebook
 
     def delete_notebook(self, notebook_id: str) -> bool:
@@ -282,15 +307,21 @@ class NotebookManager:
         }
 
         added_to: list[str] = []
+        writes: dict[Path, bytes] = {}
+        index = self._load_index()
         for notebook_id in notebook_ids:
             notebook = self._load_notebook(notebook_id)
             if not notebook:
                 continue
             notebook["records"].append(record)
             notebook["updated_at"] = now
-            self._save_notebook(notebook)
-            self._touch_index_entry(notebook_id, notebook)
+            self._update_index_entry(index, notebook_id, notebook)
+            writes[self._get_notebook_file(notebook_id)] = _json_bytes(notebook)
             added_to.append(notebook_id)
+
+        if writes:
+            writes[self.index_file] = _json_bytes(index)
+            atomic_write_batch_with_storage_limits(writes)
 
         return {"record": record, "added_to_notebooks": added_to}
 
@@ -350,8 +381,7 @@ class NotebookManager:
             return None
 
         notebook["updated_at"] = time.time()
-        self._save_notebook(notebook)
-        self._touch_index_entry(notebook_id, notebook)
+        self._save_notebook_and_index(notebook_id, notebook)
         return updated_record
 
     def get_records_by_references(self, notebook_references: list[dict]) -> list[dict]:
@@ -394,8 +424,7 @@ class NotebookManager:
             return False
 
         notebook["updated_at"] = time.time()
-        self._save_notebook(notebook)
-        self._touch_index_entry(notebook_id, notebook)
+        self._save_notebook_and_index(notebook_id, notebook)
         return True
 
     def get_statistics(self) -> dict:

@@ -14,8 +14,13 @@ from pathlib import Path
 import shutil
 from typing import List, Optional
 
+from deeptutor.commercial.storage_limits import (
+    atomic_write_text_with_storage_limits,
+    commit_staged_files_with_storage_limits,
+    create_staging_directory,
+    enforce_staging_scratch_limit,
+)
 from deeptutor.services.config import resolve_llm_runtime_config
-from deeptutor.services.file_io import atomic_write_json
 from deeptutor.services.rag.factory import (
     DEFAULT_PROVIDER,
     has_ready_provider_index,
@@ -93,7 +98,10 @@ def _read_metadata(metadata_file: Path) -> dict:
 
 def _write_metadata(metadata_file: Path, metadata: dict) -> None:
     """Persist a KB's metadata.json atomically (pretty-printed, non-ASCII preserved)."""
-    atomic_write_json(metadata_file, metadata)
+    atomic_write_text_with_storage_limits(
+        metadata_file,
+        json.dumps(metadata, indent=2, ensure_ascii=False) + "\n",
+    )
 
 
 def _raw_hash_key(file_path: Path, raw_dir: Path) -> str:
@@ -219,39 +227,65 @@ class DocumentAdder:
 
         ingested_hashes = self.get_ingested_hashes()
         files_to_process: list[Path] = []
+        staging = create_staging_directory(self.raw_dir)
+        staged_sizes: list[int] = []
 
-        for source in source_files:
-            source_path = Path(source)
-            if not source_path.exists() or not source_path.is_file():
-                logger.warning(f"Missing file: {source}")
-                continue
-
-            current_hash = self._get_file_hash(source_path)
-            if current_hash in ingested_hashes.values() and not allow_duplicates:
-                logger.info(f"Skipped (content already indexed): {source_path.name}")
-                continue
-
-            # Files already saved under raw/ (e.g. by the upload route, possibly
-            # inside a folder) are indexed in place — never flattened to the
-            # basename — so the uploaded folder structure is preserved verbatim.
-            if source_path.resolve().is_relative_to(self.raw_dir.resolve()):
-                files_to_process.append(source_path)
-                continue
-
-            dest_path = self.raw_dir / source_path.name
-            if dest_path.exists():
-                dest_hash = self._get_file_hash(dest_path)
-                if dest_hash == current_hash:
-                    logger.info(f"Recovering staged file: {source_path.name}")
-                    files_to_process.append(dest_path)
-                    continue
-                if not allow_duplicates:
-                    logger.info(f"Skipped (filename collision): {source_path.name}")
+        try:
+            for source in source_files:
+                source_path = Path(source)
+                if not source_path.exists() or not source_path.is_file():
+                    logger.warning(f"Missing file: {source}")
                     continue
 
-            shutil.copy2(source_path, dest_path)
-            logger.info(f"Staged to raw: {source_path.name}")
-            files_to_process.append(dest_path)
+                current_hash = self._get_file_hash(source_path)
+                if current_hash in ingested_hashes.values() and not allow_duplicates:
+                    logger.info(f"Skipped (content already indexed): {source_path.name}")
+                    continue
+
+                # Files already saved under raw/ (e.g. by the upload route,
+                # possibly inside a folder) are indexed in place — never
+                # flattened to the basename.
+                if source_path.resolve().is_relative_to(self.raw_dir.resolve()):
+                    files_to_process.append(source_path)
+                    continue
+
+                dest_path = self.raw_dir / source_path.name
+                staged_path = staging / source_path.name
+                collision_path = staged_path if staged_path.exists() else dest_path
+                if collision_path.exists():
+                    dest_hash = self._get_file_hash(collision_path)
+                    if dest_hash == current_hash:
+                        logger.info(f"Recovering staged file: {source_path.name}")
+                        files_to_process.append(dest_path)
+                        continue
+                    if not allow_duplicates:
+                        logger.info(f"Skipped (filename collision): {source_path.name}")
+                        continue
+
+                shutil.copy2(source_path, staged_path)
+                staged_sizes.append(staged_path.stat().st_size)
+                enforce_staging_scratch_limit(
+                    staging,
+                    replacing_paths=(
+                        self.raw_dir / path.relative_to(staging)
+                        for path in staging.rglob("*")
+                        if path.is_file()
+                    ),
+                )
+                logger.info(f"Staged to raw: {source_path.name}")
+                files_to_process.append(dest_path)
+
+            if staged_sizes:
+                commit_staged_files_with_storage_limits(
+                    staging,
+                    self.raw_dir,
+                    upload_file_sizes=staged_sizes,
+                )
+            else:
+                shutil.rmtree(staging, ignore_errors=True)
+        except Exception:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
 
         return files_to_process
 

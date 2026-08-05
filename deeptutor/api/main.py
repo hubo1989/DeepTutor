@@ -2,9 +2,8 @@ from contextlib import asynccontextmanager
 import logging
 import sys
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 
 from deeptutor.logging import configure_logging
 from deeptutor.services.config import (
@@ -14,7 +13,6 @@ from deeptutor.services.config import (
     load_system_settings,
 )
 from deeptutor.services.config.origins import normalize_origins
-from deeptutor.services.path_service import get_path_service
 
 ensure_runtime_settings_files()
 export_runtime_settings_to_env(overwrite=True)
@@ -39,19 +37,6 @@ CONFIG_DRIFT_ERROR_TEMPLATE = (
     "registered in the runtime tool registry. Register the missing tools or "
     "remove the stale tool names from the capability manifests."
 )
-
-
-class SafeOutputStaticFiles(StaticFiles):
-    """Static file mount that only exposes explicitly whitelisted artifacts."""
-
-    def __init__(self, *args, path_service, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._path_service = path_service
-
-    async def get_response(self, path: str, scope):
-        if not self._path_service.is_public_output_path(path):
-            raise HTTPException(status_code=404, detail="Output not found")
-        return await super().get_response(path, scope)
 
 
 def validate_tool_consistency():
@@ -97,6 +82,9 @@ def _build_cors_settings() -> dict[str, object]:
         "http://127.0.0.1:3000",
     ]
     for origin in extra_origins:
+        if auth_settings["enabled"] and origin == "*":
+            logger.warning("Ignoring wildcard CORS origin while authentication is enabled")
+            continue
         if origin not in origins:
             origins.append(origin)
 
@@ -124,6 +112,13 @@ async def lifespan(app: FastAPI):
 
     # Validate configuration consistency
     validate_tool_consistency()
+
+    # Hosted mode is fail-closed: validate auth/cookie/model invariants, then
+    # migrate, seed Trial v1, and reconcile existing identities before any
+    # request can be accepted. Disabled mode returns an inert runtime.
+    from deeptutor.commercial.integration import startup_commercial_foundation
+
+    commercial_runtime = await startup_commercial_foundation()
 
     # Initialize LLM client early so OPENAI_* env vars are available before
     # any downstream provider integrations start.
@@ -215,9 +210,16 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Failed to stop EventBus: {e}")
 
+    try:
+        from deeptutor.commercial.integration import shutdown_commercial_foundation
+
+        await shutdown_commercial_foundation(commercial_runtime)
+    except Exception as e:
+        logger.error("Failed to stop commercial control plane: %s", e, exc_info=True)
+
 
 app = FastAPI(
-    title="DeepTutor API",
+    title="LearnLeader API",
     version="1.0.0",
     lifespan=lifespan,
     # Disable automatic trailing slash redirects to prevent protocol downgrade issues
@@ -281,26 +283,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Mount a filtered view over user outputs.
-# Only whitelisted artifact paths are readable through the static handler.
-path_service = get_path_service()
-user_dir = path_service.get_public_outputs_root()
-
 # Initialize user directories on startup
 try:
     from deeptutor.services.setup import init_user_directories
 
     init_user_directories()
 except Exception:
-    # Fallback: just create the main directory if it doesn't exist
-    if not user_dir.exists():
-        user_dir.mkdir(parents=True)
-
-app.mount(
-    "/api/outputs",
-    SafeOutputStaticFiles(directory=str(user_dir), path_service=path_service),
-    name="outputs",
-)
+    logger.warning("Failed to initialize user directories", exc_info=True)
 
 # Import routers only after runtime settings are initialized.
 # Some router modules load YAML settings at import time.
@@ -308,8 +297,8 @@ from deeptutor.api.routers import (
     agent_config,
     attachments,
     auth,
-    byok,
     book,
+    byok,
     capabilities_settings,
     chat,
     co_writer,
@@ -320,6 +309,7 @@ from deeptutor.api.routers import (
     mcp_settings,
     memory,
     notebook,
+    outputs,
     partners,
     personas,
     plugins_api,
@@ -337,16 +327,19 @@ from deeptutor.api.routers import (
 from deeptutor.api.routers import (
     tools as tools_router,
 )
+from deeptutor.commercial.api import router as commercial_router  # noqa: E402
 from deeptutor.multi_user.router import router as multi_user_router  # noqa: E402
 
 # Auth router is public — login/logout/register/status require no token
 app.include_router(auth.router, prefix="/api/v1/auth", tags=["auth"])
+app.include_router(commercial_router, prefix="/api/v1", tags=["commercial"])
 
 # All other routers require a valid session when AUTH_ENABLED=true.
 # require_auth is a no-op when AUTH_ENABLED=false, so this is safe for local use.
-from deeptutor.api.routers.auth import require_admin, require_auth  # noqa: E402
+from deeptutor.api.routers.auth import require_admin  # noqa: E402
+from deeptutor.commercial.access import require_commercial_access  # noqa: E402
 
-_auth = [Depends(require_auth)]
+_auth = [Depends(require_commercial_access)]
 # Partner data is anchored at the admin workspace (data/partners) and shared
 # process-wide, so management is admin-gated in multi-user deployments
 # (single-user local runs are implicitly admin — no behaviour change there).
@@ -419,9 +412,9 @@ app.include_router(
 app.include_router(tools_router.router, prefix="/api/v1/tools", tags=["tools"], dependencies=_auth)
 app.include_router(system.router, prefix="/api/v1/system", tags=["system"], dependencies=_auth)
 app.include_router(voice.router, prefix="/api/v1/voice", tags=["voice"], dependencies=_auth)
-app.include_router(
-    plugins_api.router, prefix="/api/v1/plugins", tags=["plugins"], dependencies=_auth
-)
+# The Plugins Playground router carries its own admin dependency because it
+# exposes process-wide registries and direct tool/capability execution.
+app.include_router(plugins_api.router, prefix="/api/v1/plugins", tags=["plugins"])
 app.include_router(
     agent_config.router, prefix="/api/v1/agent-config", tags=["agent-config"], dependencies=_auth
 )
@@ -432,6 +425,12 @@ app.include_router(
     attachments.router,
     prefix="/api/attachments",
     tags=["attachments"],
+    dependencies=_auth,
+)
+app.include_router(
+    outputs.router,
+    prefix="/api/outputs",
+    tags=["outputs"],
     dependencies=_auth,
 )
 
@@ -446,7 +445,7 @@ app.include_router(quiz_judge.router, prefix="/api/v1", tags=["quiz-judge"])
 
 @app.get("/")
 async def root():
-    return {"message": "Welcome to DeepTutor API"}
+    return {"message": "Welcome to LearnLeader API"}
 
 
 if __name__ == "__main__":

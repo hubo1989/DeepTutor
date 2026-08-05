@@ -61,10 +61,11 @@ class ProgressTracker:
                 from deeptutor.api.utils.progress_broadcaster import ProgressBroadcaster
 
                 broadcaster = ProgressBroadcaster.get_instance()
+                channel_key = broadcaster.resource_key(self.base_dir, self.kb_name)
 
                 try:
                     loop = asyncio.get_running_loop()
-                    loop.create_task(broadcaster.broadcast(self.kb_name, progress))
+                    loop.create_task(broadcaster.broadcast(channel_key, progress))
                 except RuntimeError:
                     pass
             except (ImportError, Exception):

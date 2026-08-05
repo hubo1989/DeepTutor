@@ -60,6 +60,7 @@ async def test_incremental_add_migrates_matching_legacy_index_to_flat_version(
 
     def _fake_load_index(storage_dir) -> _FakeIndex:
         captured["load_dir"] = str(storage_dir)
+        captured["copied_docstore"] = str((Path(storage_dir) / "docstore.json").exists())
         return _FakeIndex()
 
     async def _verify_embedding_connectivity(self) -> None:
@@ -85,8 +86,11 @@ async def test_incremental_add_migrates_matching_legacy_index_to_flat_version(
     assert await pipeline.add_documents("kb", [str(raw_file)]) is True
 
     flat_storage_dir = kb_dir / "version-1"
-    assert captured["load_dir"] == str(legacy_storage_dir)
-    assert captured["persist_dir"] == str(flat_storage_dir)
+    staging_dir = Path(captured["load_dir"])
+    assert staging_dir.name.startswith(".version-1.staging-")
+    assert captured["copied_docstore"] == "True"
+    assert captured["persist_dir"] == str(staging_dir)
+    assert not staging_dir.exists()
     assert (flat_storage_dir / "docstore.json").exists()
     assert json.loads((flat_storage_dir / "meta.json").read_text())["signature"] == sig.hash()
 

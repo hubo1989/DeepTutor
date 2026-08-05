@@ -149,11 +149,18 @@ def normalize_grant(user_id: str, payload: dict[str, Any] | None) -> dict[str, A
 def load_grant(user_id: str) -> dict[str, Any]:
     path = grant_path(user_id)
     if not path.exists():
-        return empty_grant(user_id)
-    try:
-        return normalize_grant(user_id, json.loads(path.read_text(encoding="utf-8")))
-    except Exception:
-        return empty_grant(user_id)
+        grant = empty_grant(user_id)
+    else:
+        try:
+            grant = normalize_grant(user_id, json.loads(path.read_text(encoding="utf-8")))
+        except Exception:
+            grant = empty_grant(user_id)
+
+    # Imported lazily to keep commercial mode optional and avoid a module
+    # cycle: the HTTP dependency itself builds on the multi-user auth layer.
+    from deeptutor.commercial.entitlement_context import project_grant_for_commercial
+
+    return project_grant_for_commercial(user_id, grant)
 
 
 def merge_grant_update(

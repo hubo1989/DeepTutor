@@ -7,10 +7,10 @@ secret read used only by an already-authorized runtime resolver.
 
 from __future__ import annotations
 
+import base64
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from datetime import datetime, timezone
-import base64
 import hashlib
 import json
 import os
@@ -22,6 +22,8 @@ import tempfile
 import threading
 from typing import Any
 from uuid import uuid4
+
+from deeptutor.services.private_state import exclusive_path_lock
 
 from . import paths
 
@@ -302,9 +304,11 @@ class UserByokCredentialVault:
         self.root.mkdir(parents=True, exist_ok=True)
         _assert_safe_directory(self.root)
         _assert_safe_file(self.audit_path)
-        with self.audit_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(dict(event), ensure_ascii=False, sort_keys=True) + "\n")
-            handle.flush()
+        with exclusive_path_lock(self.audit_path):
+            _assert_safe_file(self.audit_path)
+            with self.audit_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(dict(event), ensure_ascii=False, sort_keys=True) + "\n")
+                handle.flush()
         _chmod(self.audit_path, stat.S_IRUSR | stat.S_IWUSR)
 
     def is_available(self) -> bool:
@@ -341,7 +345,10 @@ class UserByokCredentialVault:
             profile_id = str(value.get("profile_id") or "").strip()
             if source not in {"platform", "byok"}:
                 raise ValueError("BYOK preference source must be platform or byok")
-            clean[service] = {"source": source, **({"profile_id": profile_id} if profile_id else {})}
+            clean[service] = {
+                "source": source,
+                **({"profile_id": profile_id} if profile_id else {}),
+            }
         with self._locked(user_id) as user_root:
             profiles, state = self._load_unlocked(user_root)
             state = {
@@ -374,7 +381,11 @@ class UserByokCredentialVault:
             rows = [item for item in profiles["profiles"] if isinstance(item, dict)]
             existing = next((item for item in rows if item.get("id") == profile_id), None)
             current_generation = int(existing.get("generation", 0)) if existing else None
-            if existing is not None and expected_generation is not None and current_generation != expected_generation:
+            if (
+                existing is not None
+                and expected_generation is not None
+                and current_generation != expected_generation
+            ):
                 raise ByokVaultConflict("BYOK profile changed; reload and retry")
             if existing is None and profile_id:
                 raise ByokProfileNotFound("BYOK profile not found")
@@ -448,7 +459,10 @@ class UserByokCredentialVault:
             existing = next((item for item in rows if item.get("id") == profile_id), None)
             if existing is None:
                 return False
-            if expected_generation is not None and int(existing.get("generation", 0)) != expected_generation:
+            if (
+                expected_generation is not None
+                and int(existing.get("generation", 0)) != expected_generation
+            ):
                 raise ByokVaultConflict("BYOK profile changed; reload and retry")
             rows = [item for item in rows if item is not existing]
             next_state = {
@@ -478,7 +492,11 @@ class UserByokCredentialVault:
         with self._locked(user_id) as user_root:
             profiles, _state = self._load_unlocked(user_root)
             profile = next(
-                (item for item in profiles["profiles"] if isinstance(item, dict) and item.get("id") == profile_id),
+                (
+                    item
+                    for item in profiles["profiles"]
+                    if isinstance(item, dict) and item.get("id") == profile_id
+                ),
                 None,
             )
             if profile is None:

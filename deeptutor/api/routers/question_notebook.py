@@ -11,6 +11,8 @@ import uuid as _uuid
 from fastapi import APIRouter, HTTPException, Query, Response
 from pydantic import BaseModel, Field
 
+from deeptutor.commercial.entitlement_context import CommercialAccessDenied
+from deeptutor.commercial.storage_limits import CommercialResourceLimitDenied
 from deeptutor.services.session import get_sqlite_session_store
 from deeptutor.services.storage import get_attachment_store
 
@@ -161,6 +163,14 @@ async def _persist_answer_images(
                     data=raw_bytes,
                     mime_type=mime_type,
                 )
+            except (CommercialAccessDenied, CommercialResourceLimitDenied) as exc:
+                detail: dict[str, object] = {
+                    "code": exc.code,
+                    "message": str(exc),
+                }
+                if isinstance(exc, CommercialResourceLimitDenied):
+                    detail.update(exc.details)
+                raise HTTPException(status_code=402, detail=detail) from exc
             except Exception as exc:
                 logger.warning("attachment store rejected answer image %s: %s", filename, exc)
                 continue

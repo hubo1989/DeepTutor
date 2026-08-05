@@ -29,6 +29,7 @@ uploaded twice in the same session.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 from pathlib import Path
@@ -153,8 +154,19 @@ class LocalDiskAttachmentStore:
         if target is None:
             raise ValueError(f"refusing to write attachment outside storage root: {stored!r}")
 
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._write_sync, target, data)
+        from deeptutor.commercial.storage_limits import (
+            atomic_write_bytes_with_storage_limits,
+            commercial_owner_resource_lock,
+        )
+
+        async with commercial_owner_resource_lock():
+            await asyncio.to_thread(
+                atomic_write_bytes_with_storage_limits,
+                target,
+                data,
+                enforce_upload_limit=True,
+                additional_roots=(self._root,),
+            )
 
         # The router uses the same _coerce_filename rules to look up the file,
         # so the public URL must use the sanitised pieces. Each path segment
@@ -164,23 +176,6 @@ class LocalDiskAttachmentStore:
         aid = quote(attachment_id, safe="")
         name = quote(_coerce_filename(filename), safe="")
         return f"{_PUBLIC_URL_PREFIX}/{sid}/{aid}/{name}"
-
-    @staticmethod
-    def _write_sync(target: Path, data: bytes) -> None:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        # Atomic-ish write: write to .tmp then rename. Avoids exposing a
-        # half-written file via the static handler.
-        tmp = target.with_suffix(target.suffix + ".tmp")
-        try:
-            with tmp.open("wb") as fh:
-                fh.write(data)
-            os.replace(tmp, target)
-        finally:
-            if tmp.exists():
-                try:
-                    tmp.unlink()
-                except OSError:
-                    pass
 
     async def delete_session(self, session_id: str) -> None:
         session_dir = self._session_dir(session_id)
@@ -245,10 +240,47 @@ def get_attachment_store() -> AttachmentStore:
 
 
 def _attachment_root() -> Path:
+    from deeptutor.multi_user.context import get_current_user_or_none
+    from deeptutor.multi_user.paths import get_current_path_service
+
+    user = get_current_user_or_none()
     override = str(load_system_settings().get("chat_attachment_dir") or "").strip()
     if override:
-        return Path(override).expanduser().resolve()
-    return get_path_service().get_user_root().joinpath(*_DEFAULT_SUBPATH).resolve()
+        configured_root = Path(override).expanduser().resolve()
+        if user is None or user.scope.kind == "admin":
+            return configured_root
+        owner_root = external_attachment_root_for_owner(user.scope.user_id)
+        if owner_root is None:  # pragma: no cover - override was just resolved
+            raise RuntimeError("external attachment root could not be resolved")
+        return owner_root
+
+    # Preserve local/CLI behavior when there is no identity context. Inside
+    # authenticated HTTP/WS work, resolve directly so an unexpected scoping
+    # failure cannot silently fall back to the administrator's PathService.
+    service = get_current_path_service() if user is not None else get_path_service()
+    return service.get_user_root().joinpath(*_DEFAULT_SUBPATH).resolve()
+
+
+def external_attachment_root_for_owner(owner_id: str) -> Path | None:
+    """Resolve one owner's namespace under a deployment-level override.
+
+    This context-free form lets account export/deletion cover attachments
+    after the request's CurrentUser context has been torn down.  ``None``
+    means attachments already live inside the ordinary per-user root.
+    """
+
+    override = str(load_system_settings().get("chat_attachment_dir") or "").strip()
+    if not override:
+        return None
+    raw_owner = str(owner_id or "").strip()
+    if not raw_owner:
+        raise ValueError("attachment owner id is required")
+    configured_root = Path(override).expanduser().resolve()
+    safe_owner = _coerce_filename(raw_owner)[:48]
+    digest = hashlib.sha256(raw_owner.encode("utf-8")).hexdigest()[:12]
+    owner_root = (configured_root / "users" / f"{safe_owner}-{digest}").resolve()
+    owner_root.relative_to(configured_root)
+    return owner_root
 
 
 def reset_attachment_store() -> None:

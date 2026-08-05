@@ -6,9 +6,10 @@ Manages system status checks and model connection tests
 from datetime import datetime
 import time
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 
+from deeptutor.api.routers.auth import require_admin
 from deeptutor.multi_user.context import get_current_user
 from deeptutor.services.config import resolve_search_runtime_config
 from deeptutor.services.embedding import get_embedding_client, get_embedding_config
@@ -146,7 +147,7 @@ async def get_system_status():
 
 
 @router.post("/test/llm", response_model=TestResponse)
-async def test_llm_connection():
+async def test_llm_connection(_: object = Depends(require_admin)):
     """
     Test LLM model connection by sending a simple completion request
 
@@ -214,7 +215,7 @@ async def test_llm_connection():
 
 
 @router.post("/test/embeddings", response_model=TestResponse)
-async def test_embeddings_connection():
+async def test_embeddings_connection(_: object = Depends(require_admin)):
     """
     Test Embeddings model connection by sending a simple embedding request
 
@@ -271,7 +272,7 @@ async def test_embeddings_connection():
 
 
 @router.post("/test/search", response_model=TestResponse)
-async def test_search_connection():
+async def test_search_connection(_: object = Depends(require_admin)):
     start_time = time.time()
 
     try:

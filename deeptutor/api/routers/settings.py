@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
+from deeptutor.commercial.runtime import commercial_mode_requested
 from deeptutor.multi_user.context import get_current_user
 from deeptutor.multi_user.model_access import allowed_llm_options
 from deeptutor.services.codex_auth import CodexAuthError, get_codex_oauth_service
@@ -478,6 +479,7 @@ def _network_settings_payload() -> dict[str, Any]:
     )
     auth_enabled = bool(auth["enabled"])
     cookie_secure = bool(auth["cookie_secure"])
+    cookie_samesite = "lax" if commercial_mode_requested() else ("none" if cookie_secure else "lax")
     return {
         "settings": {
             "backend_port": file_system["backend_port"],
@@ -499,8 +501,10 @@ def _network_settings_payload() -> dict[str, Any]:
         "auth": {
             "enabled": auth_enabled,
             "cookie_secure": cookie_secure,
-            "cookie_samesite": "none" if cookie_secure else "lax",
-            "cross_site_cookie_ready": bool(auth_enabled and cookie_secure),
+            "cookie_samesite": cookie_samesite,
+            "cross_site_cookie_ready": bool(
+                auth_enabled and cookie_secure and cookie_samesite == "none"
+            ),
         },
         "restart_required": True,
     }
@@ -1259,7 +1263,7 @@ async def complete_tour(payload: TourCompletePayload | None = None):
 
     return {
         "status": "completed",
-        "message": "Configuration saved. DeepTutor will restart shortly.",
+        "message": "Configuration saved. LearnLeader will restart shortly.",
         "launch_at": launch_at,
         "redirect_at": redirect_at,
         "runtime": applied,

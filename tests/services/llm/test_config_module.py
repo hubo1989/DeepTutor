@@ -93,6 +93,50 @@ def test_scoped_llm_config_takes_precedence_over_global_cache(monkeypatch) -> No
     assert config_module.get_llm_config().model == "gpt-global"
 
 
+def test_non_admin_never_reuses_process_global_llm_cache(monkeypatch, tmp_path) -> None:
+    from deeptutor.multi_user.context import reset_current_user, set_current_user
+    from deeptutor.multi_user.models import CurrentUser, UserScope
+
+    config_module._LLM_CONFIG_CACHE = LLMConfig(
+        model="admin-only-model",
+        api_key="admin-secret",
+        base_url="https://admin.example/v1",
+    )
+    monkeypatch.setattr(
+        config_module,
+        "resolve_llm_runtime_config",
+        lambda: ResolvedLLMConfig(
+            model="alice-assigned-model",
+            provider_name="openai",
+            provider_mode="standard",
+            binding_hint="openai",
+            binding="openai",
+            api_key="alice-authorized-key",
+            base_url="https://alice.example/v1",
+            effective_url="https://alice.example/v1",
+            api_version=None,
+            extra_headers={},
+            reasoning_effort=None,
+            context_window=None,
+        ),
+    )
+    user = CurrentUser(
+        id="u_alice",
+        username="alice",
+        role="user",
+        scope=UserScope(kind="user", user_id="u_alice", root=tmp_path),
+    )
+    token = set_current_user(user)
+    try:
+        resolved = config_module.get_llm_config()
+    finally:
+        reset_current_user(token)
+
+    assert resolved.model == "alice-assigned-model"
+    assert resolved.api_key == "alice-authorized-key"
+    assert config_module._LLM_CONFIG_CACHE.model == "admin-only-model"
+
+
 def test_initialize_environment_sets_openai_env(monkeypatch) -> None:
     """initialize_environment should set OPENAI env vars from resolver output."""
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)

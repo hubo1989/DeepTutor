@@ -150,6 +150,11 @@ async def run_labeled_step(
         "stream": True,
         **completion_kwargs,
     }
+    call_id = str(iter_meta.get("call_id") or iter_meta.get("trace_id") or "").strip()
+    if call_id:
+        # Compatibility retries below copy this exact value. The DeepTutor
+        # accounting wrapper pops it before forwarding kwargs to providers.
+        kwargs["_commercial_request_id"] = f"{source}:{stage}:{call_id}"
     auto_stream_options_added = False
     if usage is not None and "stream_options" not in kwargs:
         kwargs["stream_options"] = {"include_usage": True}
@@ -385,6 +390,10 @@ async def run_labeled_step(
             if auto_stream_options_added and is_stream_options_unsupported(exc):
                 retry_kwargs = dict(kwargs)
                 retry_kwargs.pop("stream_options", None)
+                if "_commercial_request_id" in kwargs:
+                    retry_kwargs["_commercial_request_id"] = (
+                        f"{kwargs['_commercial_request_id']}:compat-no-stream-options"
+                    )
                 return await client.chat.completions.create(**retry_kwargs)
             if tool_schemas and is_tool_schema_unsupported(exc):
                 await stream.progress(
@@ -399,6 +408,10 @@ async def run_labeled_step(
                 retry_kwargs = dict(kwargs)
                 retry_kwargs.pop("tools", None)
                 retry_kwargs.pop("tool_choice", None)
+                if "_commercial_request_id" in kwargs:
+                    retry_kwargs["_commercial_request_id"] = (
+                        f"{kwargs['_commercial_request_id']}:compat-no-tools"
+                    )
                 return await client.chat.completions.create(**retry_kwargs)
             # Stage-2 vision fallback: the model rejected our image content and
             # it is not in the known-vision allowlist. Strip images in place
@@ -417,6 +430,10 @@ async def run_labeled_step(
                         {"trace_kind": "warning", "image_fallback": True},
                     ),
                 )
+                if "_commercial_request_id" in kwargs:
+                    kwargs["_commercial_request_id"] = (
+                        f"{kwargs['_commercial_request_id']}:compat-text-only"
+                    )
                 return await client.chat.completions.create(**kwargs)
             raise
 

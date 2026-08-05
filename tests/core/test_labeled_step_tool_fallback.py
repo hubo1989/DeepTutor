@@ -94,7 +94,7 @@ async def test_labeled_step_retries_without_tools_on_provider_schema_error() -> 
             stream=bus,
             source="chat",
             stage="responding",
-            iter_meta={"label": "Reasoning", "trace_id": "iter-1"},
+            iter_meta={"label": "Reasoning", "call_id": "turn-1/iteration-1"},
         )
 
     events, result = await _collect_events(bus, _run)
@@ -103,6 +103,10 @@ async def test_labeled_step_retries_without_tools_on_provider_schema_error() -> 
     assert result.text == "OK"
     assert client.calls[0]["tools"]
     assert "tools" not in client.calls[1]
+    assert [call["_commercial_request_id"] for call in client.calls] == [
+        "chat:responding:turn-1/iteration-1",
+        "chat:responding:turn-1/iteration-1:compat-no-tools",
+    ]
     warnings = [
         event
         for event in events

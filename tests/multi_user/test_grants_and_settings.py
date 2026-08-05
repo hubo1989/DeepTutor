@@ -134,9 +134,8 @@ def test_new_user_gets_a_create_time_default_quota_snapshot(mu_isolated_root, mo
         },
     )
 
-    # The first account is promoted to admin automatically, so create the
-    # deployment owner before exercising a regular user's grant snapshot.
-    auth.add_user("admin@example.com", "password1234")
+    # Every public/admin-created role=user account receives its own grant
+    # snapshot; no first-account role promotion is involved.
     auth.add_user("alice@example.com", "password1234")
     record = get_user("alice@example.com")
     assert record is not None
@@ -185,9 +184,7 @@ def test_admin_default_quota_api_normalizes_and_persists(tmp_path, monkeypatch):
             "monthly_tokens": 20_000_000_000,
         }
     )
-    saved = asyncio.run(
-        multi_user_router.put_default_token_quota(payload, object())
-    )
+    saved = asyncio.run(multi_user_router.put_default_token_quota(payload, object()))
     assert saved["default_token_quota"] == {
         "daily_tokens": 0,
         "monthly_tokens": 10_000_000_000,

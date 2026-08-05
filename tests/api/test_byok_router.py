@@ -23,7 +23,9 @@ def mu_isolated_root(tmp_path, monkeypatch):
     monkeypatch.setattr(identity, "AUTH_DIR", system_root / "auth")
     monkeypatch.setattr(identity, "USERS_FILE", system_root / "auth" / "users.json")
     monkeypatch.setattr(identity, "SECRET_FILE", system_root / "auth" / "auth_secret")
-    monkeypatch.setattr(identity, "LEGACY_USERS_FILE", tmp_path / "data" / "user" / "auth_users.json")
+    monkeypatch.setattr(
+        identity, "LEGACY_USERS_FILE", tmp_path / "data" / "user" / "auth_users.json"
+    )
     monkeypatch.setattr(identity, "LEGACY_SECRET_FILE", tmp_path / "data" / "user" / "auth_secret")
     monkeypatch.setattr(grants, "GRANTS_DIR", system_root / "grants")
     admin_root.mkdir(parents=True, exist_ok=True)
@@ -68,13 +70,13 @@ def byok_client(mu_isolated_root, make_user, seed_user, monkeypatch):
     from deeptutor.multi_user.grants import load_grant, save_grant
     from deeptutor.services.auth import TokenPayload
 
-    # The first stored account is intentionally promoted to administrator by
-    # the identity layer. Seed it separately so Alice and Bob exercise normal
-    # user grants.
-    seed_user("admin@example.com")
+    # Public/local role=user accounts stay regular users even in an empty store.
     alice = seed_user("alice@example.com")
     bob = seed_user("bob@example.com")
-    users = {"alice": make_user(alice["id"], username="alice@example.com"), "bob": make_user(bob["id"], username="bob@example.com")}
+    users = {
+        "alice": make_user(alice["id"], username="alice@example.com"),
+        "bob": make_user(bob["id"], username="bob@example.com"),
+    }
     for user in users.values():
         grant = load_grant(user.id)
         grant["byok"] = {service: {"enabled": True} for service in ("llm", "embedding", "mineru")}
@@ -87,7 +89,9 @@ def byok_client(mu_isolated_root, make_user, seed_user, monkeypatch):
 
     async def auth_override(x_test_user: str = Header(default="alice")):
         set_current_user(users[x_test_user])
-        return TokenPayload(username=users[x_test_user].username, role="user", user_id=users[x_test_user].id)
+        return TokenPayload(
+            username=users[x_test_user].username, role="user", user_id=users[x_test_user].id
+        )
 
     app = FastAPI()
     app.include_router(byok_router.router, prefix="/api/v1")

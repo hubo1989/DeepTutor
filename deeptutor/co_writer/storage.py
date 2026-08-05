@@ -25,7 +25,7 @@ import uuid
 
 from pydantic import BaseModel, Field
 
-from deeptutor.services.file_io import atomic_write_text as _atomic_write_text
+from deeptutor.commercial.storage_limits import atomic_write_text_with_storage_limits
 from deeptutor.services.path_service import get_path_service
 
 logger = logging.getLogger(__name__)
@@ -53,7 +53,7 @@ class CoWriterDocumentSummary(BaseModel):
 
 def _atomic_write_json(path: Path, payload: Any) -> None:
     text = json.dumps(payload, ensure_ascii=False, indent=2, default=str)
-    _atomic_write_text(path, text)
+    atomic_write_text_with_storage_limits(path, text)
 
 
 def _read_json(path: Path) -> Any | None:
@@ -228,7 +228,6 @@ class CoWriterStorage:
     # ── Internal ─────────────────────────────────────────────────────────
 
     def _write(self, document: CoWriterDocument) -> None:
-        self.ensure_doc_root(document.id)
         _atomic_write_json(self.manifest_path(document.id), document.model_dump(mode="json"))
 
 

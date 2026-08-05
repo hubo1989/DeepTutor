@@ -42,7 +42,21 @@ def collect_public_artifacts(
     if not root.exists() or not root.is_dir():
         return []
 
-    service = path_service or get_path_service()
+    if path_service is not None:
+        service = path_service
+    else:
+        # An authenticated HTTP/WS turn must never fall through
+        # ``get_path_service()``'s legacy admin fallback if scoped resolution
+        # fails. Local CLI calls have no current-user context and retain the
+        # historical default workspace behavior.
+        from deeptutor.multi_user.context import get_current_user_or_none
+        from deeptutor.multi_user.paths import get_current_path_service
+
+        service = (
+            get_current_path_service()
+            if get_current_user_or_none() is not None
+            else get_path_service()
+        )
     public_root = service.get_public_outputs_root().resolve()
     artifacts: list[SandboxArtifact] = []
 

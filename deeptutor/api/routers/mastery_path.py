@@ -9,6 +9,10 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from pydantic import ValidationError as PydanticValidationError
 
+from deeptutor.commercial.entitlement_context import (
+    CommercialAccessDenied,
+    require_capability,
+)
 from deeptutor.learning import policy as learning_policy
 from deeptutor.learning import prompts as learning_prompts
 from deeptutor.learning.models import (
@@ -231,6 +235,12 @@ class GenerateFromNotebookRequest(BaseModel):
 @router.post("/progress/{book_id}/generate-from-notebook")
 async def generate_from_notebook(book_id: str, body: GenerateFromNotebookRequest):
     _validate_book_id(book_id)
+    try:
+        require_capability("mastery_path")
+    except CommercialAccessDenied as exc:
+        raise HTTPException(
+            status_code=402, detail={"code": exc.code, "message": str(exc)}
+        ) from exc
     if not body.records:
         raise HTTPException(status_code=400, detail="No records provided")
 

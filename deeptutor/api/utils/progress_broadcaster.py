@@ -4,6 +4,7 @@ Progress Broadcaster - Manages WebSocket broadcasting of knowledge base progress
 
 import asyncio
 import logging
+from pathlib import Path
 from typing import Optional
 
 from fastapi import WebSocket
@@ -24,6 +25,11 @@ class ProgressBroadcaster:
         if cls._instance is None:
             cls._instance = cls()
         return cls._instance
+
+    @staticmethod
+    def resource_key(base_dir: str | Path, kb_name: str) -> str:
+        """Namespace a progress channel by its physical workspace owner."""
+        return f"{Path(base_dir).resolve()}::{kb_name}"
 
     async def connect(self, kb_name: str, websocket: WebSocket):
         """Connect WebSocket to specified knowledge base"""

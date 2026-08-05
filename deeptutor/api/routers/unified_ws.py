@@ -41,9 +41,34 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
+async def _turn_is_visible_to_current_session(
+    runtime: Any,
+    turn_id: str,
+    requested_session_id: str = "",
+) -> bool:
+    """Verify a turn through its current-user-scoped parent session.
+
+    SQLite stores are already separated per owner. PocketBase turn rows are
+    global, however, so a direct turn lookup is not an authorization check.
+    Resolving the parent through ``get_session`` applies the current user's
+    owner filter for both backends.
+    """
+    turn = await runtime.store.get_turn(turn_id)
+    if turn is None:
+        return False
+    session_id = str(turn.get("session_id") or "").strip()
+    if not session_id or (requested_session_id and requested_session_id != session_id):
+        return False
+    return await runtime.store.get_session(session_id) is not None
+
+
 @router.websocket("/ws")
 async def unified_websocket(ws: WebSocket) -> None:
-    from deeptutor.api.routers.auth import ws_auth_failed, ws_require_auth
+    from deeptutor.api.routers.auth import (
+        ws_auth_failed,
+        ws_require_auth,
+        ws_revalidate_identity,
+    )
     from deeptutor.multi_user.context import reset_current_user
 
     user_token = await ws_require_auth(ws)
@@ -102,6 +127,12 @@ async def unified_websocket(ws: WebSocket) -> None:
     try:
         while not closed:
             raw = await ws.receive_text()
+            # JWT expiry, account disable/delete, password reset, and role
+            # changes must take effect on already-connected sockets before the
+            # next message can reach any business handler.
+            if not await ws_revalidate_identity(ws):
+                closed = True
+                break
             try:
                 msg = json.loads(raw)
             except json.JSONDecodeError:
@@ -123,7 +154,11 @@ async def unified_websocket(ws: WebSocket) -> None:
                             "source": "unified_ws",
                             "stage": "",
                             "content": str(exc),
-                            "metadata": {"turn_terminal": True, "status": "rejected"},
+                            "metadata": {
+                                "turn_terminal": True,
+                                "status": "rejected",
+                                "reason": str(exc),
+                            },
                             "session_id": str(msg.get("session_id") or ""),
                             "turn_id": "",
                             "seq": 0,
@@ -297,6 +332,17 @@ async def unified_websocket(ws: WebSocket) -> None:
                 turn_id = str(msg.get("turn_id") or "").strip()
                 if not turn_id:
                     await safe_send({"type": "error", "content": "Missing turn_id for user_input."})
+                    continue
+                from deeptutor.services.session import get_turn_runtime_manager
+
+                runtime = get_turn_runtime_manager()
+                requested_session_id = str(msg.get("session_id") or "").strip()
+                if not await _turn_is_visible_to_current_session(
+                    runtime,
+                    turn_id,
+                    requested_session_id,
+                ):
+                    await safe_send({"type": "error", "content": f"Turn not found: {turn_id}"})
                     continue
                 from deeptutor.core.stream_bus import get_bus
 

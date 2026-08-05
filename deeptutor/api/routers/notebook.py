@@ -11,10 +11,21 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from deeptutor.agents.notebook import NotebookSummarizeAgent
+from deeptutor.commercial.entitlement_context import CommercialAccessDenied
+from deeptutor.commercial.storage_limits import CommercialResourceLimitDenied
 from deeptutor.services.llm import clean_thinking_tags
 from deeptutor.services.notebook import notebook_manager
 
 router = APIRouter()
+
+
+def _raise_notebook_error(exc: Exception) -> None:
+    if isinstance(exc, (CommercialAccessDenied, CommercialResourceLimitDenied)):
+        detail: dict[str, object] = {"code": exc.code, "message": str(exc)}
+        if isinstance(exc, CommercialResourceLimitDenied):
+            detail.update(exc.details)
+        raise HTTPException(status_code=402, detail=detail) from exc
+    raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 # === Request/Response Models ===
@@ -149,7 +160,7 @@ async def list_notebooks():
         notebooks = notebook_manager.list_notebooks()
         return {"notebooks": notebooks, "total": len(notebooks)}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _raise_notebook_error(e)
 
 
 @router.get("/statistics")
@@ -164,7 +175,7 @@ async def get_statistics():
         stats = notebook_manager.get_statistics()
         return stats
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _raise_notebook_error(e)
 
 
 @router.post("/create")
@@ -187,7 +198,7 @@ async def create_notebook(request: CreateNotebookRequest):
         )
         return {"success": True, "notebook": notebook}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _raise_notebook_error(e)
 
 
 @router.get("/{notebook_id}")
@@ -209,7 +220,7 @@ async def get_notebook(notebook_id: str):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _raise_notebook_error(e)
 
 
 @router.put("/{notebook_id}")
@@ -238,7 +249,7 @@ async def update_notebook(notebook_id: str, request: UpdateNotebookRequest):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _raise_notebook_error(e)
 
 
 @router.delete("/{notebook_id}")
@@ -260,7 +271,7 @@ async def delete_notebook(notebook_id: str):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _raise_notebook_error(e)
 
 
 @router.post("/add_record")
@@ -293,7 +304,7 @@ async def add_record(request: AddRecordRequest):
             "added_to_notebooks": result["added_to_notebooks"],
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _raise_notebook_error(e)
 
 
 @router.post("/add_record_with_summary")
@@ -326,7 +337,7 @@ async def remove_record(notebook_id: str, record_id: str):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _raise_notebook_error(e)
 
 
 @router.put("/{notebook_id}/records/{record_id}")
@@ -349,7 +360,7 @@ async def update_record(notebook_id: str, record_id: str, request: UpdateRecordR
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _raise_notebook_error(e)
 
 
 @router.get("/health")

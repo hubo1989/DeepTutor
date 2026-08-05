@@ -302,6 +302,98 @@ def _estimate_factory_request_tokens(
     return prompt_estimate + max(1, int(max_tokens)), prompt_estimate
 
 
+def _commercial_factory_request_tokens(
+    messages: list[dict[str, Any]],
+    *,
+    max_tokens: int,
+    request_options: Mapping[str, Any] | None = None,
+) -> int:
+    """Use serialized UTF-8 bytes as a tokenizer-independent request bound.
+
+    Tool and response schemas are billed input on several providers.  Keeping
+    the complete sanitized request options in the bound prevents a caller from
+    bypassing the reservation with a tiny message and a very large schema.
+    """
+
+    try:
+        serialized = json.dumps(
+            {"messages": messages, "options": dict(request_options or {})},
+            ensure_ascii=False,
+            default=str,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError):
+        serialized = str((messages, request_options))
+    return max(1, len(serialized.encode("utf-8"))) + max(1, int(max_tokens))
+
+
+async def _reserve_factory_commercial(
+    config: LLMConfig,
+    messages: list[dict[str, Any]],
+    *,
+    max_tokens: int,
+    request_options: Mapping[str, Any] | None = None,
+    request_id: str | None = None,
+) -> tuple[Any, int]:
+    from deeptutor.commercial.metering import (
+        CommercialUsageLimitExceeded,
+        CommercialUsageUnavailable,
+        reserve_commercial_usage,
+    )
+
+    from .exceptions import LLMProviderError, LLMRateLimitError
+
+    requested = _commercial_factory_request_tokens(
+        messages,
+        max_tokens=max_tokens,
+        request_options=request_options,
+    )
+    try:
+        lease = await reserve_commercial_usage(
+            meter="llm_tokens",
+            quantity=requested,
+            source=getattr(config, "source", "platform"),
+            provider=config.provider_name or config.binding,
+            model=config.model,
+            request_id=request_id,
+        )
+    except CommercialUsageLimitExceeded as exc:
+        raise LLMRateLimitError(str(exc), provider="deeptutor") from exc
+    except CommercialUsageUnavailable as exc:
+        raise LLMProviderError(str(exc), provider="deeptutor") from exc
+    return lease, requested
+
+
+async def _finalize_factory_commercial(
+    lease: Any,
+    usage: Any,
+    *,
+    requested: int,
+) -> None:
+    if lease is None:
+        return
+    from deeptutor.commercial.metering import (
+        CommercialUsageUnavailable,
+        measurement_from_usage,
+    )
+
+    from .exceptions import LLMProviderError
+
+    measurement = measurement_from_usage(
+        usage,
+        fallback_quantity=requested,
+        meter="llm_tokens",
+    )
+    try:
+        await lease.finalize(
+            measurement.quantity,
+            usage_units=measurement.units,
+            is_estimated=measurement.is_estimated,
+        )
+    except CommercialUsageUnavailable as exc:
+        raise LLMProviderError(str(exc), provider="deeptutor") from exc
+
+
 def _reserve_factory_quota(
     config: LLMConfig,
     messages: list[dict[str, Any]],
@@ -466,6 +558,9 @@ async def complete(
     exponential_backoff: bool = DEFAULT_EXPONENTIAL_BACKOFF,
     **kwargs: Any,
 ) -> str:
+    # DeepTutor-only idempotency metadata. Pop it before request sanitization
+    # so it neither changes the usage bound nor reaches provider kwargs.
+    commercial_request_id = kwargs.pop("_commercial_request_id", None)
     caller_extra_headers = kwargs.pop("extra_headers", None)
     reasoning_effort = kwargs.pop("reasoning_effort", None)
     image_data = kwargs.pop("image_data", None)
@@ -497,16 +592,29 @@ async def complete(
     extra_kwargs = _sanitize_call_kwargs(
         binding=capability_binding, model=config.model, kwargs=kwargs
     )
-    quota_lease, quota_reservation = _reserve_factory_quota(
+    configured_max_tokens = _configured_max_tokens(config, extra_kwargs)
+    commercial_lease, commercial_reservation = await _reserve_factory_commercial(
         config,
         request_messages,
-        max_tokens=_configured_max_tokens(config, extra_kwargs),
+        max_tokens=configured_max_tokens,
+        request_options=extra_kwargs,
+        request_id=commercial_request_id,
     )
-    byok_lease, byok_reservation = _start_byok_factory_usage(
-        config,
-        request_messages,
-        max_tokens=_configured_max_tokens(config, extra_kwargs),
-    )
+    try:
+        quota_lease, quota_reservation = _reserve_factory_quota(
+            config,
+            request_messages,
+            max_tokens=configured_max_tokens,
+        )
+        byok_lease, byok_reservation = _start_byok_factory_usage(
+            config,
+            request_messages,
+            max_tokens=configured_max_tokens,
+        )
+    except BaseException:
+        if commercial_lease is not None:
+            await commercial_lease.release()
+        raise
 
     try:
         response = await provider.chat_with_retry(
@@ -517,22 +625,39 @@ async def complete(
             allow_image_fallback=not supports_vision(capability_binding, config.model),
             **extra_kwargs,
         )
-    except Exception as exc:
+    except BaseException as exc:
         if quota_lease is not None:
             quota_lease.release()
         if byok_lease is not None:
             byok_lease.release()
+        if commercial_lease is not None:
+            await commercial_lease.release()
+        if not isinstance(exc, Exception):
+            raise
         raise map_error(exc, provider=config.provider_name) from exc
 
-    if quota_lease is not None:
-        actual = int((response.usage or {}).get("total_tokens") or 0)
-        quota_lease.finalize(actual or quota_reservation)
-    if byok_lease is not None:
-        actual = int((response.usage or {}).get("total_tokens") or 0)
-        byok_lease.finalize(
-            actual or byok_reservation,
-            status="failed" if response.finish_reason == "error" else "success",
+    # Every ledger owns an independent durable reservation.  A telemetry
+    # failure in the legacy SQLite quota must never strand the PostgreSQL
+    # reservation (or vice versa), so all three settlement attempts run.
+    try:
+        try:
+            if quota_lease is not None:
+                actual = int((response.usage or {}).get("total_tokens") or 0)
+                quota_lease.finalize(actual or quota_reservation)
+        finally:
+            if byok_lease is not None:
+                actual = int((response.usage or {}).get("total_tokens") or 0)
+                byok_lease.finalize(
+                    actual or byok_reservation,
+                    status="failed" if response.finish_reason == "error" else "success",
+                )
+    finally:
+        await _finalize_factory_commercial(
+            commercial_lease,
+            response.usage,
+            requested=commercial_reservation,
         )
+
     if response.finish_reason == "error":
         raise map_error(
             RuntimeError(response.content or "LLM request failed"), provider=config.provider_name
@@ -555,6 +680,9 @@ async def stream(
     exponential_backoff: bool = DEFAULT_EXPONENTIAL_BACKOFF,
     **kwargs: Any,
 ) -> AsyncGenerator[str, None]:
+    # One stable id is shared by reservation and all internal provider retry
+    # attempts, but remains private to DeepTutor's accounting boundary.
+    commercial_request_id = kwargs.pop("_commercial_request_id", None)
     caller_extra_headers = kwargs.pop("extra_headers", None)
     reasoning_effort = kwargs.pop("reasoning_effort", None)
     image_data = kwargs.pop("image_data", None)
@@ -592,16 +720,29 @@ async def stream(
     extra_kwargs = _sanitize_call_kwargs(
         binding=capability_binding, model=config.model, kwargs=kwargs
     )
-    quota_lease, quota_reservation = _reserve_factory_quota(
+    configured_max_tokens = _configured_max_tokens(config, extra_kwargs)
+    commercial_lease, commercial_reservation = await _reserve_factory_commercial(
         config,
         request_messages,
-        max_tokens=_configured_max_tokens(config, extra_kwargs),
+        max_tokens=configured_max_tokens,
+        request_options=extra_kwargs,
+        request_id=commercial_request_id,
     )
-    byok_lease, byok_reservation = _start_byok_factory_usage(
-        config,
-        request_messages,
-        max_tokens=_configured_max_tokens(config, extra_kwargs),
-    )
+    try:
+        quota_lease, quota_reservation = _reserve_factory_quota(
+            config,
+            request_messages,
+            max_tokens=configured_max_tokens,
+        )
+        byok_lease, byok_reservation = _start_byok_factory_usage(
+            config,
+            request_messages,
+            max_tokens=configured_max_tokens,
+        )
+    except BaseException:
+        if commercial_lease is not None:
+            await commercial_lease.release()
+        raise
 
     queue: asyncio.Queue[str | BaseException | None] = asyncio.Queue()
     saw_output = False
@@ -630,8 +771,10 @@ async def stream(
         await queue.put(chunk)
 
     async def _runner() -> None:
-        nonlocal in_think_block
+        nonlocal in_think_block, saw_output
         response = None
+        runner_status = "success"
+        provider_error: BaseException | None = None
         try:
             response = await provider.chat_stream_with_retry(
                 messages=request_messages,
@@ -662,28 +805,78 @@ async def stream(
                         provider=config.provider_name,
                     )
                 )
+        except asyncio.CancelledError:
+            runner_status = "cancelled"
+            if not saw_output:
+                if quota_lease is not None:
+                    quota_lease.release()
+                if byok_lease is not None:
+                    byok_lease.release(status="cancelled")
+            raise
         except Exception as exc:
-            if quota_lease is not None:
-                quota_lease.release()
-            if byok_lease is not None:
-                byok_lease.release()
-            await queue.put(map_error(exc, provider=config.provider_name))
+            runner_status = "failed"
+            provider_error = map_error(exc, provider=config.provider_name)
+            if not saw_output:
+                if quota_lease is not None:
+                    quota_lease.release()
+                if byok_lease is not None:
+                    byok_lease.release(status="failed")
         finally:
-            if quota_lease is not None:
-                usage = getattr(response, "usage", None) or {}
-                usage_total = int(usage.get("total_tokens") or 0)
-                quota_lease.finalize(usage_total or quota_reservation)
-            if byok_lease is not None:
-                usage = getattr(response, "usage", None) or {}
-                usage_total = int(usage.get("total_tokens") or 0)
-                byok_lease.finalize(
-                    usage_total or byok_reservation,
-                    status=(
-                        "failed"
-                        if response is not None and response.finish_reason == "error"
-                        else "success" if response is not None else "cancelled"
-                    ),
-                )
+            settlement_error: BaseException | None = None
+            usage = getattr(response, "usage", None) or {}
+            usage_total = int(usage.get("total_tokens") or 0)
+            try:
+                if quota_lease is not None:
+                    quota_lease.finalize(usage_total or quota_reservation)
+            except Exception as exc:
+                settlement_error = map_error(exc, provider=config.provider_name)
+            try:
+                if byok_lease is not None:
+                    byok_lease.finalize(
+                        usage_total or byok_reservation,
+                        status=(
+                            "failed"
+                            if response is not None and response.finish_reason == "error"
+                            else runner_status
+                        ),
+                    )
+            except Exception as exc:
+                if settlement_error is None:
+                    settlement_error = map_error(exc, provider=config.provider_name)
+            try:
+                if commercial_lease is not None:
+                    usage = getattr(response, "usage", None) if response is not None else None
+                    has_reported_usage = bool(
+                        isinstance(usage, Mapping)
+                        and any(
+                            isinstance(value, (int, float))
+                            and not isinstance(value, bool)
+                            and value > 0
+                            for value in usage.values()
+                        )
+                    )
+                    if response is None and not saw_output:
+                        await commercial_lease.release()
+                    elif (
+                        response is not None
+                        and response.finish_reason == "error"
+                        and not saw_output
+                        and not has_reported_usage
+                    ):
+                        await commercial_lease.release()
+                    else:
+                        await _finalize_factory_commercial(
+                            commercial_lease,
+                            usage,
+                            requested=commercial_reservation,
+                        )
+            except Exception as exc:
+                if settlement_error is None:
+                    settlement_error = map_error(exc, provider=config.provider_name)
+            if provider_error is not None:
+                await queue.put(provider_error)
+            if settlement_error is not None:
+                await queue.put(settlement_error)
             await queue.put(None)
 
     task = asyncio.create_task(_runner())
