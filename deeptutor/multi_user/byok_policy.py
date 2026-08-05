@@ -96,10 +96,14 @@ def normalize_policy(value: Any) -> dict[str, Any]:
             )
             if service != "mineru":
                 current["allow_custom_endpoints"] = bool(
-                    incoming.get("allow_custom_endpoints", current.get("allow_custom_endpoints", False))
+                    incoming.get(
+                        "allow_custom_endpoints", current.get("allow_custom_endpoints", False)
+                    )
                 )
             else:
-                current["allow_cloud"] = bool(incoming.get("allow_cloud", current.get("allow_cloud", True)))
+                current["allow_cloud"] = bool(
+                    incoming.get("allow_cloud", current.get("allow_cloud", True))
+                )
     endpoints = raw.get("endpoint_allowlist")
     if isinstance(endpoints, list):
         policy["endpoint_allowlist"] = sorted(
@@ -279,7 +283,11 @@ def validate_endpoint(
     service_policy = current["services"].get(service, {})
     official = official_endpoint(binding, service)
     allowlisted = value in set(current.get("endpoint_allowlist", []))
-    if value != official and not bool(service_policy.get("allow_custom_endpoints", False)) and not allowlisted:
+    if (
+        value != official
+        and not bool(service_policy.get("allow_custom_endpoints", False))
+        and not allowlisted
+    ):
         raise ValueError("This BYOK provider endpoint is not allowed by the administrator")
     return value
 

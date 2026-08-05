@@ -52,7 +52,11 @@ export interface KnowledgeBase {
     embedding_model?: string;
     embedding_dim?: number;
     embedding_mismatch?: boolean;
-    /** Connected-source kind (e.g. "obsidian", "subagent"); absent for ordinary indexed KBs. */
+    /**
+     * Connected-source kind; absent for ordinary indexed KBs. Mirrors the
+     * backend ``CONNECTED_KB_TYPES`` set (see deeptutor/knowledge/kb_types.py):
+     * "obsidian", "linked", "subagent", "lightrag_server", "ima".
+     */
     type?: string;
     /** Absolute path of a connected Obsidian vault (when type === "obsidian"). */
     vault_path?: string;
@@ -137,6 +141,25 @@ export const formatKnowledgeTimestamp = (value?: string): string | null => {
   return parsed ? parsed.toLocaleString() : value || null;
 };
 
+/**
+ * Connected KB types — pointer/read-only KBs whose index lives outside
+ * ``data/knowledge_bases``. Must stay in sync with the backend's
+ * ``CONNECTED_KB_TYPES`` (deeptutor/knowledge/kb_types.py). The backend now
+ * sets ``read_only=True`` for these, but the frontend also gates on type so
+ * the UI is correct even before a backend round-trip refreshes the field.
+ */
+const CONNECTED_KB_TYPES = new Set([
+  "obsidian",
+  "linked",
+  "subagent",
+  "lightrag_server",
+  "ima",
+]);
+
+/** True for pointer KBs whose data lives outside DeepTutor (read-only here). */
+export const isConnectedKb = (kb: KnowledgeBase): boolean =>
+  CONNECTED_KB_TYPES.has(kb.metadata?.type ?? "");
+
 /** The retrieval engine a KB is bound to. Connected vaults badge by source. */
 export const kbProvider = (kb: KnowledgeBase): string => {
   if (kb.metadata?.type === "obsidian") return "obsidian";
@@ -163,9 +186,12 @@ export const kbNeedsReindex = (kb: KnowledgeBase): boolean =>
   resolveKbStatus(kb) === "needs_reindex";
 
 export const kbIsUploadable = (kb: KnowledgeBase): boolean =>
-  resolveKbStatus(kb) === "ready" && !kbNeedsReindex(kb);
+  !isConnectedKb(kb) &&
+  resolveKbStatus(kb) === "ready" &&
+  !kbNeedsReindex(kb);
 
 export const kbCanReindex = (kb: KnowledgeBase): boolean => {
+  if (isConnectedKb(kb)) return false;
   const status = resolveKbStatus(kb);
   const hasSourceFiles =
     typeof kb.statistics?.raw_documents === "number"

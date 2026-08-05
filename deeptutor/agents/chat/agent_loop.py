@@ -31,6 +31,7 @@ import re
 from typing import TYPE_CHECKING, Any
 
 from deeptutor.agents._shared.capability_result import emit_capability_result
+from deeptutor.agents.chat.context_budget import LLMRequestSnapshot
 from deeptutor.agents.chat.dsml_tool_calls import extract_dsml_tool_calls, has_dsml_tool_calls
 from deeptutor.core.agentic.messages import assistant_message_with_tool_calls
 from deeptutor.core.agentic.tool_dispatch import DispatchOutcome
@@ -131,6 +132,11 @@ class LLMCallResult:
     text: str
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     finish_reason: str = ""
+    # Reasoning-model output routed to the ``reasoning_content`` channel
+    # (GLM / DeepSeek-R1 / QwQ ...). Tracked so a finish round that produced
+    # *only* reasoning (empty ``content``) can be recovered instead of
+    # degrading to the generic "could not produce a useful response" banner.
+    reasoning_text: str = ""
 
 
 @dataclass(slots=True)
@@ -166,6 +172,7 @@ class AgentLoop:
         self.client = client
         self.enabled_tools = enabled_tools
         self.tool_schemas = tool_schemas
+        self._last_request: LLMRequestSnapshot | None = None
 
     async def run(self) -> None:
         state = AgentLoopState()
@@ -206,15 +213,20 @@ class AgentLoop:
                 stage=LOOP_STAGE,
                 metadata={"trace_kind": "sources"},
             )
+        payload: dict[str, Any] = {
+            "response": outcome.final_text,
+            "completed": outcome.completed,
+            "engine": "agent_loop",
+            "rounds": state.rounds,
+            "tool_steps": state.tool_steps,
+        }
+        if self._last_request is not None:
+            budget = self.pipeline.measure_context_budget(self._last_request)
+            if budget is not None:
+                payload["metadata"] = {"context_budget": budget}
         await emit_capability_result(
             self.stream,
-            {
-                "response": outcome.final_text,
-                "completed": outcome.completed,
-                "engine": "agent_loop",
-                "rounds": state.rounds,
-                "tool_steps": state.tool_steps,
-            },
+            payload,
             source="chat",
             usage=self.pipeline.usage,
         )
@@ -267,11 +279,17 @@ class AgentLoop:
             if not result.tool_calls:
                 final_text = self._clean(result.text)
                 if not final_text and not nudged_empty_finish:
-                    # The round produced only internal reasoning (e.g. the
-                    # whole reply inside <think>) — the model planned but
-                    # never acted. Keep its raw text in-conversation (the
-                    # plan/script lives there) and nudge it once to act
-                    # instead of falling back to an empty answer.
+                    # The round produced no user-facing text. Two shapes:
+                    #  (a) inline <think> only — the model planned but never
+                    #      acted; or
+                    #  (b) a reasoning model (GLM / DeepSeek-R1 / QwQ) that
+                    #      wrote its whole reply to the ``reasoning_content``
+                    #      channel and left ``content`` empty.
+                    # Both look identical to the rest of the loop (empty text,
+                    # no tool calls). Nudge once with a targeted instruction:
+                    # case (b) needs to be told explicitly to move its output
+                    # into the content channel, not just "continue".
+                    reasoning_only = self._is_reasoning_only(result)
                     nudged_empty_finish = True
                     await self.stream.progress(
                         self.pipeline._t(
@@ -290,16 +308,7 @@ class AgentLoop:
                     messages.append(
                         {
                             "role": "user",
-                            "content": self.pipeline._t(
-                                "loop.finish_empty_nudge",
-                                default=(
-                                    "Your previous round produced only internal "
-                                    "reasoning — no tool call and no user-facing "
-                                    "answer. Continue now: either call the tools "
-                                    "to execute your plan, or write the final "
-                                    "user-facing answer directly."
-                                ),
-                            ),
+                            "content": self._empty_finish_nudge(reasoning_only),
                         }
                     )
                     continue
@@ -419,7 +428,68 @@ class AgentLoop:
             logger.warning("forced-finish LLM call failed: %s", exc)
             return await self._finalize_finish("")
         state.rounds += 1
+        # A reasoning model can write its whole salvage reply to the
+        # reasoning channel and leave content empty — same trap as the main
+        # loop. Reuse the targeted nudge once before falling back, so a
+        # budget-exhausted / mid-loop-error turn still recovers instead of
+        # degrading to the generic "could not produce a useful response".
+        if not self._clean(result.text) and self._is_reasoning_only(result):
+            if result.text:
+                messages.append({"role": "assistant", "content": result.text})
+            messages.append({"role": "user", "content": self._empty_finish_nudge(True)})
+            try:
+                result = await self._call_llm(
+                    messages=messages,
+                    label=self.pipeline._t("labels.final_response", default="Final response"),
+                    call_kind="llm_final_response",
+                    trace_role="response",
+                    max_tokens=self.pipeline.loop_max_tokens,
+                    tool_schemas=None,
+                )
+                state.rounds += 1
+            except Exception as exc:
+                logger.warning("forced-finish reasoning retry failed: %s", exc)
+                return await self._finalize_finish("")
         return await self._finalize_finish(result.text)
+
+    @staticmethod
+    def _is_reasoning_only(result: LLMCallResult) -> bool:
+        """True when a round wrote only to the reasoning channel.
+
+        Reasoning models (GLM / DeepSeek-R1 / QwQ) occasionally emit their
+        whole reply via ``reasoning_content`` and leave ``content`` empty.
+        Detecting this lets the loop nudge them to move the answer into the
+        content channel rather than degrading to the generic fallback.
+        """
+        return not result.text.strip() and bool(result.reasoning_text.strip())
+
+    def _empty_finish_nudge(self, reasoning_only: bool) -> str:
+        """The user-message that asks an empty-finish round to produce an answer.
+
+        ``reasoning_only`` selects the channel-targeted variant (the model's
+        conclusion landed in the thinking channel) over the generic
+        "continue" nudge.
+        """
+        if reasoning_only:
+            return self.pipeline._t(
+                "loop.finish_empty_nudge_reasoning_channel",
+                default=(
+                    "Your previous reply arrived only in the reasoning channel "
+                    "— the content channel was empty, so nothing reached the "
+                    "user. Write your final user-facing answer now in the "
+                    "content channel, without any tool call. Do not repeat the "
+                    "reasoning."
+                ),
+            )
+        return self.pipeline._t(
+            "loop.finish_empty_nudge",
+            default=(
+                "Your previous round produced only internal reasoning — no "
+                "tool call and no user-facing answer. Continue now: either "
+                "call the tools to execute your plan, or write the final "
+                "user-facing answer directly."
+            ),
+        )
 
     async def _finalize_finish(self, raw_text: str) -> LoopOutcome:
         final_text = self._clean(raw_text)
@@ -485,12 +555,27 @@ class AgentLoop:
         if tool_schemas:
             kwargs["tools"] = tool_schemas
             kwargs["tool_choice"] = "auto"
+        # What this request actually carried, pinned now: the loop keeps
+        # appending to ``messages`` and the deferred loader keeps appending to
+        # ``tool_schemas``, so the turn's context budget is read off the last
+        # snapshot rather than off the lists' end state.
+        #
+        # The forced-finish round deliberately ships no ``tools`` so the model
+        # must answer. That absence is a loop mechanic, not a turn that ran
+        # without tools, so the last non-empty schema list stands — otherwise a
+        # turn that spent eight rounds calling tools would report zero tokens
+        # for the schemas that sat in its window the whole time.
+        carried = list(tool_schemas or [])
+        if not carried and self._last_request is not None:
+            carried = self._last_request.tool_schemas
+        self._last_request = LLMRequestSnapshot(messages=list(messages), tool_schemas=carried)
 
         # Providers (esp. Gemini OpenAI-compat) may attach ``usage`` to more
         # than one stream chunk. Keep the latest frame; it is recorded once
         # after the stream via ``record_streamed_usage``.
         usage_seen: Any = None
         text_parts: list[str] = []
+        reasoning_parts: list[str] = []
         tool_acc: dict[int, dict[str, str]] = {}
         output_chars = 0
         finish_reason = ""
@@ -536,6 +621,7 @@ class AgentLoop:
                 )
                 if reasoning_text:
                     output_chars += len(reasoning_text)
+                    reasoning_parts.append(reasoning_text)
                     await self.stream.thinking(
                         reasoning_text, source="chat", stage=stage, metadata=chunk_meta
                     )
@@ -627,7 +713,12 @@ class AgentLoop:
                 },
             ),
         )
-        return LLMCallResult(text=text, tool_calls=tool_calls, finish_reason=finish_reason)
+        return LLMCallResult(
+            text=text,
+            tool_calls=tool_calls,
+            finish_reason=finish_reason,
+            reasoning_text="".join(reasoning_parts),
+        )
 
     async def _create_response_stream(
         self,

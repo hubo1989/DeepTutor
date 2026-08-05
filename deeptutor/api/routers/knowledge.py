@@ -1948,6 +1948,12 @@ async def list_knowledge_bases():
             try:
                 info = manager.get_info(name)
                 logger.debug(f"Successfully got info for KB '{name}': {info.get('statistics', {})}")
+                # Connected KBs (obsidian / linked / subagent / lightrag_server /
+                # ima) are read-only pointers: the index lives elsewhere, so the
+                # UI must hide write actions. ``is_connected_kb`` reads the KB's
+                # config entry, which is the authoritative source for ``type``.
+                kb_entry = manager.config.get("knowledge_bases", {}).get(name, {})
+                read_only = is_connected_kb(kb_entry)
                 result.append(
                     KnowledgeBaseInfo(
                         id=f"{own_prefix}{info['name']}",
@@ -1960,7 +1966,7 @@ async def list_knowledge_bases():
                         progress=info.get("progress"),
                         source="admin" if get_current_user().is_admin else "user",
                         assigned=False,
-                        read_only=False,
+                        read_only=read_only,
                         provenance_label=access_by_id.get(f"{own_prefix}{info['name']}", {}).get(
                             "provenance_label"
                         ),
@@ -2092,12 +2098,17 @@ async def get_knowledge_base_details(kb_name: str):
         resource = resolve_kb(kb_name)
         manager = manager_for_resource(resource)
         info = manager.get_info(resource.name)
+        # ``resource.read_only`` reflects admin-assigned access control; a
+        # connected KB (obsidian / linked / subagent / lightrag_server / ima)
+        # is read-only regardless, so OR the two conditions together.
+        kb_entry = manager.config.get("knowledge_bases", {}).get(resource.name, {})
+        connected_read_only = is_connected_kb(kb_entry)
         info.update(
             {
                 "id": resource.id,
                 "source": resource.source,
                 "assigned": resource.assigned,
-                "read_only": resource.read_only,
+                "read_only": bool(resource.read_only) or connected_read_only,
             }
         )
         if resource.assigned:

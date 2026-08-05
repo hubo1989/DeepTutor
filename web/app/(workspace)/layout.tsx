@@ -1,4 +1,5 @@
 import WorkspaceSidebar from "@/components/sidebar/WorkspaceSidebar";
+import AppShell from "@/components/layout/AppShell";
 import { CapabilityAccessProvider } from "@/components/access/CapabilityAccessContext";
 import CapabilityGate from "@/components/access/CapabilityGate";
 import { UnifiedChatProvider } from "@/context/UnifiedChatContext";
@@ -16,15 +17,10 @@ export default function WorkspaceLayout({
     <CommercialAccessProvider>
       <CapabilityAccessProvider>
         <UnifiedChatProvider>
-          <div className="flex h-screen overflow-hidden">
-            <WorkspaceSidebar />
-            <div className="flex min-w-0 flex-1 flex-col overflow-hidden bg-[var(--background)]">
-              <TrialStatusBanner />
-              <main className="min-h-0 flex-1 overflow-hidden">
-                <CapabilityGate>{children}</CapabilityGate>
-              </main>
-            </div>
-          </div>
+          <AppShell sidebar={<WorkspaceSidebar />}>
+            <TrialStatusBanner />
+            <CapabilityGate>{children}</CapabilityGate>
+          </AppShell>
         </UnifiedChatProvider>
       </CapabilityAccessProvider>
     </CommercialAccessProvider>

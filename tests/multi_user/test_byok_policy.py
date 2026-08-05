@@ -38,9 +38,7 @@ def test_endpoint_dns_timeout_does_not_change_global_socket_timeout(monkeypatch)
 
     monkeypatch.setattr(byok_policy.socket, "getaddrinfo", stalled_getaddrinfo)
     monkeypatch.setattr(byok_policy, "DNS_RESOLUTION_TIMEOUT_SECONDS", 0.01)
-    policy = byok_policy.normalize_policy(
-        {"services": {"llm": {"allow_custom_endpoints": True}}}
-    )
+    policy = byok_policy.normalize_policy({"services": {"llm": {"allow_custom_endpoints": True}}})
     initial_timeout = socket.getdefaulttimeout()
     try:
         with pytest.raises(ValueError, match="DNS resolution timed out"):

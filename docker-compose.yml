@@ -67,9 +67,10 @@ services:
       # and back up: admin workspace + runtime settings (data/user), per-user
       # workspaces (data/users), partners (data/partners), accounts/grants/
       # audit (data/system), knowledge bases, memory.
-      # The sandbox-runner deliberately gets only the *workspace* subtrees of
-      # this volume (the mount contract below) — never data/system or
-      # data/user/settings, which hold auth state and provider API keys.
+      # The sandbox-runner gets a narrower slice of this volume: never
+      # data/system, which holds auth state, provider API keys, and per-owner
+      # secrets. What it *does* carry for non-admin accounts is wider than
+      # workspace subtrees — see the scope note on that service's own volumes.
       - ./data:/app/data
 
     environment:
@@ -133,13 +134,21 @@ services:
     container_name: deeptutor-sandbox-runner
     restart: unless-stopped
 
-    # Share only the admin task workspace at the SAME path as the main app.
-    # The runner is a shared process namespace; mounting ./data/users here
-    # would let one shell enumerate another user's workspace even when its
-    # workdir is scoped correctly. Non-admin exec is therefore fail-closed by
-    # default until a per-user runner isolation implementation is deployed.
+    # The stock runner only receives the admin task workspace. It is a shared
+    # process namespace, so mounting the whole data/users tree would let one
+    # account's command read every other account's workspace. Per-user exec
+    # requires a separately isolated runner deployment and explicit policy opt-in.
+    # data/system is never mounted here: it contains auth state, provider keys,
+    # and per-owner secrets. Installed CLI apps live in a separate read-only
+    # tree so the runner can execute them without being able to replace them.
     volumes:
       - ./data/user/workspace:/app/data/user/workspace
+      # Installed CLI apps, READ-ONLY. This is the one directory the runner
+      # executes code from that it did not receive in a request, so it must not
+      # be writable here: an escaped command that could overwrite an app's entry
+      # point would run as that app in every later turn, for every account.
+      # Installing writes it from the main container instead (services/cli_apps).
+      - ./data/cli-apps:/app/data/cli-apps:ro
 
     # No `ports:` — intentionally not published to the host.
 

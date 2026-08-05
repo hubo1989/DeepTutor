@@ -2,8 +2,10 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { AlertCircle, CheckCircle2, Loader2, Save } from "lucide-react";
+import McpToolGroups from "@/components/common/McpToolGroups";
+import { toggleToolName as toggleName } from "@/lib/mcp-tool-groups";
 import { fetchAdminResources, fetchUserGrant, saveUserGrant } from "../api";
-import type { GrantPayload, McpToolOption, MultiUserResources } from "../types";
+import type { GrantPayload, MultiUserResources } from "../types";
 import {
   EMBEDDING_TOKEN_UNIT,
   LLM_TOKEN_UNIT,
@@ -382,14 +384,13 @@ export function GrantEditor({ userId }: { userId: string }) {
     });
   }
 
-  function toggleToolName(key: "enabled_tools" | "mcp_tools", name: string) {
+  // Named apart from the imported `toggleName` helper it wraps, and narrowed to
+  // the one key that still uses it: MCP rows go through McpToolGroups now.
+  function toggleGrantTool(key: "enabled_tools", name: string) {
     setGrant((current) => {
       const list = current[key];
       if (list === null) return current;
-      const next = list.includes(name)
-        ? list.filter((item) => item !== name)
-        : [...list, name];
-      return { ...current, [key]: next };
+      return { ...current, [key]: toggleName(list, name) };
     });
   }
 
@@ -462,19 +463,10 @@ export function GrantEditor({ userId }: { userId: string }) {
   const mcpSummary =
     grant.mcp_tools === null ? "no MCP" : `${grant.mcp_tools.length} MCP`;
 
-  const mcpByServer = useMemo(() => {
-    const groups = new Map<string, McpToolOption[]>();
-    for (const tool of resources?.mcp_tools || []) {
-      const key = tool.server || "other";
-      groups.set(key, [...(groups.get(key) ?? []), tool]);
-    }
-    return groups;
-  }, [resources?.mcp_tools]);
-
   if (loading && !resources) {
     return (
       <div className="border-t border-[var(--border)] bg-[var(--background)]/40 p-4">
-        <div className="flex h-[420px] items-center justify-center rounded-2xl border border-[var(--border)] bg-[var(--card)] text-sm text-[var(--muted-foreground)]">
+        <div className="flex h-[min(420px,calc(100dvh-6rem))] min-h-[280px] items-center justify-center rounded-2xl border border-[var(--border)] bg-[var(--card)] text-sm text-[var(--muted-foreground)]">
           <Loader2 className="mr-2 h-4 w-4 animate-spin" />
           Loading assignments...
         </div>
@@ -484,8 +476,8 @@ export function GrantEditor({ userId }: { userId: string }) {
 
   return (
     <div className="border-t border-[var(--border)] bg-[var(--background)]/40 p-4">
-      <div className="flex h-[620px] max-h-[calc(100vh-170px)] min-h-[420px] flex-col overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--card)] shadow-sm">
-        <div className="shrink-0 border-b border-[var(--border)] px-5 py-4">
+      <div className="flex h-[min(620px,calc(100dvh-6rem))] min-h-[360px] flex-col overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--card)] shadow-sm">
+        <div className="shrink-0 border-b border-[var(--border)] px-4 py-4 lg:px-5">
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div>
               <h2 className="text-sm font-semibold text-[var(--foreground)]">
@@ -519,8 +511,8 @@ export function GrantEditor({ userId }: { userId: string }) {
           </div>
         </div>
 
-        <div className="min-h-0 flex-1 overflow-y-auto px-5 py-5 [scrollbar-gutter:stable]">
-          <div className="grid gap-5 md:grid-cols-3">
+        <div className="min-h-0 flex-1 overflow-y-auto px-4 py-5 [scrollbar-gutter:stable] lg:px-5">
+          <div className="grid gap-5 lg:grid-cols-3">
             <section className="min-w-0">
               <SectionTitle>Models</SectionTitle>
               <div className="space-y-1.5 text-xs">
@@ -563,7 +555,7 @@ export function GrantEditor({ userId }: { userId: string }) {
                 profile. Platform permissions control administrator-provided
                 spend. Sandbox and tool permissions are unchanged.
               </p>
-              <div className="grid gap-2 sm:grid-cols-3">
+                  <div className="grid gap-2 lg:grid-cols-3">
                 {(["llm", "embedding", "mineru"] as const).map((service) => (
                   <div key={service} className="rounded-lg border border-[var(--border)]/60 p-2">
                     <p className="mb-2 text-xs font-medium text-[var(--foreground)]">{service === "mineru" ? "MinerU" : service === "embedding" ? "Embedding" : "LLM"}</p>
@@ -667,7 +659,7 @@ export function GrantEditor({ userId }: { userId: string }) {
                       checked={grant.enabled_tools!.includes(tool.name)}
                       disabled={controlsDisabled}
                       onToggle={() =>
-                        toggleToolName("enabled_tools", tool.name)
+                        toggleGrantTool("enabled_tools", tool.name)
                       }
                     />
                   ))}
@@ -681,43 +673,64 @@ export function GrantEditor({ userId }: { userId: string }) {
                 disabled={controlsDisabled}
                 defaultLabel="Default · none"
                 onDefault={() => setToolList("mcp_tools", null)}
-                onCustom={() =>
-                  setToolList(
-                    "mcp_tools",
-                    (resources?.mcp_tools || []).map((tool) => tool.name),
-                  )
-                }
+                // Custom starts empty: the admin picks the services to assign,
+                // rather than un-picking hundreds of tools they never meant to
+                // grant by switching modes.
+                onCustom={() => setToolList("mcp_tools", [])}
               />
               {grant.mcp_tools === null ? (
                 <p className="px-1 text-[11px] leading-relaxed text-[var(--muted-foreground)]">
                   MCP tools proxy host-side capabilities, so they stay denied by
-                  default. Switch to Custom to grant specific tools.
+                  default. Switch to Custom to assign specific services.
                 </p>
               ) : null}
               {grant.mcp_tools !== null &&
                 (resources?.mcp_tools?.length ? (
-                  <div className="space-y-2 text-xs">
-                    {[...mcpByServer.entries()].map(([server, tools]) => (
-                      <div key={server}>
-                        <p className="mb-1 px-1 font-mono text-[11px] text-[var(--muted-foreground)]">
-                          {server}
-                        </p>
-                        <div className="space-y-1.5">
-                          {tools.map((tool) => (
-                            <CheckRow
-                              key={tool.name}
-                              label={tool.name}
-                              description={tool.description}
-                              checked={grant.mcp_tools!.includes(tool.name)}
-                              disabled={controlsDisabled}
-                              onToggle={() =>
-                                toggleToolName("mcp_tools", tool.name)
-                              }
-                            />
-                          ))}
-                        </div>
-                      </div>
-                    ))}
+                  <div className="text-xs">
+                    {/* Bulk affordance: with ~40 curated services, granting
+                        everything must not mean forty clicks. Mirrors the
+                        partner picker, which has had All/None all along. */}
+                    <div className="mb-1.5 flex items-center gap-2 px-1">
+                      <button
+                        type="button"
+                        disabled={controlsDisabled}
+                        onClick={() =>
+                          setToolList(
+                            "mcp_tools",
+                            (resources.mcp_tools ?? []).map(
+                              (tool) => tool.name,
+                            ),
+                          )
+                        }
+                        className="rounded px-1.5 py-0.5 text-[11px] text-[var(--muted-foreground)] hover:text-[var(--foreground)] disabled:opacity-50"
+                      >
+                        All
+                      </button>
+                      <button
+                        type="button"
+                        disabled={controlsDisabled}
+                        onClick={() => setToolList("mcp_tools", [])}
+                        className="rounded px-1.5 py-0.5 text-[11px] text-[var(--muted-foreground)] hover:text-[var(--foreground)] disabled:opacity-50"
+                      >
+                        None
+                      </button>
+                    </div>
+                    <McpToolGroups
+                      tools={resources.mcp_tools}
+                      selected={grant.mcp_tools}
+                      onChange={(next) => setToolList("mcp_tools", next)}
+                      disabled={controlsDisabled}
+                      renderTool={({ tool, checked, onToggle }) => (
+                        <CheckRow
+                          key={tool.name}
+                          label={tool.name}
+                          description={tool.description}
+                          checked={checked}
+                          disabled={controlsDisabled}
+                          onToggle={onToggle}
+                        />
+                      )}
+                    />
                   </div>
                 ) : (
                   <p className="text-xs text-[var(--muted-foreground)]">
@@ -859,7 +872,7 @@ export function GrantEditor({ userId }: { userId: string }) {
           </div>
         </div>
 
-        <div className="flex shrink-0 items-center justify-between gap-3 border-t border-[var(--border)] bg-[var(--card)] px-5 py-3">
+        <div className="flex shrink-0 flex-col items-stretch justify-between gap-3 border-t border-[var(--border)] bg-[var(--card)] px-4 py-3 lg:flex-row lg:items-center lg:px-5">
           <div
             aria-live="polite"
             className={`flex min-w-0 items-center gap-1.5 text-xs ${statusTone}`}
@@ -874,7 +887,7 @@ export function GrantEditor({ userId }: { userId: string }) {
           <button
             onClick={save}
             disabled={controlsDisabled || !dirty}
-            className="inline-flex shrink-0 items-center gap-1.5 rounded-lg bg-[var(--foreground)] px-3 py-1.5 text-xs font-medium text-[var(--background)] transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-45"
+            className="inline-flex min-h-10 w-full shrink-0 items-center justify-center gap-1.5 rounded-lg bg-[var(--foreground)] px-3 py-1.5 text-xs font-medium text-[var(--background)] transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-45 lg:w-auto"
           >
             {saving ? (
               <Loader2 className="h-3 w-3 animate-spin" />

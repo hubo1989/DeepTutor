@@ -100,7 +100,9 @@ def _validate_profile_request(
     if not user.is_admin and not grant_service_enabled(grant, "byok", payload.service):
         raise HTTPException(status_code=403, detail="BYOK is not enabled for your account")
     if not allowed_binding(payload.service, payload.provider, policy):
-        raise HTTPException(status_code=400, detail="This provider is not allowed by the administrator")
+        raise HTTPException(
+            status_code=400, detail="This provider is not allowed by the administrator"
+        )
     if payload.service == "mineru" and payload.mode not in {"", "cloud"}:
         raise HTTPException(status_code=400, detail="MinerU BYOK only supports cloud mode")
     try:
@@ -140,7 +142,8 @@ async def get_byok_status(_: object = Depends(require_auth)) -> dict[str, Any]:
             "services": {
                 service: {
                     "enabled": byok_runtime_enabled(service, policy),
-                    "allowed": user.is_admin or bool((grant.get("byok") or {}).get(service, {}).get("enabled", False)),
+                    "allowed": user.is_admin
+                    or bool((grant.get("byok") or {}).get(service, {}).get("enabled", False)),
                 }
                 for service in SERVICES
             },
@@ -166,7 +169,9 @@ async def create_byok_profile(
         raise HTTPException(status_code=400, detail="A BYOK secret is required")
     vault = _vault()
     try:
-        result = vault.save_profile(user_id, _profile_metadata(payload), payload.secret.get_secret_value())
+        result = vault.save_profile(
+            user_id, _profile_metadata(payload), payload.secret.get_secret_value()
+        )
         preferences = vault.get_preferences(user_id)
         if payload.service not in preferences:
             preferences[payload.service] = {"source": "byok", "profile_id": result["id"]}
@@ -276,9 +281,13 @@ async def set_byok_preference(
         profiles = vault.list_profiles(user_id, service=payload.service)
         selected = next((item for item in profiles if item.get("id") == payload.profile_id), None)
         if selected is None:
-            raise HTTPException(status_code=400, detail="Select a BYOK profile belonging to your account")
+            raise HTTPException(
+                status_code=400, detail="Select a BYOK profile belonging to your account"
+            )
         if not allowed_binding(payload.service, str(selected.get("provider") or ""), policy):
-            raise HTTPException(status_code=400, detail="This BYOK provider is not allowed by the administrator")
+            raise HTTPException(
+                status_code=400, detail="This BYOK provider is not allowed by the administrator"
+            )
     preferences = vault.get_preferences(user_id)
     preferences[payload.service] = {
         "source": payload.source,

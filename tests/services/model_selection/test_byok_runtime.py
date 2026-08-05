@@ -36,6 +36,7 @@ def test_byok_runtime_uses_vault_and_skips_platform_catalog(monkeypatch):
     monkeypatch.setattr(provider_runtime, "grant_service_enabled", lambda *_args: True)
     monkeypatch.setattr(provider_runtime, "allowed_binding", lambda *_args: True)
     monkeypatch.setattr(provider_runtime, "get_user_byok_vault", lambda: _Vault())
+
     def validate_endpoint(endpoint, **kwargs):
         assert kwargs["resolve_dns"] is False
         return endpoint
@@ -44,9 +45,7 @@ def test_byok_runtime_uses_vault_and_skips_platform_catalog(monkeypatch):
 
     resolved = provider_runtime.resolve_llm_runtime_config(
         catalog={"this": "must not be read"},
-        llm_selection=LLMSelection(
-            profile_id="p_user", model_id=None, source="byok", generation=4
-        ),
+        llm_selection=LLMSelection(profile_id="p_user", model_id=None, source="byok", generation=4),
     )
 
     assert resolved.model == "gpt-user"
@@ -89,7 +88,11 @@ def test_platform_runtime_uses_authorized_selection_result(monkeypatch):
     monkeypatch.setattr(
         model_access,
         "apply_allowed_llm_selection",
-        lambda _selection: {"source": "platform", "profile_id": "p_allowed", "model_id": "m_allowed"},
+        lambda _selection: {
+            "source": "platform",
+            "profile_id": "p_allowed",
+            "model_id": "m_allowed",
+        },
     )
     seen: dict[str, object] = {}
     catalog = {
@@ -116,7 +119,11 @@ def test_platform_runtime_uses_authorized_selection_result(monkeypatch):
     monkeypatch.setattr(provider_runtime, "apply_llm_selection_to_catalog", capture_selection)
     resolved = provider_runtime.resolve_llm_runtime_config(
         catalog=catalog,
-        llm_selection={"source": "platform", "profile_id": "p_untrusted", "model_id": "m_untrusted"},
+        llm_selection={
+            "source": "platform",
+            "profile_id": "p_untrusted",
+            "model_id": "m_untrusted",
+        },
     )
 
     assert seen["selection"] == LLMSelection(

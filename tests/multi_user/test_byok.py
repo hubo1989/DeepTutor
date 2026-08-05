@@ -69,11 +69,7 @@ def test_vault_generation_conflict_and_metadata_update(tmp_path, monkeypatch):
 def test_policy_blocks_private_addresses_and_requires_custom_allowlist(monkeypatch):
     monkeypatch.setattr(byok_policy, "load_auth_settings", lambda: {"enabled": True})
     policy = byok_policy.normalize_policy(
-        {
-            "services": {
-                "llm": {"allowed_bindings": ["openai"], "allow_custom_endpoints": False}
-            }
-        }
+        {"services": {"llm": {"allowed_bindings": ["openai"], "allow_custom_endpoints": False}}}
     )
     with pytest.raises(ValueError, match="not allowed"):
         byok_policy.validate_endpoint(
