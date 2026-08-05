@@ -14,8 +14,8 @@ import pytest
 from deeptutor.knowledge.kb_types import (
     CONNECTED_KB_TYPES,
     IMA_KB_TYPE,
-    LINKED_KB_TYPE,
     LIGHTRAG_SERVER_KB_TYPE,
+    LINKED_KB_TYPE,
     OBSIDIAN_KB_TYPE,
     SUBAGENT_KB_TYPE,
     external_root_of,
