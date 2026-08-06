@@ -186,7 +186,7 @@ class CodexModelCatalog:
         ) or len(response.content) > CODEX_MAX_CATALOG_BYTES:
             raise CodexAuthError(
                 "catalog_too_large",
-            "The Codex model catalog exceeded LearnLeader's safety limit.",
+                "The Codex model catalog exceeded LearnLeader's safety limit.",
                 502,
             )
         try:
