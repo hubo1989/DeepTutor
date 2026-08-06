@@ -16,6 +16,9 @@ export interface AuthStatus {
   is_admin?: boolean;
   /** Avatar marker: "", "icon:<name>:<color>", or "img:<version>". */
   avatar?: string;
+  /** Public deployment contract used to show Trial terms before registration. */
+  commercial_enabled?: boolean;
+  trial_days?: number | null;
 }
 
 /**

@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 import pytest
 
 from deeptutor.api.routers.mastery_path import router
+from deeptutor.commercial.entitlement_context import CommercialAccessDenied
 from deeptutor.learning.storage import LearningStore
 
 
@@ -314,6 +315,26 @@ class TestImportFromBook:
 
 
 class TestGenerateFromNotebook:
+    @patch("deeptutor.services.llm.complete", new_callable=AsyncMock)
+    @patch("deeptutor.api.routers.mastery_path.require_capability")
+    def test_inactive_subscription_is_rejected_before_llm(
+        self, mock_require_capability, mock_complete, client
+    ):
+        mock_require_capability.side_effect = CommercialAccessDenied(
+            "trial_expired", "The trial has expired."
+        )
+        resp = client.post(
+            "/api/v1/learning/progress/nb1/generate-from-notebook",
+            json={
+                "notebook_id": "nb",
+                "records": [{"id": "r1", "type": "note", "title": "T", "output": "O"}],
+            },
+        )
+
+        assert resp.status_code == 402
+        assert resp.json()["detail"]["code"] == "trial_expired"
+        mock_complete.assert_not_awaited()
+
     def test_missing_records_returns_400(self, client):
         resp = client.post(
             "/api/v1/learning/progress/nb1/generate-from-notebook",

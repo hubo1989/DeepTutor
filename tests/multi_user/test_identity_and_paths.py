@@ -23,6 +23,44 @@ def test_identity_migrates_legacy_users_with_stable_uid(tmp_path, monkeypatch):
     assert users_file.exists()
 
 
+def test_existing_admin_role_is_preserved(mu_isolated_root) -> None:
+    identity.USERS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    identity.USERS_FILE.write_text(
+        '{"owner@example.com":{"id":"u_owner","hash":"hash","role":"admin",'
+        '"created_at":"2026-01-01T00:00:00+00:00","disabled":false}}',
+        encoding="utf-8",
+    )
+
+    assert identity.load_users()["owner@example.com"]["role"] == "admin"
+
+
+def test_first_public_user_is_not_implicitly_promoted(mu_isolated_root) -> None:
+    record = identity.save_user("first@example.com", "hash", role="user")
+
+    assert record["role"] == "user"
+
+
+def test_create_user_if_absent_honors_explicit_role(mu_isolated_root) -> None:
+    created, regular = identity.create_user_if_absent("first@example.com", "hash", role="user")
+    created_admin, admin = identity.create_user_if_absent("owner@example.com", "hash", role="admin")
+
+    assert created is True
+    assert regular["role"] == "user"
+    assert created_admin is True
+    assert admin["role"] == "admin"
+
+
+def test_conditional_delete_never_removes_a_new_account_incarnation(
+    mu_isolated_root,
+) -> None:
+    original = identity.save_user("user@example.com", "hash", role="user")
+
+    removed = identity.delete_user("user@example.com", expected_user_id="u_different_incarnation")
+
+    assert removed is False
+    assert identity.get_user("user@example.com")["id"] == original["id"]
+
+
 def test_path_service_uses_current_user_scope(tmp_path, monkeypatch):
     monkeypatch.setattr(paths, "ensure_user_workspace", lambda _uid: tmp_path)
     user_root = tmp_path / "data" / "users" / "u_alice"

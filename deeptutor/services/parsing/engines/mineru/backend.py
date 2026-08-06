@@ -46,8 +46,22 @@ def _pdf_page_count(pdf_path: Path) -> int:
     return count
 
 
-def _reserve_mineru_pages(pdf_path: Path, config: MinerUConfig):
+def _reserve_mineru_pages(
+    pdf_path: Path,
+    config: MinerUConfig,
+    *,
+    request_id: str | None = None,
+):
     """Reserve this user's MinerU page allowance, if the user is bounded."""
+    from deeptutor.commercial.entitlement_context import (
+        CommercialAccessDenied,
+        integer_limit,
+    )
+    from deeptutor.commercial.metering import (
+        CommercialMeteringError,
+        commercial_usage_required,
+        reserve_commercial_usage_sync,
+    )
     from deeptutor.multi_user.byok_policy import load_policy
     from deeptutor.multi_user.token_quota import (
         QuotaExceeded,
@@ -57,14 +71,25 @@ def _reserve_mineru_pages(pdf_path: Path, config: MinerUConfig):
 
     policy_limits = load_policy().get("limits") or {}
     global_max_pages = max(1, int(policy_limits.get("max_pages_per_file", 50)))
+    if config.source != "byok":
+        from deeptutor.multi_user.token_quota import current_user_resource_quota_policy
+
+        policy = current_user_resource_quota_policy("mineru")
+        needs_commercial_meter = commercial_usage_required(source=config.source)
+        if policy is None and not needs_commercial_meter:
+            return None, None, 0
+    try:
+        plan_max_pages = integer_limit("mineru_max_pages_per_file")
+    except CommercialAccessDenied as exc:
+        raise MinerUError(str(exc)) from exc
+    if plan_max_pages is not None:
+        global_max_pages = min(global_max_pages, plan_max_pages)
+    pages = _pdf_page_count(pdf_path)
+    if pages > global_max_pages:
+        raise MinerUError(
+            f"MinerU file exceeds the per-file safety limit of {global_max_pages} pages."
+        )
     if config.source == "byok":
-        # BYOK does not consume platform page credits, but the administrator's
-        # per-file safety ceiling remains mandatory for untrusted users.
-        pages = _pdf_page_count(pdf_path)
-        if pages > global_max_pages:
-            raise MinerUError(
-                f"MinerU file exceeds the per-file safety limit of {global_max_pages} pages."
-            )
         from deeptutor.multi_user.byok_usage import start_byok_usage
         from deeptutor.multi_user.context import get_current_user
         from deeptutor.multi_user.execution_source import get_execution_source
@@ -83,21 +108,40 @@ def _reserve_mineru_pages(pdf_path: Path, config: MinerUConfig):
             model=config.model_version,
             estimated_units=pages,
         )
-        return lease, pages
-    from deeptutor.multi_user.token_quota import current_user_resource_quota_policy
-
-    policy = current_user_resource_quota_policy("mineru")
-    if policy is None:
-        return None, 0
-    pages = _pdf_page_count(pdf_path)
-    if pages > global_max_pages:
-        raise MinerUError(
-            f"MinerU file exceeds the per-file safety limit of {global_max_pages} pages."
-        )
+        try:
+            # MinerU's 20-page Trial limit is source-independent: BYOK avoids
+            # platform cost, not parser/storage safety accounting.
+            commercial_lease = reserve_commercial_usage_sync(
+                meter="mineru_pages",
+                quantity=pages,
+                source="byok",
+                provider="mineru-cloud" if config.is_cloud else "mineru-local",
+                model=config.model_version,
+                request_id=request_id,
+                count_byok=True,
+            )
+        except CommercialMeteringError as exc:
+            lease.release()
+            raise MinerUError(str(exc)) from exc
+        return lease, commercial_lease, pages
     try:
-        return reserve_current_user_units(resource="mineru", requested_units=pages), pages
+        lease = reserve_current_user_units(resource="mineru", requested_units=pages)
     except (QuotaExceeded, TokenQuotaUnavailable) as exc:
         raise MinerUError(str(exc)) from exc
+    try:
+        commercial_lease = reserve_commercial_usage_sync(
+            meter="mineru_pages",
+            quantity=pages,
+            source=config.source,
+            provider="mineru-cloud" if config.is_cloud else "mineru-local",
+            model=config.model_version,
+            request_id=request_id,
+        )
+    except CommercialMeteringError as exc:
+        if lease is not None:
+            lease.release()
+        raise MinerUError(str(exc)) from exc
+    return lease, commercial_lease, pages
 
 
 def parse_pdf_to_workdir(
@@ -106,6 +150,7 @@ def parse_pdf_to_workdir(
     *,
     config: MinerUConfig | None = None,
     on_output: Callable[[str], None] | None = None,
+    request_id: str | None = None,
 ) -> Path:
     """Parse ``pdf_path`` and return the directory holding MinerU artifacts.
 
@@ -121,7 +166,11 @@ def parse_pdf_to_workdir(
     output_base = Path(output_base)
     output_base.mkdir(parents=True, exist_ok=True)
 
-    lease, page_count = _reserve_mineru_pages(pdf_path, cfg)
+    lease, commercial_lease, page_count = _reserve_mineru_pages(
+        pdf_path,
+        cfg,
+        request_id=request_id,
+    )
     try:
         if cfg.is_cloud:
             from .cloud import parse_cloud
@@ -130,12 +179,27 @@ def parse_pdf_to_workdir(
             result = parse_cloud(pdf_path, output_base, cfg, on_progress=on_output)
         else:
             result = _parse_local(pdf_path, output_base, config=cfg, on_output=on_output)
-    except Exception:
-        if lease is not None:
-            lease.release()
+    except BaseException:
+        try:
+            if lease is not None:
+                lease.release()
+        finally:
+            if commercial_lease is not None:
+                commercial_lease.release()
         raise
-    if lease is not None:
-        lease.finalize(page_count)
+    try:
+        if lease is not None:
+            lease.finalize(page_count)
+    finally:
+        if commercial_lease is not None:
+            try:
+                commercial_lease.finalize(
+                    page_count,
+                    usage_units={"pages": page_count},
+                    is_estimated=False,
+                )
+            except Exception as exc:
+                raise MinerUError(str(exc)) from exc
     return result
 
 

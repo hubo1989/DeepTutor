@@ -36,10 +36,12 @@ import logging
 import re
 from typing import Literal
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from deeptutor.api.routers.auth import require_admin
+from deeptutor.multi_user.context import get_current_user
 from deeptutor.services.memory import (
     L3_SLOTS,
     SURFACES,
@@ -76,6 +78,11 @@ def _validate_surface(surface: str) -> Surface:
     if surface not in SURFACES:
         raise HTTPException(status_code=404, detail=f"unknown surface {surface!r}")
     return surface  # type: ignore[return-value]
+
+
+def _memory_owner_id() -> str:
+    """Stable workspace owner used to scope process-wide run state."""
+    return get_current_user().scope.user_id
 
 
 # ── Overview / list ──────────────────────────────────────────────────────
@@ -183,7 +190,7 @@ async def reset_doc(layer: str, key: str):
 
     from deeptutor.services.memory.consolidator.runs import get_run_manager
 
-    if get_run_manager().active_for(lyr, key) is not None:
+    if get_run_manager().active_for(lyr, key, owner_id=_memory_owner_id()) is not None:
         raise HTTPException(
             status_code=409,
             detail="cancel the active run before resetting this doc",
@@ -327,6 +334,7 @@ async def start_run(req: RunStartRequest):
     selection = req.llm_selection.model_dump(exclude_none=True) if req.llm_selection else None
     try:
         run = await manager.start(
+            owner_id=_memory_owner_id(),
             layer=lyr,
             key=req.key,
             mode=req.mode,
@@ -348,7 +356,7 @@ async def start_run(req: RunStartRequest):
 async def get_run(run_id: str):
     from deeptutor.services.memory.consolidator.runs import get_run_manager
 
-    run = get_run_manager().get(run_id)
+    run = get_run_manager().get(run_id, owner_id=_memory_owner_id())
     if run is None:
         raise HTTPException(status_code=404, detail="unknown run_id")
     return run.to_dict()
@@ -358,7 +366,11 @@ async def get_run(run_id: str):
 async def cancel_run(run_id: str):
     from deeptutor.services.memory.consolidator.runs import get_run_manager
 
-    ok = await get_run_manager().cancel(run_id)
+    manager = get_run_manager()
+    owner_id = _memory_owner_id()
+    if manager.get(run_id, owner_id=owner_id) is None:
+        raise HTTPException(status_code=404, detail="unknown run_id")
+    ok = await manager.cancel(run_id, owner_id=owner_id)
     if not ok:
         raise HTTPException(status_code=409, detail="not active")
     return {"run_id": run_id, "cancelled": True}
@@ -373,14 +385,14 @@ async def undo_run_edit(run_id: str):
 
     manager = get_run_manager()
     try:
-        event = await manager.undo_last(run_id)
+        event = await manager.undo_last(run_id, owner_id=_memory_owner_id())
     except KeyError:
         raise HTTPException(status_code=404, detail="unknown run_id")
     except RunBusyError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
     if event is None:
         raise HTTPException(status_code=409, detail="nothing to undo")
-    run = manager.get(run_id)
+    run = manager.get(run_id, owner_id=_memory_owner_id())
     return {
         "run_id": run_id,
         "undone": True,
@@ -396,7 +408,11 @@ async def list_runs(layer: str | None = None, key: str | None = None):
     lyr = _validate_layer(layer) if layer is not None else None
     if lyr and key is not None:
         _validate_doc_key(lyr, key)
-    runs = get_run_manager().list_for(layer=lyr, key=key)
+    runs = get_run_manager().list_for(
+        layer=lyr,
+        key=key,
+        owner_id=_memory_owner_id(),
+    )
     return {"runs": [r.to_dict() for r in runs]}
 
 
@@ -411,7 +427,7 @@ async def stream_run_events(run_id: str, since: int = 0):
     from deeptutor.services.memory.consolidator.runs import get_run_manager
 
     manager = get_run_manager()
-    run = manager.get(run_id)
+    run = manager.get(run_id, owner_id=_memory_owner_id())
     if run is None:
         raise HTTPException(status_code=404, detail="unknown run_id")
 
@@ -457,12 +473,15 @@ def _legacy_run_stream(req: RunStartRequest) -> StreamingResponse:
         get_run_manager,
     )
 
+    owner_id = _memory_owner_id()
+
     async def producer():
         manager = get_run_manager()
         runner = _runner_for(req)
         selection = req.llm_selection.model_dump(exclude_none=True) if req.llm_selection else None
         try:
             run = await manager.start(
+                owner_id=owner_id,
                 layer=req.layer,
                 key=req.key,
                 mode=req.mode,
@@ -602,7 +621,7 @@ async def get_doc_lines(layer: str, key: str):
 
 
 @router.get("/settings")
-async def get_memory_settings_endpoint():
+async def get_memory_settings_endpoint(_: object = Depends(require_admin)):
     """Return the current ``memory:`` subtree (defaults merged in)."""
     from deeptutor.services.memory.settings import memory_settings_dict
 
@@ -610,7 +629,10 @@ async def get_memory_settings_endpoint():
 
 
 @router.put("/settings")
-async def put_memory_settings(payload: dict):
+async def put_memory_settings(
+    payload: dict,
+    _: object = Depends(require_admin),
+):
     """Merge the payload into the ``memory:`` subtree and persist."""
     from deeptutor.services.memory.settings import (
         memory_settings_dict,

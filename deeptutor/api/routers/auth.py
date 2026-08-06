@@ -7,6 +7,7 @@ import re
 
 from fastapi import (
     APIRouter,
+    BackgroundTasks,
     Cookie,
     Depends,
     File,
@@ -20,19 +21,47 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, field_validator
+from starlette.background import BackgroundTask
 
-from deeptutor.services.config import load_auth_settings
+from deeptutor.commercial.runtime import commercial_mode_requested
+from deeptutor.commercial.service import DEFAULT_TRIAL_DAYS
+from deeptutor.services.config import load_auth_settings, load_system_settings
+from deeptutor.services.config.origins import normalize_origin, normalize_origins
 
-# SameSite=None lets the cookie work when the browser accesses the frontend via
-# 127.0.0.1 and the backend via localhost (different origins on the same machine).
-# Browsers require Secure=True for SameSite=None, but that needs HTTPS — so in
-# local dev we fall back to SameSite=Lax and tell users to use localhost:// URLs.
+
+def _cookie_samesite(*, secure: bool, commercial: bool) -> str:
+    """Choose the legacy cross-site policy or hosted SaaS CSRF boundary."""
+
+    if commercial:
+        # Hosted commercial deployments must keep the frontend and API on the
+        # same site. Lax prevents ambient cookies on cross-site POSTs while the
+        # explicit CORS and WebSocket-Origin checks cover script/socket access.
+        return "lax"
+    # Legacy/self-hosted secure deployments may intentionally split the web
+    # and API origins. SameSite=None preserves that behavior outside SaaS mode.
+    return "none" if secure else "lax"
+
+
 _SECURE = bool(load_auth_settings()["cookie_secure"])
-_SAMESITE = "none" if _SECURE else "lax"
+_COMMERCIAL = commercial_mode_requested()
+_SAMESITE = _cookie_samesite(
+    secure=_SECURE,
+    commercial=_COMMERCIAL,
+)
 
-from deeptutor.multi_user.context import set_current_user, user_from_token_payload
+from deeptutor.multi_user.context import (
+    get_current_user_or_none,
+    reset_current_user,
+    set_current_user,
+    user_from_token_payload,
+)
 from deeptutor.multi_user.paths import local_admin_user
-from deeptutor.services import email_verification
+from deeptutor.services import (
+    account_lifecycle,
+    email_verification,
+    login_rate_limit,
+    password_reset,
+)
 from deeptutor.services.auth import (
     AUTH_ENABLED,
     POCKETBASE_ENABLED,
@@ -44,13 +73,14 @@ from deeptutor.services.auth import (
     authenticate_pb,
     create_token,
     decode_token,
-    delete_user,
     get_user_info,
     hash_password,
     list_users,
     register_pb,
+    reset_password,
     set_avatar,
     set_role,
+    validate_password_bytes,
 )
 from deeptutor.services.codex_auth.contracts import CodexAuthError
 from deeptutor.services.codex_auth.service import deliver_codex_oauth_callback
@@ -92,6 +122,21 @@ class LoginRequest(BaseModel):
     username: str
     password: str
 
+    @field_validator("username")
+    @classmethod
+    def username_bounded(cls, v: str) -> str:
+        value = v.strip()
+        if len(value.encode("utf-8")) > 254:
+            raise ValueError("Username must be at most 254 UTF-8 bytes")
+        return value
+
+    @field_validator("password")
+    @classmethod
+    def password_bounded(cls, v: str) -> str:
+        # Login intentionally has no minimum: legacy local accounts may use a
+        # short password, and auth-disabled localhost mode accepts an empty one.
+        return validate_password_bytes(v)
+
 
 class RegisterRequest(BaseModel):
     """Payload for the POST /register endpoint."""
@@ -111,7 +156,7 @@ class RegisterRequest(BaseModel):
         # usernames (used by the built-in SQLite/JSON auth mode).
         email_re = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
         plain_re = re.compile(r"^[A-Za-z0-9_\-.]{3,64}$")
-        if not email_re.match(v) and not plain_re.match(v):
+        if len(v.encode("utf-8")) > 254 or (not email_re.match(v) and not plain_re.match(v)):
             raise ValueError("Enter a valid email address")
         return v
 
@@ -120,7 +165,7 @@ class RegisterRequest(BaseModel):
     def password_valid(cls, v: str) -> str:
         if len(v) < 8:
             raise ValueError("Password must be at least 8 characters")
-        return v
+        return validate_password_bytes(v)
 
 
 class EmailRegistrationRequest(BaseModel):
@@ -142,7 +187,7 @@ class EmailRegistrationRequest(BaseModel):
     def password_valid(cls, v: str) -> str:
         if len(v) < 8:
             raise ValueError("Password must be at least 8 characters")
-        return v
+        return validate_password_bytes(v)
 
 
 class VerifyRegistrationRequest(BaseModel):
@@ -168,6 +213,53 @@ class VerifyRegistrationRequest(BaseModel):
         return v
 
 
+class PasswordResetRequest(BaseModel):
+    """Request a one-time password-reset code for a mailbox."""
+
+    email: str
+
+    @field_validator("email")
+    @classmethod
+    def email_valid(cls, v: str) -> str:
+        v = email_verification.normalize_email(v)
+        if len(v) > 254 or not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", v):
+            raise ValueError("Enter a valid email address")
+        return v
+
+
+class ConfirmPasswordResetRequest(PasswordResetRequest):
+    """Consume a reset code and choose a replacement password."""
+
+    code: str
+    new_password: str
+
+    @field_validator("code")
+    @classmethod
+    def code_valid(cls, v: str) -> str:
+        v = v.strip()
+        if not re.fullmatch(r"\d{6}", v):
+            raise ValueError("Verification code must be 6 digits")
+        return v
+
+    @field_validator("new_password")
+    @classmethod
+    def password_valid(cls, v: str) -> str:
+        if len(v) < 8:
+            raise ValueError("Password must be at least 8 characters")
+        return validate_password_bytes(v)
+
+
+class DeleteOwnAccountRequest(BaseModel):
+    """Password confirmation for irreversible self-service deletion."""
+
+    password: str
+
+    @field_validator("password")
+    @classmethod
+    def password_bounded(cls, v: str) -> str:
+        return validate_password_bytes(v)
+
+
 class SetRoleRequest(BaseModel):
     """Payload for the PUT /users/{username}/role endpoint."""
 
@@ -191,6 +283,8 @@ class AuthStatusResponse(BaseModel):
     role: str | None = None
     is_admin: bool = False
     avatar: str = ""
+    commercial_enabled: bool = False
+    trial_days: int | None = None
 
 
 class UserInfo(BaseModel):
@@ -255,6 +349,138 @@ def _bearer_token_from_header(authorization: str | None) -> str | None:
 
 def _extract_token(authorization: str | None, dt_token: str | None) -> str | None:
     return _bearer_token_from_header(authorization) or dt_token
+
+
+def _client_ip(request: Request) -> str:
+    """Use the ASGI peer address; trusted proxy handling belongs to the server."""
+    return request.client.host if request.client else "unknown"
+
+
+def _check_login_rate_limit(username: str, client_ip: str) -> None:
+    try:
+        login_rate_limit.check_login_allowed(username, client_ip)
+    except login_rate_limit.LoginRateLimited as exc:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many login attempts. Please try again later.",
+            headers={"Retry-After": str(exc.retry_after)},
+        ) from exc
+    except login_rate_limit.LoginRateLimitUnavailable as exc:
+        logger.error("Persistent login limiter is unavailable: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Login is temporarily unavailable.",
+        ) from exc
+
+
+def _record_login_result(
+    username: str,
+    client_ip: str,
+    *,
+    success: bool,
+) -> None:
+    try:
+        login_rate_limit.record_login_result(username, client_ip, success=success)
+    except login_rate_limit.LoginRateLimitUnavailable as exc:
+        logger.error("Could not persist login attempt: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Login is temporarily unavailable.",
+        ) from exc
+
+
+async def _provision_commercial_trial(user_id: str, role: str) -> bool:
+    """Return whether a created regular account still needs trial repair."""
+    if role == "admin" or not user_id:
+        return False
+    try:
+        from deeptutor.commercial.runtime import get_commercial_runtime
+
+        runtime = get_commercial_runtime()
+        if not runtime.settings.enabled:
+            return False
+        await runtime.ensure_trial_for_owner(user_id)
+        return False
+    except Exception:
+        # Identity creation is already committed.  Keep login usable and let
+        # require_commercial_access's idempotent ensure call reconcile this
+        # account when PostgreSQL becomes healthy again.
+        logger.exception("Trial provisioning deferred for owner %s", user_id)
+        return True
+
+
+async def _commercial_export_data(user_id: str) -> dict | None:
+    from deeptutor.commercial.errors import CommercialNotFound
+    from deeptutor.commercial.runtime import get_commercial_runtime
+
+    runtime = get_commercial_runtime()
+    if not runtime.settings.enabled:
+        return None
+    if runtime.control_plane is None:
+        raise RuntimeError("Commercial control plane is not available")
+    try:
+        return await runtime.control_plane.export_customer_data(user_id)
+    except CommercialNotFound:
+        # A legacy identity may not have reached reconciliation yet. There is
+        # no commercial record to export, so the local export remains valid.
+        return None
+    except Exception as exc:
+        raise RuntimeError("Commercial account export is unavailable") from exc
+
+
+async def _erase_commercial_customer(user_id: str) -> None:
+    from deeptutor.commercial.runtime import get_commercial_runtime
+
+    runtime = get_commercial_runtime()
+    if not runtime.settings.enabled:
+        return
+    if runtime.control_plane is None:
+        raise RuntimeError("Commercial control plane is not available")
+    await runtime.control_plane.erase_customer(user_id)
+
+
+async def _delete_account_saga(
+    username: str,
+    *,
+    expected_user_id: str | None,
+    actor_id: str,
+    actor_username: str,
+) -> account_lifecycle.AccountDeletionResult:
+    """Quiesce local work and erase billing before identity's commit point."""
+    context = await asyncio.to_thread(
+        account_lifecycle.begin_account_deletion,
+        username,
+        actor_id=actor_id,
+        actor_username=actor_username,
+        expected_user_id=expected_user_id,
+    )
+    if context.already_deleted:
+        return await asyncio.to_thread(account_lifecycle.finish_account_deletion, context)
+    try:
+        from deeptutor.api.utils.task_id_manager import TaskIDManager
+        from deeptutor.services.memory.consolidator.runs import get_run_manager
+        from deeptutor.services.session.turn_runtime import cancel_turns_for_user
+
+        await asyncio.gather(
+            cancel_turns_for_user(context.user_id),
+            TaskIDManager.get_instance().cancel_all_for_owner(context.user_id),
+            get_run_manager().cancel_all_for_owner(context.user_id),
+        )
+        await asyncio.to_thread(
+            account_lifecycle.remove_scheduled_account_jobs,
+            context.user_id,
+        )
+        await _erase_commercial_customer(context.user_id)
+    except Exception as exc:
+        await asyncio.to_thread(
+            account_lifecycle.fail_account_deletion,
+            context,
+            exc,
+        )
+        raise account_lifecycle.AccountLifecycleError(
+            "Account deletion did not complete; the account remains disabled"
+        ) from exc
+    return await asyncio.to_thread(account_lifecycle.finish_account_deletion, context)
 
 
 # ---------------------------------------------------------------------------
@@ -340,6 +566,125 @@ class _WsAuthFailed:
 ws_auth_failed: _WsAuthFailed = _WsAuthFailed()
 
 
+def _configured_websocket_origins() -> set[str]:
+    """Return the exact browser origins accepted by authenticated WS routes.
+
+    WebSockets bypass ``CORSMiddleware``, so this intentionally mirrors
+    ``api.main._build_cors_settings`` instead of relying on HTTP CORS headers.
+    """
+    system = load_system_settings()
+    frontend_port = str(system["frontend_port"])
+    origins = {
+        f"http://localhost:{frontend_port}",
+        f"http://127.0.0.1:{frontend_port}",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    }
+    origins.update(normalize_origins([system["cors_origin"], system["cors_origins"]]))
+    return origins
+
+
+def _websocket_origin_allowed(ws: WebSocket) -> bool:
+    """Reject browser cross-site upgrades while allowing non-browser clients.
+
+    Browsers always send ``Origin`` for WebSocket handshakes. CLI clients that
+    authenticate with a Bearer token commonly omit it, which remains allowed.
+    """
+    if not AUTH_ENABLED:
+        return True
+    origin = str(getattr(ws, "headers", {}).get("origin") or "").strip()
+    if not origin:
+        return True
+    normalized = normalize_origin(origin)
+    allowed = _configured_websocket_origins()
+    # A wildcard is never safe with authenticated cookies: it would recreate
+    # the cross-site WebSocket hijacking path this check is meant to close.
+    return bool(normalized and normalized in allowed and normalized != "*")
+
+
+def _websocket_auth_token(ws: WebSocket) -> str | None:
+    query_token = ws.query_params.get("token")
+    authorization = getattr(ws, "headers", {}).get("authorization")
+    return query_token or _bearer_token_from_header(authorization) or ws.cookies.get(_COOKIE_NAME)
+
+
+def _websocket_principal_is_current(ws: WebSocket) -> bool:
+    """Revalidate the socket JWT against the currently bound principal."""
+    if not AUTH_ENABLED:
+        return True
+    raw_token = _websocket_auth_token(ws)
+    expected = get_current_user_or_none()
+    if not raw_token or expected is None:
+        return False
+    try:
+        payload = decode_token(raw_token)
+        if payload is None:
+            return False
+        current = user_from_token_payload(payload)
+    except Exception:
+        logger.warning("WebSocket token revalidation failed", exc_info=True)
+        return False
+    return (
+        current.id == expected.id
+        and current.username == expected.username
+        and current.role == expected.role
+        and current.scope.cache_key == expected.scope.cache_key
+    )
+
+
+async def _close_websocket(ws: WebSocket, code: int) -> None:
+    try:
+        await ws.close(code=code)
+    except Exception:
+        logger.debug("Failed to close WebSocket with code %s", code, exc_info=True)
+
+
+async def _refresh_websocket_commercial_access(ws: WebSocket) -> bool:
+    """Install a fresh subscription snapshot in this socket task.
+
+    A WebSocket can outlive both a seven-day Trial boundary and an account
+    state change.  Refreshing on the handshake and before every inbound frame
+    makes subsequent consuming handlers observe current entitlements while
+    still allowing already-running work to finish under its copied context.
+    """
+    try:
+        from deeptutor.commercial.entitlement_context import (
+            install_commercial_access_for_current_user,
+        )
+
+        await install_commercial_access_for_current_user()
+        return True
+    except Exception:
+        logger.exception("Commercial access refresh failed for WebSocket principal")
+        await _close_websocket(ws, 1011)
+        return False
+
+
+async def ws_require_capability_access(ws: WebSocket, capability: str = "llm") -> bool:
+    """Fail the WS upgrade when the current user has no usable capability."""
+    from deeptutor.multi_user.model_access import has_capability_access
+
+    if has_capability_access(capability):
+        return True
+    await _close_websocket(ws, 4003)
+    return False
+
+
+async def ws_revalidate_identity(ws: WebSocket) -> bool:
+    """Apply account deletion/disable/password reset before an inbound frame."""
+    if not _websocket_principal_is_current(ws):
+        await _close_websocket(ws, 4001)
+        return False
+    return await _refresh_websocket_commercial_access(ws)
+
+
+async def ws_authorize_message(ws: WebSocket, capability: str = "llm") -> bool:
+    """Revalidate identity and model access before a consuming WS action."""
+    if not await ws_revalidate_identity(ws):
+        return False
+    return await ws_require_capability_access(ws, capability)
+
+
 async def ws_require_auth(ws: WebSocket) -> _CtxToken | _WsAuthFailed:
     """Authenticate a WebSocket connection and set the user ContextVar.
 
@@ -362,15 +707,27 @@ async def ws_require_auth(ws: WebSocket) -> _CtxToken | _WsAuthFailed:
             reset_current_user(user_token)
     """
     if not AUTH_ENABLED:
-        return _install_current_user(None)
+        user_token = _install_current_user(None)
+        if await _refresh_websocket_commercial_access(ws):
+            return user_token
+        reset_current_user(user_token)
+        return ws_auth_failed
 
-    token = ws.query_params.get("token") or ws.cookies.get(_COOKIE_NAME)
+    if not _websocket_origin_allowed(ws):
+        await _close_websocket(ws, 4003)
+        return ws_auth_failed
+
+    token = _websocket_auth_token(ws)
     payload = decode_token(token) if token else None
     if not payload:
         await ws.close(code=4001)
         return ws_auth_failed
 
-    return _install_current_user(payload)
+    user_token = _install_current_user(payload)
+    if await _refresh_websocket_commercial_access(ws):
+        return user_token
+    reset_current_user(user_token)
+    return ws_auth_failed
 
 
 async def require_admin(
@@ -433,16 +790,16 @@ async def receive_codex_oauth_callback(
     except CodexAuthError as exc:
         return HTMLResponse(
             (
-                "<!doctype html><title>DeepTutor Codex</title>"
-                "<p>Authentication could not be received. Return to DeepTutor and try again.</p>"
+                "<!doctype html><title>LearnLeader Codex</title>"
+                "<p>Authentication could not be received. Return to LearnLeader and try again.</p>"
             ),
             status_code=exc.http_status,
             headers=headers,
         )
     return HTMLResponse(
         (
-            "<!doctype html><title>DeepTutor Codex</title>"
-            "<p>Authentication received. You can return to DeepTutor.</p>"
+            "<!doctype html><title>LearnLeader Codex</title>"
+            "<p>Authentication received. You can return to LearnLeader.</p>"
         ),
         headers=headers,
     )
@@ -462,6 +819,8 @@ async def auth_status(
             username="local",
             role="admin",
             is_admin=True,
+            commercial_enabled=False,
+            trial_days=None,
         )
 
     token = _extract_token(authorization, dt_token)
@@ -479,19 +838,25 @@ async def auth_status(
         role=payload.role if payload else None,
         is_admin=payload.role == "admin" if payload else False,
         avatar=avatar,
+        commercial_enabled=_COMMERCIAL,
+        trial_days=DEFAULT_TRIAL_DAYS if _COMMERCIAL else None,
     )
 
 
 @router.post("/login")
-async def login(body: LoginRequest, response: Response) -> dict:
+async def login(body: LoginRequest, request: Request, response: Response) -> dict:
     """Validate credentials and set a JWT cookie."""
     if not AUTH_ENABLED:
         return {"ok": True, "message": "Auth is disabled — no login required."}
+
+    client_ip = _client_ip(request)
+    _check_login_rate_limit(body.username, client_ip)
 
     if POCKETBASE_ENABLED:
         # PocketBase mode: email = username field for backwards-compat with the
         # existing LoginRequest schema; users can pass their email as "username".
         pb_result = authenticate_pb(body.username, body.password)
+        _record_login_result(body.username, client_ip, success=pb_result is not None)
         if not pb_result:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -510,6 +875,7 @@ async def login(body: LoginRequest, response: Response) -> dict:
 
     # Standard JWT + bcrypt mode
     result = authenticate(body.username, body.password)
+    _record_login_result(body.username, client_ip, success=result is not None)
     if not result:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -529,6 +895,95 @@ async def login(body: LoginRequest, response: Response) -> dict:
     }
 
 
+_PASSWORD_RESET_PUBLIC_RESPONSE = {
+    "ok": True,
+    "message": "If this address has an account, a password reset code has been sent.",
+}
+
+
+@router.post("/password-reset/request-code", status_code=status.HTTP_202_ACCEPTED)
+async def request_password_reset_code(
+    body: PasswordResetRequest,
+    request: Request,
+    background_tasks: BackgroundTasks,
+) -> dict:
+    """Issue a reset code without revealing whether the account exists."""
+    if not AUTH_ENABLED:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Auth is disabled — password reset is not available.",
+        )
+    if POCKETBASE_ENABLED:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Use the configured identity provider to reset this password.",
+        )
+    try:
+        challenge = password_reset.issue_challenge(body.email, _client_ip(request))
+        info = get_user_info(body.email)
+        deliverable = bool(
+            password_reset.email_delivery_configured()
+            and info
+            and not bool(info.get("disabled", False))
+            and bool(info.get("email_verified", True))
+        )
+        # Always enqueue the same background callable.  The HTTP response is
+        # therefore independent of account existence and SMTP latency/failure.
+        background_tasks.add_task(
+            password_reset.deliver_password_reset_challenge,
+            challenge,
+            deliverable=deliverable,
+        )
+    except password_reset.PasswordResetRateLimited as exc:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Please wait before requesting another password reset code.",
+            headers={"Retry-After": "60"},
+        ) from exc
+    except password_reset.PasswordResetError as exc:
+        logger.warning("Password reset challenge service unavailable: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Password reset is temporarily unavailable.",
+        ) from exc
+    return dict(_PASSWORD_RESET_PUBLIC_RESPONSE)
+
+
+@router.post("/password-reset/confirm")
+async def confirm_password_reset(body: ConfirmPasswordResetRequest) -> dict:
+    """Consume a one-time code, replace the password, and revoke old JWTs."""
+    if not AUTH_ENABLED:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Auth is disabled — password reset is not available.",
+        )
+    if POCKETBASE_ENABLED:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Use the configured identity provider to reset this password.",
+        )
+    try:
+        valid = password_reset.consume_challenge(body.email, body.code)
+    except password_reset.PasswordResetError as exc:
+        logger.warning("Password reset verification unavailable: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Password reset is temporarily unavailable.",
+        ) from exc
+    if not valid or not reset_password(body.email, body.new_password):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired password reset code.",
+        )
+    try:
+        login_rate_limit.clear_login_history(body.email)
+    except login_rate_limit.LoginRateLimitUnavailable:
+        # The password/version update is already committed. Old tokens are
+        # revoked even if cleanup of failed-login history needs later repair.
+        logger.exception("Could not clear login history after password reset")
+    return {"ok": True}
+
+
 @router.post("/logout")
 async def logout(response: Response) -> dict:
     """Clear the JWT cookie.
@@ -541,7 +996,11 @@ async def logout(response: Response) -> dict:
 
 
 @router.post("/register/request-code", status_code=status.HTTP_202_ACCEPTED)
-async def request_registration_code(body: EmailRegistrationRequest, request: Request) -> dict:
+async def request_registration_code(
+    body: EmailRegistrationRequest,
+    request: Request,
+    background_tasks: BackgroundTasks,
+) -> dict:
     """Request a one-time code without revealing whether an account exists."""
     if not AUTH_ENABLED:
         raise HTTPException(
@@ -564,23 +1023,7 @@ async def request_registration_code(body: EmailRegistrationRequest, request: Req
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Email registration is not available in PocketBase mode.",
         )
-    if not email_verification.email_delivery_configured():
-        logger.error("Public registration requested but SMTP delivery is not configured")
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Email verification is temporarily unavailable.",
-        )
-
     email = body.email
-    # Keep the public response identical for an existing account. Do not spend
-    # a bcrypt hash or send mail for an address that already owns an account.
-    if get_user_info(email) is not None:
-        return {
-            "ok": True,
-            "verification_required": True,
-            "message": "If this address can register, a verification code has been sent.",
-        }
-
     client_ip = request.client.host if request.client else "unknown"
     try:
         # Do the cheap persistent limiter check before bcrypt, which is
@@ -589,7 +1032,17 @@ async def request_registration_code(body: EmailRegistrationRequest, request: Req
         email_verification.check_registration_rate_limit(email, client_ip)
         password_hash = hash_password(body.password)
         challenge = email_verification.issue_challenge(email, password_hash, client_ip)
-        await asyncio.to_thread(email_verification.send_verification_email, challenge)
+        deliverable = bool(
+            email_verification.email_delivery_configured() and get_user_info(email) is None
+        )
+        # Existing and new accounts take the same bcrypt/ledger path and queue
+        # the same background callable. SMTP latency or failure cannot turn
+        # the endpoint into an account-existence oracle.
+        background_tasks.add_task(
+            email_verification.deliver_registration_challenge,
+            challenge,
+            deliverable=deliverable,
+        )
     except (
         email_verification.VerificationRateLimited,
         email_verification.VerificationCooldown,
@@ -600,11 +1053,10 @@ async def request_registration_code(body: EmailRegistrationRequest, request: Req
             headers={"Retry-After": "60"},
         ) from exc
     except email_verification.EmailVerificationError as exc:
-        email_verification.discard_challenge(email)
-        logger.warning("Registration email delivery failed: %s", exc)
+        logger.warning("Registration verification service unavailable: %s", exc)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Could not send the verification email. Please try again later.",
+            detail="Email verification is temporarily unavailable.",
         ) from exc
 
     return {
@@ -657,6 +1109,7 @@ async def register(body: VerifyRegistrationRequest, response: Response) -> dict:
     username = body.email
     role = str(record.get("role") or "user")
     user_id = str(record.get("id") or "")
+    trial_pending = await _provision_commercial_trial(user_id, role)
     token = create_token(username, role, user_id)
     response.set_cookie(value=token, max_age=_COOKIE_MAX_AGE, **_cookie_attrs())
     logger.info(
@@ -671,6 +1124,7 @@ async def register(body: VerifyRegistrationRequest, response: Response) -> dict:
         "role": role,
         "is_first_user": role == "admin",
         "is_admin": role == "admin",
+        "trial_pending": trial_pending,
     }
 
 
@@ -735,6 +1189,90 @@ async def get_profile(
             created_at="",
         )
     return UserInfo(**info)
+
+
+@router.get("/profile/export")
+async def export_profile_data(
+    payload: TokenPayload | None = Depends(require_auth),
+) -> FileResponse:
+    """Download a privacy-safe ZIP snapshot of the current local account."""
+    current = _require_profile_identity(payload)
+    if POCKETBASE_ENABLED:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Account export is managed by the configured identity provider.",
+        )
+    try:
+        commercial_data = await _commercial_export_data(current.user_id)
+        result = await asyncio.to_thread(
+            account_lifecycle.export_account,
+            current.username,
+            actor_id=current.user_id,
+            commercial_data=commercial_data,
+        )
+    except account_lifecycle.AccountNotFound as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found") from exc
+    except (account_lifecycle.AccountLifecycleError, RuntimeError) as exc:
+        logger.exception("Account export failed for user id %s", current.user_id)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Account export could not be created.",
+        ) from exc
+    return FileResponse(
+        path=str(result.path),
+        media_type="application/zip",
+        filename="deeptutor-account-export.zip",
+        headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+        background=BackgroundTask(result.path.unlink, missing_ok=True),
+    )
+
+
+@router.delete("/profile")
+async def delete_own_account(
+    body: DeleteOwnAccountRequest,
+    request: Request,
+    response: Response,
+    payload: TokenPayload | None = Depends(require_auth),
+) -> dict:
+    """Irreversibly erase the current regular account after password proof."""
+    current = _require_profile_identity(payload)
+    if POCKETBASE_ENABLED:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Account deletion is managed by the configured identity provider.",
+        )
+    if current.role == "admin":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Demote the administrator before deleting the account.",
+        )
+
+    client_ip = _client_ip(request)
+    _check_login_rate_limit(current.username, client_ip)
+    confirmed = authenticate(current.username, body.password)
+    _record_login_result(current.username, client_ip, success=confirmed is not None)
+    if confirmed is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect password",
+        )
+    try:
+        result = await _delete_account_saga(
+            current.username,
+            expected_user_id=current.user_id,
+            actor_id=current.user_id,
+            actor_username=current.username,
+        )
+    except account_lifecycle.AccountLifecycleForbidden as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except account_lifecycle.AccountLifecycleError as exc:
+        logger.exception("Self-service account deletion failed for user id %s", current.user_id)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Account deletion could not be completed. The account is disabled.",
+        ) from exc
+    response.delete_cookie(**_cookie_attrs())
+    return {"ok": result.deleted, "already_deleted": result.already_deleted}
 
 
 @router.put("/profile")
@@ -895,12 +1433,15 @@ async def admin_create_user(
             f"Admin '{current.username if current else 'local'}' created PocketBase user "
             f"'{body.username}'"
         )
+        user_id = str(result.get("id") or "")
+        trial_pending = await _provision_commercial_trial(user_id, "user")
         return {
             "ok": True,
-            "user_id": result.get("id", ""),
+            "user_id": user_id,
             "username": body.username,
             "role": "user",
             "is_admin": False,
+            "trial_pending": trial_pending,
         }
 
     existing = {u["username"] for u in list_users()}
@@ -922,12 +1463,14 @@ async def admin_create_user(
         f"Admin '{current.username if current else 'local'}' created user '{body.username}' "
         f"(role={role!r})"
     )
+    trial_pending = await _provision_commercial_trial(user_id, role)
     return {
         "ok": True,
         "user_id": user_id,
         "username": body.username,
         "role": role,
         "is_admin": role == "admin",
+        "trial_pending": trial_pending,
     }
 
 
@@ -943,21 +1486,38 @@ async def remove_user(
             detail="You cannot delete your own account",
         )
 
-    # Capture the id before the record disappears so the avatar file can go too.
-    info = get_user_info(username)
+    if POCKETBASE_ENABLED:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Account deletion is managed by the configured identity provider.",
+        )
+    canonical_username = username.strip().casefold() if "@" in username else username.strip()
+    target_info = get_user_info(canonical_username)
+    expected_user_id = str(target_info.get("id") or "") if target_info else None
+    try:
+        result = await _delete_account_saga(
+            canonical_username,
+            expected_user_id=expected_user_id,
+            actor_id=current.user_id,
+            actor_username=current.username,
+        )
+    except account_lifecycle.AccountNotFound as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found") from exc
+    except account_lifecycle.AccountLifecycleForbidden as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except account_lifecycle.AccountLifecycleError as exc:
+        logger.exception("Admin account deletion failed actor=%s", current.user_id or "unknown")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Account deletion could not be completed. The account is disabled.",
+        ) from exc
 
-    removed = delete_user(username)
-    if not removed:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
-
-    user_id = str(info.get("id") or "") if info else ""
-    if user_id and _USER_ID_RE.match(user_id):
-        from deeptutor.multi_user.identity import delete_avatar_file
-
-        delete_avatar_file(user_id)
-
-    logger.info(f"Admin '{current.username if current else 'local'}' deleted user '{username}'")
-    return {"ok": True}
+    logger.info(
+        "Admin '%s' deleted account (already_deleted=%s)",
+        current.username,
+        result.already_deleted,
+    )
+    return {"ok": result.deleted, "already_deleted": result.already_deleted}
 
 
 @router.put("/users/{username}/role", status_code=status.HTTP_200_OK)

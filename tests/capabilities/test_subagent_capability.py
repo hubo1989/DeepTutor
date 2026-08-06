@@ -163,6 +163,7 @@ def test_owned_kbs_reports_only_agent_ref(monkeypatch) -> None:
 
 class _FakeBackend:
     kind = "claude_code"
+    local_cli = True
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, str | None]] = []
@@ -236,6 +237,75 @@ async def test_consult_budget_is_authoritative(monkeypatch) -> None:
     assert refused.success is False
     assert "budget" in refused.content.lower()
     assert len(backend.calls) == 1  # backend never invoked the second time
+
+
+@pytest.mark.asyncio
+async def test_regular_user_cannot_consult_host_cli_via_capability(monkeypatch, tmp_path) -> None:
+    from deeptutor.multi_user.context import reset_current_user, set_current_user
+    from deeptutor.multi_user.models import CurrentUser, UserScope
+
+    backend = _FakeBackend()
+    monkeypatch.setattr("deeptutor.services.subagent.get_backend", lambda _kind: backend)
+    user = CurrentUser(
+        id="u_alice",
+        username="alice",
+        role="user",
+        scope=UserScope(kind="user", user_id="u_alice", root=tmp_path),
+    )
+    token = set_current_user(user)
+    try:
+        result = await ConsultSubagentTool().execute(
+            question="inspect the host",
+            _subagent=_spec({"count": 0, "session_id": None, "name": "myagent"}),
+        )
+    finally:
+        reset_current_user(token)
+
+    assert result.success is False
+    assert "admin" in result.content.lower()
+    assert backend.calls == []
+
+
+@pytest.mark.asyncio
+async def test_partner_grant_is_rechecked_before_capability_consult(monkeypatch, tmp_path) -> None:
+    from fastapi import HTTPException
+
+    from deeptutor.multi_user.context import reset_current_user, set_current_user
+    from deeptutor.multi_user.models import CurrentUser, UserScope
+
+    class _PartnerBackend(_FakeBackend):
+        kind = "partner"
+        local_cli = False
+
+    backend = _PartnerBackend()
+    monkeypatch.setattr("deeptutor.services.subagent.get_backend", lambda _kind: backend)
+
+    def deny(_partner_id: str) -> None:
+        raise HTTPException(status_code=403, detail="Partner is not assigned to you")
+
+    monkeypatch.setattr("deeptutor.multi_user.partner_access.assert_partner_allowed", deny)
+    user = CurrentUser(
+        id="u_alice",
+        username="alice",
+        role="user",
+        scope=UserScope(kind="user", user_id="u_alice", root=tmp_path),
+    )
+    state = {"count": 0, "session_id": None, "name": "partner"}
+    spec = {
+        **_spec(state),
+        "kind": "partner",
+        "partner_id": "revoked-partner",
+    }
+    token = set_current_user(user)
+    try:
+        result = await ConsultSubagentTool().execute(question="hello", _subagent=spec)
+    finally:
+        reset_current_user(token)
+
+    assert result.success is False
+    assert "assigned" in result.content.lower()
+    assert state["count"] == 0
+    assert backend.calls == []
 
 
 @pytest.mark.asyncio

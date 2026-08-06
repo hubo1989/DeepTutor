@@ -23,6 +23,8 @@ from deeptutor.co_writer.storage import (
     CoWriterDocumentSummary,
     get_co_writer_storage,
 )
+from deeptutor.commercial.entitlement_context import CommercialAccessDenied
+from deeptutor.commercial.storage_limits import CommercialResourceLimitDenied
 from deeptutor.core.stream_bus import StreamBus
 from deeptutor.services.config import PROJECT_ROOT, load_config_with_main
 from deeptutor.services.llm import clean_thinking_tags
@@ -36,6 +38,15 @@ log_dir = config.get("paths", {}).get("user_log_dir") or config.get("logging", {
 logger = logging.getLogger(__name__)
 
 _edit_agent: EditAgent | None = None
+
+
+def _raise_storage_denial(
+    exc: CommercialAccessDenied | CommercialResourceLimitDenied,
+) -> None:
+    detail: dict[str, object] = {"code": exc.code, "message": str(exc)}
+    if isinstance(exc, CommercialResourceLimitDenied):
+        detail.update(exc.details)
+    raise HTTPException(status_code=402, detail=detail) from exc
 
 
 def _current_language() -> str:
@@ -236,6 +247,28 @@ async def _run_react_edit(
     stream: StreamBus | None = None,
 ) -> dict[str, object]:
     selected_text, instruction, tools = _prepare_react_edit_request(request, language)
+    from deeptutor.commercial.concurrency import commercial_turn_lease
+
+    async with commercial_turn_lease():
+        return await _run_react_edit_reserved(
+            request,
+            language=language,
+            stream=stream,
+            selected_text=selected_text,
+            instruction=instruction,
+            tools=tools,
+        )
+
+
+async def _run_react_edit_reserved(
+    request: ReactEditRequest,
+    *,
+    language: str,
+    stream: StreamBus | None,
+    selected_text: str,
+    instruction: str,
+    tools: list[str],
+) -> dict[str, object]:
     operation_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
 
     agent = get_edit_agent()
@@ -374,28 +407,37 @@ async def _stream_react_edit(request: ReactEditRequest) -> AsyncGenerator[str, N
     finally:
         if not task.done():
             task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
 
 @router.post("/edit", response_model=EditResponse)
 async def edit_text(request: EditRequest):
     try:
-        # Get agent with refreshed LLM configuration from Settings
-        agent = get_edit_agent()
+        from deeptutor.commercial.concurrency import commercial_turn_lease
 
-        result = await agent.process(
-            text=request.text,
-            instruction=request.instruction,
-            action=request.action,
-            source=request.source,
-            kb_name=request.kb_name,
-        )
+        async with commercial_turn_lease():
+            # Get agent with refreshed LLM configuration from Settings
+            agent = get_edit_agent()
 
-        # Print token stats
-        print_stats()
+            result = await agent.process(
+                text=request.text,
+                instruction=request.instruction,
+                action=request.action,
+                source=request.source,
+                kb_name=request.kb_name,
+            )
 
-        return result
+            # Print token stats
+            print_stats()
+
+            return result
 
     except Exception as e:
+        if isinstance(e, (CommercialAccessDenied, CommercialResourceLimitDenied)):
+            _raise_storage_denial(e)
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -407,6 +449,8 @@ async def edit_text_react(request: ReactEditRequest):
     except HTTPException:
         raise
     except Exception as e:
+        if isinstance(e, (CommercialAccessDenied, CommercialResourceLimitDenied)):
+            _raise_storage_denial(e)
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -428,16 +472,21 @@ async def edit_text_react_stream(request: ReactEditRequest):
 async def auto_mark_text(request: AutoMarkRequest):
     """AI auto-mark text"""
     try:
-        # Get agent with refreshed LLM configuration from Settings
-        agent = get_edit_agent()
+        from deeptutor.commercial.concurrency import commercial_turn_lease
 
-        result = await agent.auto_mark(text=request.text)
+        async with commercial_turn_lease():
+            # Get agent with refreshed LLM configuration from Settings
+            agent = get_edit_agent()
 
-        # Print token stats
-        print_stats()
+            result = await agent.auto_mark(text=request.text)
 
-        return result
+            # Print token stats
+            print_stats()
+
+            return result
     except Exception as e:
+        if isinstance(e, (CommercialAccessDenied, CommercialResourceLimitDenied)):
+            _raise_storage_denial(e)
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -563,6 +612,8 @@ async def create_document(request: CreateDocumentRequest) -> DocumentResponse:
         document = storage.create_document(title=request.title, content=request.content)
         return DocumentResponse.from_model(document)
     except Exception as e:
+        if isinstance(e, (CommercialAccessDenied, CommercialResourceLimitDenied)):
+            _raise_storage_denial(e)
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -579,6 +630,8 @@ async def get_document(doc_id: str) -> DocumentResponse:
     except HTTPException:
         raise
     except Exception as e:
+        if isinstance(e, (CommercialAccessDenied, CommercialResourceLimitDenied)):
+            _raise_storage_denial(e)
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -597,6 +650,8 @@ async def update_document(doc_id: str, request: UpdateDocumentRequest) -> Docume
     except HTTPException:
         raise
     except Exception as e:
+        if isinstance(e, (CommercialAccessDenied, CommercialResourceLimitDenied)):
+            _raise_storage_denial(e)
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 

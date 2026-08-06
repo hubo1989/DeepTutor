@@ -89,6 +89,45 @@ def _guard_legacy_multi_user_migration(monkeypatch):
     yield
 
 
+@pytest.fixture
+def auth_isolated_root(tmp_path: Path, monkeypatch) -> Path:
+    """Redirect account/auth persistence for cross-package lifecycle tests."""
+    from deeptutor.multi_user import grants, identity, paths
+    from deeptutor.services.cron import service as cron_service
+
+    project_root = tmp_path
+    admin_root = (project_root / "data").resolve()
+    users_root = admin_root / "users"
+    system_root = admin_root / "system"
+    monkeypatch.setattr(paths, "PROJECT_ROOT", project_root)
+    monkeypatch.setattr(paths, "USERS_ROOT", users_root)
+    monkeypatch.setattr(paths, "SYSTEM_ROOT", system_root)
+    monkeypatch.setattr(paths, "ADMIN_WORKSPACE_ROOT", admin_root)
+    monkeypatch.setattr(paths, "_path_services", {})
+    monkeypatch.setattr(identity, "PROJECT_ROOT", project_root)
+    monkeypatch.setattr(identity, "SYSTEM_ROOT", system_root)
+    monkeypatch.setattr(identity, "AUTH_DIR", system_root / "auth")
+    monkeypatch.setattr(identity, "USERS_FILE", system_root / "auth" / "users.json")
+    monkeypatch.setattr(identity, "SECRET_FILE", system_root / "auth" / "auth_secret")
+    monkeypatch.setattr(
+        identity,
+        "LEGACY_USERS_FILE",
+        project_root / "data" / "user" / "auth_users.json",
+    )
+    monkeypatch.setattr(
+        identity,
+        "LEGACY_SECRET_FILE",
+        project_root / "data" / "user" / "auth_secret",
+    )
+    monkeypatch.setattr(grants, "GRANTS_DIR", system_root / "grants")
+    # Account export/deletion now includes the process-wide Cron store.  Reset
+    # its singleton so lifecycle tests can never read or mutate a developer's
+    # real scheduled jobs after replacing the admin workspace above.
+    monkeypatch.setattr(cron_service, "_service", None)
+    admin_root.mkdir(parents=True, exist_ok=True)
+    return project_root
+
+
 # ---------------------------------------------------------------------------
 # StreamBus
 # ---------------------------------------------------------------------------

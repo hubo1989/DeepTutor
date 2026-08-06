@@ -22,6 +22,7 @@ from deeptutor.services.session.artifact_attachments import (
 from deeptutor.services.session.protocol import SessionStoreProtocol
 
 if TYPE_CHECKING:
+    from deeptutor.commercial.concurrency import CommercialTurnLease
     from deeptutor.services.model_selection.runtime import LLMSelectionScopeToken
 
 logger = logging.getLogger(__name__)
@@ -567,6 +568,7 @@ class _TurnExecution:
     events: list[dict[str, Any]] = field(default_factory=list)
     next_seq: int = 1
     events_flushed: bool = False
+    commercial_lease: CommercialTurnLease | None = None
 
 
 class TurnRuntimeManager:
@@ -576,6 +578,12 @@ class TurnRuntimeManager:
         from deeptutor.services.session import get_session_store
 
         self.store = store or get_session_store()
+        try:
+            from deeptutor.multi_user.context import get_current_user
+
+            self.owner_id = get_current_user().id
+        except Exception:
+            self.owner_id = ""
         self._lock = asyncio.Lock()
         self._executions: dict[str, _TurnExecution] = {}
         # Per-turn reply queues used by tools that pause the agentic
@@ -631,6 +639,53 @@ class TurnRuntimeManager:
             await self._fail_orphan_running_turn(turn)
 
     async def start_turn(self, payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Apply hosted-plan gates before any session, message, or file write."""
+        from deeptutor.commercial.concurrency import acquire_commercial_turn_lease
+        from deeptutor.commercial.entitlement_context import (
+            CommercialAccessDenied,
+            require_capability,
+        )
+
+        payload = self._validated_start_payload(payload)
+        capability = str(payload.get("capability") or "chat")
+        try:
+            access = require_capability(capability)
+            if access is not None:
+                raw_config = payload.get("config")
+                render_mode = (
+                    str(raw_config.get("render_mode") or "auto")
+                    if isinstance(raw_config, dict)
+                    else "auto"
+                )
+                if (
+                    capability in {"visualize", "math_animator"}
+                    and render_mode in {"manim_video", "manim_image"}
+                    and access.resolved.values.get("feature.manim") is not True
+                ):
+                    raise CommercialAccessDenied(
+                        "feature_not_in_plan",
+                        "Manim rendering is not included in the current plan.",
+                    )
+            lease = await acquire_commercial_turn_lease(capability=capability)
+        except CommercialAccessDenied as exc:
+            # The transport layer already treats RuntimeError as a rejected
+            # turn.  Preserve a stable machine-readable reason instead of
+            # leaking provider or billing internals into the response.
+            raise RuntimeError(exc.code) from exc
+
+        try:
+            return await self._start_turn_impl(
+                payload,
+                commercial_lease=lease,
+            )
+        except BaseException:
+            await lease.release()
+            raise
+
+    @staticmethod
+    def _validated_start_payload(payload: dict[str, Any]) -> dict[str, Any]:
+        """Validate public capability config before reserving shared capacity."""
+
         capability = str(payload.get("capability") or "chat")
         raw_config = dict(payload.get("config", {}) or {})
         runtime_only_keys = (
@@ -639,10 +694,8 @@ class TurnRuntimeManager:
             "_regenerated_from_message_id",
             "_superseded_turn_id",
             "followup_question_context",
-            # Per-turn subagent consult budget (composer stepper). Not part of
-            # any capability's public config schema, so it rides as a runtime
-            # key — stripped before validation, merged back into the turn config
-            # and read by the subagent capability from context.config_overrides.
+            # Per-turn subagent consult budget is a runtime key rather than a
+            # field in an individual capability's public config schema.
             "subagent_consult_budget",
         )
         runtime_only_config = {
@@ -654,11 +707,27 @@ class TurnRuntimeManager:
             validated_public_config = validate_capability_config(capability, raw_config)
         except ValueError as exc:
             raise RuntimeError(str(exc)) from exc
-        payload = {
+        return {
             **payload,
             "capability": capability,
             "config": {**validated_public_config, **runtime_only_config},
         }
+
+    async def _start_turn_impl(
+        self,
+        payload: dict[str, Any],
+        *,
+        commercial_lease: CommercialTurnLease,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        from deeptutor.multi_user.context import get_current_user
+        from deeptutor.services.account_lifecycle import is_account_deletion_fenced
+
+        current_user = get_current_user()
+        if not current_user.is_admin and is_account_deletion_fenced(current_user.id):
+            raise RuntimeError("account_deletion_in_progress")
+
+        capability = str(payload.get("capability") or "chat")
+        runtime_only_config = dict(payload.get("config", {}) or {})
         session = await self.store.ensure_session(payload.get("session_id"))
         preferences = session.get("preferences") or {}
         # Persona is a session-level preference (mirrors llm_selection): an
@@ -759,6 +828,7 @@ class TurnRuntimeManager:
             session_id=session["id"],
             capability=capability,
             payload=dict(payload),
+            commercial_lease=commercial_lease,
         )
         session_metadata: dict[str, Any] = {
             "session_id": session["id"],
@@ -912,6 +982,19 @@ class TurnRuntimeManager:
         except asyncio.CancelledError:
             pass
         return True
+
+    async def cancel_all_turns(self) -> int:
+        """Cancel and await every live turn owned by this runtime manager."""
+        async with self._lock:
+            turn_ids = [
+                turn_id
+                for turn_id, execution in self._executions.items()
+                if execution.task is None or not execution.task.done()
+            ]
+        if not turn_ids:
+            return 0
+        results = await asyncio.gather(*(self.cancel_turn(turn_id) for turn_id in turn_ids))
+        return sum(bool(result) for result in results)
 
     async def submit_user_reply(
         self,
@@ -1208,6 +1291,8 @@ class TurnRuntimeManager:
             import base64 as _b64
             import uuid as _uuid
 
+            from deeptutor.commercial.entitlement_context import CommercialAccessDenied
+            from deeptutor.commercial.storage_limits import CommercialResourceLimitDenied
             from deeptutor.services.storage import get_attachment_store
 
             for item in payload.get("attachments", []):
@@ -1250,6 +1335,8 @@ class TurnRuntimeManager:
                         data=raw_bytes,
                         mime_type=record.get("mime_type", "") or "",
                     )
+                except (CommercialAccessDenied, CommercialResourceLimitDenied):
+                    raise
                 except Exception as exc:
                     logger.warning(
                         "attachment store rejected %r: %s",
@@ -1806,6 +1893,9 @@ class TurnRuntimeManager:
             # that finds the queue gone will return ``False`` rather than
             # accumulating on a dead turn.
             self._reply_queues.pop(turn_id, None)
+            if execution.commercial_lease is not None:
+                await execution.commercial_lease.release()
+                execution.commercial_lease = None
             async with self._lock:
                 current = self._executions.get(turn_id)
                 if current is not None:
@@ -1923,6 +2013,7 @@ class TurnRuntimeManager:
                     system_prompt=sys_prompt,
                     temperature=0.3,
                     max_tokens=80,
+                    _commercial_request_id=f"turn:{execution.turn_id}:session-title",
                 ):
                     buf.append(c)
                 return "".join(buf)
@@ -2066,4 +2157,20 @@ def get_turn_runtime_manager() -> TurnRuntimeManager:
         return _runtime_instances[key]
 
 
-__all__ = ["TurnRuntimeManager", "get_turn_runtime_manager"]
+async def cancel_turns_for_user(user_id: str) -> int:
+    """Quiesce local in-flight turns before deleting an owner's workspace."""
+    with _runtime_lock:
+        managers = tuple(
+            {
+                id(manager): manager
+                for manager in _runtime_instances.values()
+                if manager.owner_id == user_id
+            }.values()
+        )
+    if not managers:
+        return 0
+    cancelled = await asyncio.gather(*(manager.cancel_all_turns() for manager in managers))
+    return sum(cancelled)
+
+
+__all__ = ["TurnRuntimeManager", "cancel_turns_for_user", "get_turn_runtime_manager"]

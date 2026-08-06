@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from contextvars import ContextVar
+import json
 import logging
 import math
 from typing import Any, Dict, List, Optional
@@ -35,6 +36,29 @@ def _estimate_content_tokens(contents: List[Dict[str, Any]]) -> int:
     # Image/video-only embedding requests still consume provider work but may
     # expose no token count. Count each such item minimally for quota purposes.
     return max(estimated, sum(1 for item in contents if not item.get("text")))
+
+
+def _commercial_text_token_bound(texts: List[str]) -> int:
+    """UTF-8 bytes are a provider-neutral upper bound for tokenizer pieces."""
+
+    return max(
+        _estimate_text_tokens(texts), sum(len((text or "").encode("utf-8")) for text in texts)
+    )
+
+
+def _commercial_content_token_bound(contents: List[Dict[str, Any]]) -> int:
+    try:
+        serialized = json.dumps(contents, ensure_ascii=False, default=str, separators=(",", ":"))
+    except (TypeError, ValueError):
+        serialized = str(contents)
+    return max(_estimate_content_tokens(contents), len(serialized.encode("utf-8")))
+
+
+def _batch_request_id(request_id: str | None, batch_index: int) -> str | None:
+    """Derive a stable reservation id for one batch of a retried operation."""
+
+    normalized = str(request_id or "").strip()
+    return f"{normalized}/batch-{batch_index + 1}" if normalized else None
 
 
 def _usage_tokens(usage: Any) -> int:
@@ -136,7 +160,116 @@ class EmbeddingClient:
         if lease is not None:
             lease.finalize(_usage_tokens(usage) or estimated_tokens)
 
-    async def embed(self, texts: List[str], progress_callback=None) -> List[List[float]]:
+    async def _reserve_commercial(
+        self,
+        quantity: int,
+        *,
+        request_id: str | None = None,
+    ):
+        from deeptutor.commercial.metering import (
+            CommercialUsageLimitExceeded,
+            CommercialUsageUnavailable,
+            reserve_commercial_usage,
+        )
+
+        from .adapters import EmbeddingProviderError
+
+        try:
+            return await reserve_commercial_usage(
+                meter="embedding_tokens",
+                quantity=quantity,
+                source=self.config.source,
+                provider=self.config.provider_name or self.config.binding,
+                model=self.config.model,
+                request_id=request_id,
+            )
+        except CommercialUsageLimitExceeded as exc:
+            raise EmbeddingProviderError(
+                str(exc),
+                status=429,
+                model=self.config.model,
+                provider="deeptutor",
+            ) from exc
+        except CommercialUsageUnavailable as exc:
+            raise EmbeddingProviderError(
+                str(exc),
+                status=503,
+                model=self.config.model,
+                provider="deeptutor",
+            ) from exc
+
+    @staticmethod
+    async def _release_leases(lease: Any, commercial_lease: Any) -> None:
+        """Release both ledgers even when the legacy SQLite release fails."""
+
+        try:
+            if lease is not None:
+                lease.release()
+        finally:
+            if commercial_lease is not None:
+                await commercial_lease.release()
+
+    async def _finalize_leases(
+        self,
+        lease: Any,
+        commercial_lease: Any,
+        usage: Any,
+        *,
+        estimated_tokens: int,
+        commercial_quantity: int,
+    ) -> None:
+        """Settle PostgreSQL even when the legacy SQLite finalizer fails."""
+
+        try:
+            self._finalize_quota(lease, usage, estimated_tokens)
+        finally:
+            await self._finalize_commercial(
+                commercial_lease,
+                usage,
+                commercial_quantity,
+            )
+
+    async def _finalize_commercial(
+        self,
+        lease: Any,
+        usage: Any,
+        fallback_quantity: int,
+    ) -> None:
+        if lease is None:
+            return
+        from deeptutor.commercial.metering import (
+            CommercialUsageUnavailable,
+            measurement_from_usage,
+        )
+
+        from .adapters import EmbeddingProviderError
+
+        measurement = measurement_from_usage(
+            usage,
+            fallback_quantity=fallback_quantity,
+            meter="embedding_tokens",
+        )
+        try:
+            await lease.finalize(
+                measurement.quantity,
+                usage_units=measurement.units,
+                is_estimated=measurement.is_estimated,
+            )
+        except CommercialUsageUnavailable as exc:
+            raise EmbeddingProviderError(
+                str(exc),
+                status=503,
+                model=self.config.model,
+                provider="deeptutor",
+            ) from exc
+
+    async def embed(
+        self,
+        texts: List[str],
+        progress_callback=None,
+        *,
+        request_id: str | None = None,
+    ) -> List[List[float]]:
         if not texts:
             return []
 
@@ -168,11 +301,22 @@ class EmbeddingClient:
             )
             estimated_tokens = _estimate_text_tokens(batch)
             lease = self._reserve_quota(estimated_tokens)
+            commercial_quantity = _commercial_text_token_bound(batch)
             try:
-                response = await self.adapter.embed(request)
-            except Exception as exc:
+                commercial_lease = await self._reserve_commercial(
+                    commercial_quantity,
+                    request_id=_batch_request_id(request_id, i),
+                )
+            except BaseException:
                 if lease is not None:
                     lease.release()
+                raise
+            try:
+                response = await self.adapter.embed(request)
+            except BaseException as exc:
+                await self._release_leases(lease, commercial_lease)
+                if not isinstance(exc, Exception):
+                    raise
                 # Capture batch context so the task log stream / KB diagnostics
                 # show actionable info instead of a bare exception string.
                 import traceback
@@ -199,10 +343,15 @@ class EmbeddingClient:
                     start_index=start,
                 )
             except Exception:
-                if lease is not None:
-                    lease.release()
+                await self._release_leases(lease, commercial_lease)
                 raise
-            self._finalize_quota(lease, getattr(response, "usage", None), estimated_tokens)
+            await self._finalize_leases(
+                lease,
+                commercial_lease,
+                getattr(response, "usage", None),
+                estimated_tokens=estimated_tokens,
+                commercial_quantity=commercial_quantity,
+            )
             batch_dim = len(validated[0]) if validated else 0
             if expected_dim is None:
                 expected_dim = batch_dim
@@ -251,6 +400,7 @@ class EmbeddingClient:
         contents: List[Dict[str, Any]],
         *,
         progress_callback=None,
+        request_id: str | None = None,
     ) -> List[List[float]]:
         """Embed provider-agnostic multimodal content items.
 
@@ -283,6 +433,16 @@ class EmbeddingClient:
             )
             estimated_tokens = _estimate_content_tokens(batch)
             lease = self._reserve_quota(estimated_tokens)
+            commercial_quantity = _commercial_content_token_bound(batch)
+            try:
+                commercial_lease = await self._reserve_commercial(
+                    commercial_quantity,
+                    request_id=_batch_request_id(request_id, i),
+                )
+            except BaseException:
+                if lease is not None:
+                    lease.release()
+                raise
             try:
                 response = await self.adapter.embed(request)
                 validated = validate_embedding_batch(
@@ -294,11 +454,16 @@ class EmbeddingClient:
                     total_batches=total_batches,
                     start_index=start,
                 )
-            except Exception:
-                if lease is not None:
-                    lease.release()
+            except BaseException:
+                await self._release_leases(lease, commercial_lease)
                 raise
-            self._finalize_quota(lease, getattr(response, "usage", None), estimated_tokens)
+            await self._finalize_leases(
+                lease,
+                commercial_lease,
+                getattr(response, "usage", None),
+                estimated_tokens=estimated_tokens,
+                commercial_quantity=commercial_quantity,
+            )
             all_embeddings.extend(validated)
 
             if progress_callback:
@@ -312,18 +477,23 @@ class EmbeddingClient:
 
         return all_embeddings
 
-    def embed_sync(self, texts: List[str]) -> List[List[float]]:
+    def embed_sync(
+        self,
+        texts: List[str],
+        *,
+        request_id: str | None = None,
+    ) -> List[List[float]]:
         import asyncio
 
         try:
             asyncio.get_running_loop()
         except RuntimeError:
-            return asyncio.run(self.embed(texts))
+            return asyncio.run(self.embed(texts, request_id=request_id))
 
         import concurrent.futures
 
         with concurrent.futures.ThreadPoolExecutor() as executor:
-            future = executor.submit(asyncio.run, self.embed(texts))
+            future = executor.submit(asyncio.run, self.embed(texts, request_id=request_id))
             return future.result()
 
     def get_embedding_func(self):

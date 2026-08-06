@@ -281,6 +281,7 @@ async def test_inline_think_streams_to_trace_not_bubble(
     result = _result(events)
     assert result.metadata["response"] == "The answer."
     assert result.metadata["completed"] is True
+    assert str(client.calls[0]["_commercial_request_id"]).startswith("chat:s1:chat-")
 
 
 @pytest.mark.asyncio
@@ -352,6 +353,8 @@ async def test_empty_finish_gets_one_nudge_then_recovers(
     events = await _run(pipeline, UnifiedContext(session_id="s1", user_message="Make a PDF"))
 
     assert client.call_count == 2
+    request_ids = [str(call["_commercial_request_id"]) for call in client.calls]
+    assert len(set(request_ids)) == 2
     # The nudge round keeps the raw think text in-conversation and appends
     # the nudge instruction as the trailing user message.
     second_round = client.calls[1]["messages"]

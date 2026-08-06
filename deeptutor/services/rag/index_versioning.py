@@ -261,13 +261,17 @@ def storage_dir_for_signature(kb_dir: Path, sig_hash: str) -> Path:
 
 
 def write_version_meta(
-    kb_dir: Path, signature: EmbeddingSignature, storage_dir: Path | None = None
+    kb_dir: Path,
+    signature: EmbeddingSignature,
+    storage_dir: Path | None = None,
+    *,
+    version_name: str | None = None,
 ) -> None:
     """Persist metadata next to the LlamaIndex store."""
     target = storage_dir or resolve_storage_dir_for_write(kb_dir, signature)
     target.mkdir(parents=True, exist_ok=True)
     payload: dict[str, Any] = {
-        "version": target.name,
+        "version": version_name or target.name,
         "signature": signature.hash(),
         **asdict(signature),
         "layout": "flat" if target.parent == kb_dir else "nested_legacy",

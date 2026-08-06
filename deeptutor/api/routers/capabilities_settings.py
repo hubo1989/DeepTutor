@@ -19,20 +19,27 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
+
+from deeptutor.api.routers.auth import require_admin
 
 router = APIRouter()
 
 
 @router.get("/settings")
-async def get_capabilities_settings_endpoint() -> dict[str, Any]:
+async def get_capabilities_settings_endpoint(
+    _: object = Depends(require_admin),
+) -> dict[str, Any]:
     from deeptutor.services.config.capabilities_settings import capabilities_settings_dict
 
     return capabilities_settings_dict()
 
 
 @router.put("/settings")
-async def put_capabilities_settings(payload: dict[str, Any]) -> dict[str, Any]:
+async def put_capabilities_settings(
+    payload: dict[str, Any],
+    _: object = Depends(require_admin),
+) -> dict[str, Any]:
     from deeptutor.services.config.capabilities_settings import save_capabilities_settings
 
     return save_capabilities_settings(payload)

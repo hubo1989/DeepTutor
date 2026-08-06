@@ -13,8 +13,9 @@ Quick setup (single user via data/user/settings/auth.json):
 
 Multi-user setup (recommended):
     Enable auth and leave username/password_hash empty.
-    Navigate to /register in the browser. The first user to register is granted
-    admin privileges and can manage other users from /admin/users.
+    Set DEEPTUTOR_BOOTSTRAP_ADMIN_EMAIL before opening registration. That
+    verified address becomes admin when no administrator exists yet; every
+    other public registration is a regular user.
 
     Users are stored in data/user/auth_users.json:
         {
@@ -26,6 +27,8 @@ Multi-user setup (recommended):
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import logging
+import os
+import re
 from typing import Any
 
 from deeptutor.services.config import load_auth_settings, load_integrations_settings
@@ -52,6 +55,7 @@ POCKETBASE_BASE_URL: str = str(_INTEGRATIONS_SETTINGS["pocketbase_url"]).rstrip(
 POCKETBASE_ENABLED: bool = bool(POCKETBASE_BASE_URL) and AUTH_ENABLED
 
 _ALGORITHM = "HS256"
+PASSWORD_MAX_BYTES = 72
 
 
 if AUTH_ENABLED and not POCKETBASE_ENABLED and not AUTH_SECRET:
@@ -79,11 +83,28 @@ class TokenPayload:
 # ---------------------------------------------------------------------------
 
 
+def validate_password_bytes(plain: str) -> str:
+    """Reject passwords bcrypt cannot represent without truncation.
+
+    bcrypt's input boundary is measured in bytes, not Python characters.  A
+    local guard keeps behaviour identical across bcrypt versions (older
+    releases silently truncated while newer releases raise ``ValueError``).
+    """
+    try:
+        encoded = plain.encode("utf-8")
+    except (AttributeError, UnicodeEncodeError) as exc:
+        raise ValueError("Password must be valid UTF-8 text") from exc
+    if len(encoded) > PASSWORD_MAX_BYTES:
+        raise ValueError(f"Password must be at most {PASSWORD_MAX_BYTES} UTF-8 bytes")
+    return plain
+
+
 def hash_password(plain: str) -> str:
     """Hash a plaintext password. Use this to generate password hashes."""
     import bcrypt
 
-    return bcrypt.hashpw(plain.encode(), bcrypt.gensalt()).decode()
+    validated = validate_password_bytes(plain)
+    return bcrypt.hashpw(validated.encode("utf-8"), bcrypt.gensalt()).decode()
 
 
 def verify_password(plain: str, hashed: str) -> bool:
@@ -91,8 +112,9 @@ def verify_password(plain: str, hashed: str) -> bool:
     import bcrypt
 
     try:
-        return bcrypt.checkpw(plain.encode(), hashed.encode())
-    except Exception:
+        validated = validate_password_bytes(plain)
+        return bcrypt.checkpw(validated.encode("utf-8"), hashed.encode("utf-8"))
+    except (TypeError, ValueError, UnicodeEncodeError):
         return False
 
 
@@ -133,22 +155,55 @@ def _load_users() -> dict[str, dict]:
 
 
 def is_first_user() -> bool:
-    """Return True when no users exist yet (first registration will become admin)."""
+    """Return True when no local users exist yet."""
     return len(_load_users()) == 0
+
+
+def bootstrap_admin_email() -> str:
+    """Return the deployment-controlled bootstrap administrator address.
+
+    The runtime-settings service will eventually expose the same key. Reading
+    the process override here keeps bootstrap authority out of public request
+    payloads and makes current deployments explicit and fail-closed.
+    """
+    configured = os.getenv("DEEPTUTOR_BOOTSTRAP_ADMIN_EMAIL", "")
+    candidate = configured.strip().casefold()
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", candidate):
+        return ""
+    return candidate
+
+
+def _ensure_configured_admin_persisted() -> None:
+    """Materialize the legacy auth.json admin before adding local users.
+
+    Once ``users.json`` becomes non-empty it is authoritative, so failing to
+    copy the configured single-user admin first would silently lock that
+    existing operator out when the first public/admin-created user is saved.
+    """
+    if not AUTH_USERNAME or not AUTH_PASSWORD_HASH:
+        return
+    from deeptutor.multi_user.identity import create_user_if_absent
+
+    create_user_if_absent(
+        AUTH_USERNAME,
+        AUTH_PASSWORD_HASH,
+        role="admin",
+        email_verified=True,
+    )
 
 
 def add_user(username: str, plain_password: str, role: str = "user") -> None:
     """
     Add or update a user in data/user/auth_users.json.
 
-    The role defaults to 'user'. Pass role='admin' to elevate. When the store
-    is empty the first user is automatically promoted to 'admin' regardless of
-    the role argument.
+    The role defaults to 'user'. Pass role='admin' only from an authenticated,
+    trusted administration path.
 
     Creates the file (and parent directories) if they don't exist.
     """
     from deeptutor.multi_user.identity import save_user
 
+    _ensure_configured_admin_persisted()
     record = save_user(username, hash_password(plain_password), role=role)  # type: ignore[arg-type]
     _initialize_user_grant(record)
     logger.info("User '%s' saved with role=%r", username, record.get("role", "user"))
@@ -163,11 +218,13 @@ def add_verified_user(
     """Create a verified account without exposing plaintext to the store layer."""
     from deeptutor.multi_user.identity import create_user_if_absent
 
+    _ensure_configured_admin_persisted()
     created, record = create_user_if_absent(
         username,
         hashed_password,
         role=role,  # type: ignore[arg-type]
         email_verified=True,
+        bootstrap_admin_username=bootstrap_admin_email(),
     )
     if created:
         _initialize_user_grant(record)
@@ -214,6 +271,20 @@ def delete_user(username: str) -> bool:
         return False
     logger.info("User '%s' deleted", username)
     return True
+
+
+def reset_password(username: str, plain_password: str) -> bool:
+    """Set a new local password and revoke tokens issued before the reset."""
+    from deeptutor.multi_user.identity import update_password
+
+    canonical = username.strip().casefold() if "@" in username else username.strip()
+    if not canonical:
+        return False
+    _ensure_configured_admin_persisted()
+    updated = update_password(canonical, hash_password(plain_password))
+    if updated:
+        logger.info("Password reset completed for account %s", canonical)
+    return updated
 
 
 def set_role(username: str, role: str) -> bool:
@@ -265,14 +336,15 @@ def create_token(username: str, role: str = "user", user_id: str | None = None) 
     """Create a signed JWT for the given username and role."""
     from jose import jwt
 
+    record = _load_users().get(username) or {}
     if not user_id:
-        record = _load_users().get(username) or {}
         user_id = str(record.get("id") or "")
 
     payload = {
         "sub": username,
         "role": role,
         "uid": user_id,
+        "ver": max(0, int(record.get("auth_version") or 0)),
         "exp": datetime.now(timezone.utc) + timedelta(hours=TOKEN_EXPIRE_HOURS),
         "iat": datetime.now(timezone.utc),
     }
@@ -322,6 +394,13 @@ def decode_token(token: str) -> TokenPayload | None:
         # A disabled account or an account whose verification state was
         # revoked must lose access even if an older JWT has not expired.
         if bool(record.get("disabled", False)) or not bool(record.get("email_verified", True)):
+            return None
+        try:
+            token_version = int(payload.get("ver") or 0)
+            current_version = int(record.get("auth_version") or 0)
+        except (TypeError, ValueError):
+            return None
+        if token_version != current_version:
             return None
         role = str(record.get("role") or payload.get("role", "user"))
         user_id = str(record.get("id") or payload.get("uid") or "")

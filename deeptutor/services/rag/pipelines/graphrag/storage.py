@@ -62,7 +62,7 @@ def has_output(root_dir: Path | None) -> bool:
     return any((out / f"{name}.parquet").exists() for name in OUTPUT_TABLES)
 
 
-def write_meta(root_dir: Path) -> None:
+def write_meta(root_dir: Path, *, version_name: str | None = None) -> None:
     """Write a flat-layout ``meta.json`` so the version is listed as ready.
 
     Mirrors ``index_versioning.write_version_meta`` but carries a synthetic
@@ -75,7 +75,7 @@ def write_meta(root_dir: Path) -> None:
 
     target = Path(root_dir)
     payload = {
-        "version": target.name,
+        "version": version_name or target.name,
         "signature": PROVIDER,
         "provider": PROVIDER,
         "layout": "flat",

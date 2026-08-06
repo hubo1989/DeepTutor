@@ -349,7 +349,10 @@ def test_initialize_orchestrates_index(tmp_path, monkeypatch) -> None:
 
     assert ok is True
     assert calls == [{"root": calls[0]["root"], "is_update": False}]
-    root = Path(calls[0]["root"])
+    staging = Path(calls[0]["root"])
+    assert staging.name.startswith(".version-1.staging-")
+    assert not staging.exists()
+    root = tmp_path / "kb" / "version-1"
     assert (root / gr_config.SETTINGS_FILENAME).exists()
     assert list(storage.input_dir(root).glob("*.txt"))
     assert (root / storage.META_FILENAME).exists()

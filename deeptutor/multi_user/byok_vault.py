@@ -23,6 +23,8 @@ import threading
 from typing import Any
 from uuid import uuid4
 
+from deeptutor.services.private_state import exclusive_path_lock
+
 from . import paths
 
 _SCHEMA_VERSION = 1
@@ -302,9 +304,11 @@ class UserByokCredentialVault:
         self.root.mkdir(parents=True, exist_ok=True)
         _assert_safe_directory(self.root)
         _assert_safe_file(self.audit_path)
-        with self.audit_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(dict(event), ensure_ascii=False, sort_keys=True) + "\n")
-            handle.flush()
+        with exclusive_path_lock(self.audit_path):
+            _assert_safe_file(self.audit_path)
+            with self.audit_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(dict(event), ensure_ascii=False, sort_keys=True) + "\n")
+                handle.flush()
         _chmod(self.audit_path, stat.S_IRUSR | stat.S_IWUSR)
 
     def is_available(self) -> bool:

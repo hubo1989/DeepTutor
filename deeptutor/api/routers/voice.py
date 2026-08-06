@@ -2,8 +2,8 @@
 
 These are thin HTTP surfaces over :mod:`deeptutor.services.voice`. Config comes
 from the admin-managed model catalog (``services.tts`` / ``services.stt``), so
-voice is shared infrastructure like embedding/search — any authenticated user
-may call it; it is not gated by per-user LLM grants.
+ordinary users must have an explicit platform grant before a provider request
+can consume shared credentials.
 """
 
 from __future__ import annotations
@@ -15,6 +15,9 @@ import wave
 from fastapi import APIRouter, File, Form, HTTPException, Response, UploadFile, status
 from pydantic import BaseModel, Field
 
+from deeptutor.multi_user.byok_policy import grant_service_enabled
+from deeptutor.multi_user.context import get_current_user
+from deeptutor.multi_user.grants import load_grant
 from deeptutor.services.voice import (
     VoiceProviderError,
     synthesize_speech,
@@ -30,6 +33,18 @@ _MAX_AUDIO_BYTES = 25 * 1024 * 1024  # 25 MB, matching OpenAI's limit.
 _DEFAULT_PCM_SAMPLE_RATE = 24_000
 _DEFAULT_PCM_CHANNELS = 1
 _PCM16_SAMPLE_WIDTH = 2
+
+
+def _require_platform_voice_access(service: str) -> None:
+    """Fail closed before resolving an admin-managed voice credential."""
+    user = get_current_user()
+    if user.is_admin:
+        return
+    if not grant_service_enabled(load_grant(user.id), "platform", service):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Platform {service.upper()} access is not enabled for your account",
+        )
 
 
 class TTSRequest(BaseModel):
@@ -78,6 +93,7 @@ def _pcm16_to_wav(audio: bytes, *, sample_rate: int, channels: int) -> bytes:
 @router.post("/tts")
 async def text_to_speech(payload: TTSRequest) -> Response:
     """Synthesize ``text`` to audio using the active TTS provider."""
+    _require_platform_voice_access("tts")
     try:
         audio, content_type = await synthesize_speech(
             payload.text,
@@ -107,6 +123,7 @@ async def speech_to_text(
     language: str | None = Form(default=None),
 ) -> dict[str, str]:
     """Transcribe an uploaded audio clip using the active STT provider."""
+    _require_platform_voice_access("stt")
     audio = await file.read()
     if not audio:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Empty audio upload.")

@@ -107,6 +107,35 @@ class ConsultSubagentTool(BaseTool):
                 content=f"Unknown subagent backend: {spec.get('kind')!r}", success=False
             )
 
+        from deeptutor.multi_user.context import get_current_user
+        from deeptutor.services.subagent import PARTNER_BACKEND_KIND
+
+        current_user = get_current_user()
+        if getattr(backend, "local_cli", True):
+            if not current_user.is_admin:
+                return ToolResult(
+                    content="Admin access is required to run a host agent.",
+                    success=False,
+                )
+        elif backend.kind == PARTNER_BACKEND_KIND:
+            # Saved pointer metadata can outlive a grant. Authorize every
+            # consult so revocation takes effect without reconnecting the KB.
+            from deeptutor.multi_user.partner_access import assert_partner_allowed
+
+            try:
+                assert_partner_allowed(str(spec.get("partner_id") or ""))
+            except Exception as exc:
+                if getattr(exc, "status_code", None) == 403:
+                    return ToolResult(content=str(getattr(exc, "detail", exc)), success=False)
+                raise
+        elif not current_user.is_admin:
+            # Future platform integrations remain admin-only unless they gain
+            # an explicit user-level authorization model like Partners.
+            return ToolResult(
+                content="Admin access is required to run this platform agent.",
+                success=False,
+            )
+
         state["count"] = int(state.get("count", 0)) + 1
         consult_index = state["count"]
         event_sink = kwargs.get("event_sink")

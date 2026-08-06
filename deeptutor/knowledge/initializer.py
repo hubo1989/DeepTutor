@@ -12,15 +12,27 @@ from pathlib import Path
 import shutil
 from typing import Optional
 
+from deeptutor.commercial.storage_limits import (
+    atomic_write_text_with_storage_limits,
+    commit_staged_files_with_storage_limits,
+    create_staging_directory,
+    enforce_staging_scratch_limit,
+)
 from deeptutor.knowledge.naming import validate_knowledge_base_name
 from deeptutor.knowledge.progress_tracker import ProgressStage, ProgressTracker
 from deeptutor.services.config import resolve_llm_runtime_config
-from deeptutor.services.file_io import atomic_write_json
 from deeptutor.services.rag.factory import normalize_provider_name
 from deeptutor.services.rag.file_routing import FileTypeRouter
 from deeptutor.services.rag.service import RAGService
 
 logger = logging.getLogger(__name__)
+
+
+def _write_json(path: Path, payload: dict) -> None:
+    atomic_write_text_with_storage_limits(
+        path,
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+    )
 
 
 class KnowledgeBaseInitializer:
@@ -95,7 +107,7 @@ class KnowledgeBaseInitializer:
         )
         metadata["last_indexed_action"] = "create"
 
-        atomic_write_json(metadata_file, metadata)
+        _write_json(metadata_file, metadata)
 
         try:
             from deeptutor.services.config import get_kb_config_service
@@ -124,21 +136,44 @@ class KnowledgeBaseInitializer:
             "needs_reindex": False,
         }
 
-        atomic_write_json(self.kb_dir / "metadata.json", metadata)
+        _write_json(self.kb_dir / "metadata.json", metadata)
 
         self._register_to_config()
 
     def copy_documents(self, source_files: list[str]) -> list[str]:
         """Copy source documents into raw directory."""
         copied_files: list[str] = []
-        for source in source_files:
-            source_path = Path(source)
-            if not source_path.exists() or not source_path.is_file():
-                logger.warning(f"Source file not found: {source}")
-                continue
-            dest_path = self.raw_dir / source_path.name
-            shutil.copy2(source_path, dest_path)
-            copied_files.append(str(dest_path))
+        staging = create_staging_directory(self.raw_dir)
+        sizes: list[int] = []
+        try:
+            for source in source_files:
+                source_path = Path(source)
+                if not source_path.exists() or not source_path.is_file():
+                    logger.warning(f"Source file not found: {source}")
+                    continue
+                staged_path = staging / source_path.name
+                shutil.copy2(source_path, staged_path)
+                sizes.append(staged_path.stat().st_size)
+                copied_files.append(str(self.raw_dir / source_path.name))
+                enforce_staging_scratch_limit(
+                    staging,
+                    replacing_paths=(
+                        self.raw_dir / path.relative_to(staging)
+                        for path in staging.rglob("*")
+                        if path.is_file()
+                    ),
+                )
+            if sizes:
+                commit_staged_files_with_storage_limits(
+                    staging,
+                    self.raw_dir,
+                    upload_file_sizes=sizes,
+                )
+            else:
+                shutil.rmtree(staging, ignore_errors=True)
+        except Exception:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
         return copied_files
 
     async def process_documents(

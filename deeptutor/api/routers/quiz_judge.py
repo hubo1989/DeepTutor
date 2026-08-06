@@ -227,11 +227,19 @@ async def websocket_quiz_judge(websocket: WebSocket):
         {"type": "done"}
         {"type": "error", "content": "..."}
     """
-    from deeptutor.api.routers.auth import ws_auth_failed, ws_require_auth
+    from deeptutor.api.routers.auth import (
+        ws_auth_failed,
+        ws_authorize_message,
+        ws_require_auth,
+        ws_require_capability_access,
+    )
     from deeptutor.multi_user.context import reset_current_user
 
     user_token = await ws_require_auth(websocket)
     if user_token is ws_auth_failed:
+        return
+    if not await ws_require_capability_access(websocket):
+        reset_current_user(user_token)
         return
 
     await websocket.accept()
@@ -258,6 +266,10 @@ async def websocket_quiz_judge(websocket: WebSocket):
                 reset_current_user(user_token)
             except Exception:
                 pass
+        return
+
+    if not await ws_authorize_message(websocket):
+        reset_current_user(user_token)
         return
 
     question_text = (data.get("question") or "").strip()
@@ -366,40 +378,44 @@ async def websocket_quiz_judge(websocket: WebSocket):
                 pass
         return
 
-    await safe_send({"type": "started"})
-
-    # Build a multimodal user message when ≥1 image was attached. We pass
-    # the full ``messages`` array to ``factory.stream`` so it forwards the
-    # content-parts unchanged (the single-image ``image_data`` kwarg only
-    # supports one image).
-    stream_kwargs: dict[str, Any] = {}
-    if has_image:
-        from deeptutor.services.llm import config as _llm_config_mod
-        from deeptutor.services.llm.capabilities import supports_vision
-
-        llm_cfg = _llm_config_mod.get_llm_config()
-        binding = getattr(llm_cfg, "binding", "openai") or "openai"
-        model = getattr(llm_cfg, "model", "") or ""
-        if supports_vision(binding, model):
-            user_content = await _build_multimodal_user_content(
-                text=user_prompt,
-                image_records=image_records,
-            )
-            stream_kwargs["messages"] = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_content},
-            ]
-        else:
-            # Vision-incapable model — fall back to text-only judge so the
-            # learner still gets feedback on their typed answer.
-            logger.info(
-                "Judge: %s/%s does not support vision; dropping %d image(s)",
-                binding,
-                model,
-                len(image_records),
-            )
-
+    lease = None
     try:
+        from deeptutor.commercial.concurrency import acquire_commercial_turn_lease
+
+        lease = await acquire_commercial_turn_lease()
+        await safe_send({"type": "started"})
+
+        # Build a multimodal user message when ≥1 image was attached. We pass
+        # the full ``messages`` array to ``factory.stream`` so it forwards the
+        # content-parts unchanged (the single-image ``image_data`` kwarg only
+        # supports one image).
+        stream_kwargs: dict[str, Any] = {}
+        if has_image:
+            from deeptutor.services.llm import config as _llm_config_mod
+            from deeptutor.services.llm.capabilities import supports_vision
+
+            llm_cfg = _llm_config_mod.get_llm_config()
+            binding = getattr(llm_cfg, "binding", "openai") or "openai"
+            model = getattr(llm_cfg, "model", "") or ""
+            if supports_vision(binding, model):
+                user_content = await _build_multimodal_user_content(
+                    text=user_prompt,
+                    image_records=image_records,
+                )
+                stream_kwargs["messages"] = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_content},
+                ]
+            else:
+                # Vision-incapable model — fall back to text-only judge so the
+                # learner still gets feedback on their typed answer.
+                logger.info(
+                    "Judge: %s/%s does not support vision; dropping %d image(s)",
+                    binding,
+                    model,
+                    len(image_records),
+                )
+
         async for chunk in llm_stream(
             prompt=user_prompt,
             system_prompt=system_prompt,
@@ -416,6 +432,8 @@ async def websocket_quiz_judge(websocket: WebSocket):
         logger.exception("AI judge stream failed")
         await safe_send({"type": "error", "content": format_exception_message(exc)})
     finally:
+        if lease is not None:
+            await lease.release()
         try:
             await websocket.close()
         except Exception:

@@ -13,16 +13,21 @@ import threading
 from typing import Any
 from uuid import uuid4
 
+from deeptutor.services.private_state import (
+    chmod_private,
+    ensure_private_directory,
+    ensure_private_file,
+    exclusive_path_lock,
+)
+
 from .models import Role
 from .paths import PROJECT_ROOT, SYSTEM_ROOT, migrate_legacy_multi_user_tree
 
 logger = logging.getLogger(__name__)
 
-# Serialises writes to USERS_FILE so a concurrent burst of /register requests
-# cannot all see ``not users`` and each promote themselves to admin. Single-
-# process FastAPI deployments (the ``deeptutor start`` launcher) are fully covered;
-# multi-worker deployments still race and must rely on an external user store
-# (e.g. PocketBase), which is documented in the multi-user README.
+# Serialises read-modify-write operations on USERS_FILE. This also makes the
+# explicit no-existing-admin bootstrap check atomic for single-process FastAPI
+# deployments. Multi-worker deployments need the shared control-plane store.
 _USERS_WRITE_LOCK = threading.Lock()
 
 AUTH_DIR = SYSTEM_ROOT / "auth"
@@ -40,6 +45,13 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _auth_version(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _canonical_record(
     username: str,
     value: Any,
@@ -54,6 +66,7 @@ def _canonical_record(
             "created_at": utc_now(),
             "disabled": False,
             "avatar": "",
+            "auth_version": 0,
             # Existing records are trusted legacy accounts. New public
             # registrations are only written after email verification.
             "email_verified": True,
@@ -74,6 +87,7 @@ def _canonical_record(
         "disabled": bool(value.get("disabled", False)),
         "avatar": str(value.get("avatar") or ""),
         "email_verified": bool(value.get("email_verified", True)),
+        "auth_version": _auth_version(value.get("auth_version")),
     }
 
 
@@ -87,7 +101,7 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 
 def _write_users(users: dict[str, dict[str, Any]]) -> None:
-    USERS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    ensure_private_directory(USERS_FILE.parent)
     # A truncated users.json can lock every account out after a crash. Write
     # and fsync a sibling temp file, then atomically replace the live store.
     fd, temp_name = tempfile.mkstemp(
@@ -101,6 +115,7 @@ def _write_users(users: dict[str, dict[str, Any]]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp_path, USERS_FILE)
+        chmod_private(USERS_FILE)
     finally:
         temp_path.unlink(missing_ok=True)
 
@@ -130,12 +145,9 @@ def _migrate_secret() -> None:
     try:
         secret = LEGACY_SECRET_FILE.read_text(encoding="utf-8").strip()
         if secret:
-            SECRET_FILE.parent.mkdir(parents=True, exist_ok=True)
+            ensure_private_file(SECRET_FILE)
             SECRET_FILE.write_text(secret, encoding="utf-8")
-            try:
-                SECRET_FILE.chmod(0o600)
-            except OSError:
-                pass
+            chmod_private(SECRET_FILE)
             logger.info("Migrated auth secret from %s to %s", LEGACY_SECRET_FILE, SECRET_FILE)
     except Exception as exc:
         logger.warning("Failed to migrate legacy auth secret: %s", exc)
@@ -147,6 +159,8 @@ def load_users(  # nosec B107 - empty defaults mean "no env fallback supplied".
 ) -> dict[str, dict[str, Any]]:
     """Load canonical users, migrating legacy records and env fallback in memory."""
     migrate_legacy_multi_user_tree()
+    ensure_private_directory(AUTH_DIR)
+    chmod_private(USERS_FILE)
     users: dict[str, dict[str, Any]] | None = None
     if USERS_FILE.exists():
         users = _read_json(USERS_FILE)
@@ -183,6 +197,9 @@ def load_users(  # nosec B107 - empty defaults mean "no env fallback supplied".
                 "role": "admin",
                 "created_at": "",
                 "disabled": False,
+                "avatar": "",
+                "email_verified": True,
+                "auth_version": 0,
             }
         }
 
@@ -191,20 +208,19 @@ def load_users(  # nosec B107 - empty defaults mean "no env fallback supplied".
 
 def save_user(username: str, hashed_password: str, role: Role = "user") -> dict[str, Any]:
     USERS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    # Read-modify-write must be atomic so concurrent first-time registrations
-    # cannot each see an empty store and each promote themselves to admin.
+    # Read-modify-write must be atomic so concurrent account writes are not lost.
     with _USERS_WRITE_LOCK:
         users = load_users()
-        effective_role: Role = "admin" if not users else role
         existing = users.get(username) or {}
         record = {
             "id": str(existing.get("id") or new_user_id()),
             "hash": hashed_password,
-            "role": effective_role,
+            "role": role,
             "created_at": str(existing.get("created_at") or utc_now()),
             "disabled": bool(existing.get("disabled", False)),
             "avatar": str(existing.get("avatar") or ""),
             "email_verified": True,
+            "auth_version": _auth_version(existing.get("auth_version")),
         }
         users[username] = record
         _write_users(users)
@@ -240,14 +256,61 @@ def get_user_by_id(user_id: str) -> tuple[str, dict[str, Any]] | None:
     return None
 
 
-def delete_user(username: str) -> bool:
+def delete_user(username: str, *, expected_user_id: str | None = None) -> bool:
+    """Delete an account, optionally only if its incarnation still matches."""
     with _USERS_WRITE_LOCK:
         if not USERS_FILE.exists():
             return False
         users = load_users()
-        if username not in users:
+        record = users.get(username)
+        if record is None:
+            return False
+        if expected_user_id is not None and str(record.get("id") or "") != expected_user_id:
             return False
         users.pop(username, None)
+        _write_users(users)
+        return True
+
+
+def set_disabled(
+    username: str,
+    disabled: bool,
+    *,
+    expected_user_id: str | None = None,
+) -> bool:
+    """Atomically enable or disable an existing local account."""
+    if not USERS_FILE.exists():
+        return False
+    with _USERS_WRITE_LOCK:
+        users = load_users()
+        if username not in users:
+            return False
+        if (
+            expected_user_id is not None
+            and str(users[username].get("id") or "") != expected_user_id
+        ):
+            return False
+        users[username]["disabled"] = bool(disabled)
+        _write_users(users)
+        return True
+
+
+def update_password(username: str, hashed_password: str) -> bool:
+    """Replace a password hash and revoke every previously issued JWT.
+
+    ``auth_version`` is embedded in new tokens and compared during decode.
+    Legacy accounts and tokens both normalize to version zero, preserving
+    existing sessions until the first password reset.
+    """
+    if not hashed_password or not USERS_FILE.exists():
+        return False
+    with _USERS_WRITE_LOCK:
+        users = load_users()
+        record = users.get(username)
+        if record is None:
+            return False
+        record["hash"] = hashed_password
+        record["auth_version"] = _auth_version(record.get("auth_version")) + 1
         _write_users(users)
         return True
 
@@ -293,11 +356,13 @@ def save_avatar_file(user_id: str, data: bytes, ext: str) -> Path:
     if ext not in AVATAR_EXTENSIONS:
         raise ValueError(f"Unsupported avatar extension: {ext!r}")
     directory = _avatar_dir()
-    directory.mkdir(parents=True, exist_ok=True)
+    ensure_private_directory(directory)
     target = directory / f"{user_id}.{ext}"
     tmp = directory / f"{user_id}.{ext}.tmp"
     tmp.write_bytes(data)
+    chmod_private(tmp)
     tmp.replace(target)
+    chmod_private(target)
     # A re-upload may change the extension; drop stale siblings.
     for other in AVATAR_EXTENSIONS:
         if other != ext:
@@ -330,18 +395,24 @@ def create_user_if_absent(
     *,
     role: Role = "user",
     email_verified: bool = True,
+    bootstrap_admin_username: str = "",
 ) -> tuple[bool, dict[str, Any]]:
     """Create a user exactly once and return ``(created, record)``.
 
-    The first successful account is promoted to admin under the same lock as
-    the uniqueness check. This is the commit point used by email verification.
+    The requested role is honored exactly. Deciding whether a verified email
+    is the explicitly configured bootstrap administrator belongs to the auth
+    service, not to the persistence layer.
     """
     with _USERS_WRITE_LOCK:
         users = load_users()
         existing = users.get(username)
         if existing is not None:
             return False, existing
-        effective_role: Role = "admin" if not users else role
+        bootstrap = str(bootstrap_admin_username or "").strip().casefold()
+        effective_role: Role = role
+        has_admin = any(str(item.get("role") or "user") == "admin" for item in users.values())
+        if not has_admin and bootstrap and username.strip().casefold() == bootstrap:
+            effective_role = "admin"
         record = {
             "id": new_user_id(),
             "hash": hashed_password,
@@ -350,6 +421,7 @@ def create_user_if_absent(
             "disabled": False,
             "avatar": "",
             "email_verified": bool(email_verified),
+            "auth_version": 0,
         }
         users[username] = record
         _write_users(users)
@@ -358,24 +430,30 @@ def create_user_if_absent(
 
 def load_or_create_auth_secret() -> str:
     migrate_legacy_multi_user_tree()
-    _migrate_secret()
     try:
-        if SECRET_FILE.exists():
-            existing = SECRET_FILE.read_text(encoding="utf-8").strip()
-            if existing:
-                return existing
-        SECRET_FILE.parent.mkdir(parents=True, exist_ok=True)
-        generated = secrets.token_hex(32)
-        SECRET_FILE.write_text(generated, encoding="utf-8")
-        try:
-            SECRET_FILE.chmod(0o600)
-        except OSError:
-            pass
-        logger.warning(
-            "Auth is enabled and no auth_secret file exists. Generated a stable local secret at %s.",
-            SECRET_FILE,
-        )
-        return generated
+        with exclusive_path_lock(SECRET_FILE):
+            _migrate_secret()
+            if SECRET_FILE.exists():
+                chmod_private(SECRET_FILE)
+                existing = SECRET_FILE.read_text(encoding="utf-8").strip()
+                if existing:
+                    return existing
+            ensure_private_file(SECRET_FILE)
+            generated = secrets.token_hex(32)
+            SECRET_FILE.write_text(generated, encoding="utf-8")
+            chmod_private(SECRET_FILE)
+            logger.warning(
+                "Auth is enabled and no auth_secret file exists. "
+                "Generated a stable local secret at %s.",
+                SECRET_FILE,
+            )
+            return generated
     except Exception as exc:
         logger.warning("Failed to load/create auth secret at %s: %s", SECRET_FILE, exc)
+        from deeptutor.commercial.runtime import commercial_mode_requested
+
+        if commercial_mode_requested():
+            raise RuntimeError(
+                "Commercial mode cannot persist a stable authentication secret"
+            ) from exc
         return secrets.token_hex(32)

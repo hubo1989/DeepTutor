@@ -70,10 +70,7 @@ def byok_client(mu_isolated_root, make_user, seed_user, monkeypatch):
     from deeptutor.multi_user.grants import load_grant, save_grant
     from deeptutor.services.auth import TokenPayload
 
-    # The first stored account is intentionally promoted to administrator by
-    # the identity layer. Seed it separately so Alice and Bob exercise normal
-    # user grants.
-    seed_user("admin@example.com")
+    # Public/local role=user accounts stay regular users even in an empty store.
     alice = seed_user("alice@example.com")
     bob = seed_user("bob@example.com")
     users = {

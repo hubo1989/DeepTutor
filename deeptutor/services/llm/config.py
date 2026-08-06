@@ -208,6 +208,16 @@ def get_llm_config() -> LLMConfig:
     if scoped is not None:
         return scoped
 
+    # The process cache contains the deployment/admin active model and its
+    # credential. It is never a safe source for an ordinary user: resolve the
+    # caller's currently granted platform model or owner-bound BYOK profile on
+    # every request instead. This also makes grant changes effective without a
+    # process-wide cache flush.
+    from deeptutor.multi_user.context import get_current_user
+
+    if not get_current_user().is_admin:
+        return _get_llm_config_from_resolver()
+
     if _LLM_CONFIG_CACHE is not None:
         return _LLM_CONFIG_CACHE
 

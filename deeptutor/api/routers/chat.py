@@ -58,11 +58,19 @@ async def delete_session(session_id: str):
 
 @router.websocket("/chat")
 async def websocket_chat(websocket: WebSocket):
-    from deeptutor.api.routers.auth import ws_auth_failed, ws_require_auth
+    from deeptutor.api.routers.auth import (
+        ws_auth_failed,
+        ws_authorize_message,
+        ws_require_auth,
+        ws_require_capability_access,
+    )
     from deeptutor.multi_user.context import reset_current_user
 
     user_token = await ws_require_auth(websocket)
     if user_token is ws_auth_failed:
+        return
+    if not await ws_require_capability_access(websocket):
+        reset_current_user(user_token)
         return
 
     await websocket.accept()
@@ -70,6 +78,8 @@ async def websocket_chat(websocket: WebSocket):
     try:
         while True:
             data = await websocket.receive_json()
+            if not await ws_authorize_message(websocket):
+                break
             requested_language = str(data.get("language") or "").lower().strip()
             language = (
                 "zh"
@@ -94,7 +104,17 @@ async def websocket_chat(websocket: WebSocket):
                 f"message={message[:50]}..., rag={enable_rag}, web={enable_web_search}"
             )
 
+            lease = None
             try:
+                from deeptutor.commercial.concurrency import (
+                    acquire_commercial_turn_lease,
+                )
+
+                # The frame has been authenticated and its required message
+                # field validated. Reserve before creating a session/message
+                # or invoking the provider, and share the slot with unified
+                # TurnRuntime requests for this owner.
+                lease = await acquire_commercial_turn_lease()
                 sm = _get_session_manager()
 
                 if session_id:
@@ -232,6 +252,9 @@ async def websocket_chat(websocket: WebSocket):
             except Exception as e:
                 logger.error(f"Chat processing error: {e}")
                 await websocket.send_json({"type": "error", "message": str(e)})
+            finally:
+                if lease is not None:
+                    await lease.release()
 
     except WebSocketDisconnect:
         logger.debug("Client disconnected from chat")

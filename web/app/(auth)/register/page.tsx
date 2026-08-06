@@ -23,10 +23,18 @@ export default function RegisterPage() {
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [loading, setLoading] = useState(false);
+  const [trialDays, setTrialDays] = useState<number | null>(null);
 
   useEffect(() => {
     fetchAuthStatus().then((status) => {
       if (status?.authenticated) router.replace("/");
+      if (
+        status?.commercial_enabled &&
+        typeof status.trial_days === "number" &&
+        status.trial_days > 0
+      ) {
+        setTrialDays(status.trial_days);
+      }
     });
   }, [router]);
 
@@ -87,7 +95,7 @@ export default function RegisterPage() {
     <div className="w-full max-w-sm">
       <div className="text-center mb-8">
         <h1 className="font-serif text-2xl font-semibold text-[var(--foreground)] tracking-tight">
-          DeepTutor
+          导学吧
         </h1>
         <p className="mt-1 text-sm text-[var(--muted-foreground)]">
           {t("Create your account")}
@@ -95,6 +103,18 @@ export default function RegisterPage() {
       </div>
 
       <div className="bg-[var(--card)] border border-[var(--border)] rounded-2xl shadow-sm px-8 py-8">
+        {trialDays !== null && (
+          <div className="mb-5 rounded-xl border border-amber-500/25 bg-amber-500/10 px-4 py-3">
+            <p className="text-sm font-medium text-[var(--foreground)]">
+              {t("commercial.registration.trialSummary", {
+                days: trialDays,
+              })}
+            </p>
+            <p className="mt-1 text-xs leading-relaxed text-[var(--muted-foreground)]">
+              {t("commercial.registration.trialLimits")}
+            </p>
+          </div>
+        )}
         <form onSubmit={handleSubmit} className="space-y-5">
           <div>
             <label
@@ -248,7 +268,7 @@ export default function RegisterPage() {
       </p>
 
       <p className="mt-3 text-center text-xs text-[var(--muted-foreground)]">
-        DeepTutor · Agent-Native Learning
+        LearnLeader · Agent-Native Learning
       </p>
     </div>
   );

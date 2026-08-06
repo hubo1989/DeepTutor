@@ -3,6 +3,10 @@ import AppShell from "@/components/layout/AppShell";
 import { CapabilityAccessProvider } from "@/components/access/CapabilityAccessContext";
 import CapabilityGate from "@/components/access/CapabilityGate";
 import { UnifiedChatProvider } from "@/context/UnifiedChatContext";
+import {
+  CommercialAccessProvider,
+  TrialStatusBanner,
+} from "@/features/commercial";
 
 export default function WorkspaceLayout({
   children,
@@ -10,12 +14,15 @@ export default function WorkspaceLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <CapabilityAccessProvider>
-      <UnifiedChatProvider>
-        <AppShell sidebar={<WorkspaceSidebar />}>
-          <CapabilityGate>{children}</CapabilityGate>
-        </AppShell>
-      </UnifiedChatProvider>
-    </CapabilityAccessProvider>
+    <CommercialAccessProvider>
+      <CapabilityAccessProvider>
+        <UnifiedChatProvider>
+          <AppShell sidebar={<WorkspaceSidebar />}>
+            <TrialStatusBanner />
+            <CapabilityGate>{children}</CapabilityGate>
+          </AppShell>
+        </UnifiedChatProvider>
+      </CapabilityAccessProvider>
+    </CommercialAccessProvider>
   );
 }

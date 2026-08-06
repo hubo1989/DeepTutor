@@ -12,12 +12,18 @@ message when it is not installed instead of an opaque ``ImportError``.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 import shutil
 import traceback
 from typing import Any, Dict, List, Optional
 
+from deeptutor.commercial.storage_limits import (
+    create_staging_directory,
+    enforce_staging_scratch_limit,
+    promote_staged_directory_with_storage_limits,
+)
 from deeptutor.runtime.home import get_runtime_data_root
 from deeptutor.services.rag.index_versioning import (
     resolve_storage_dir_for_read,
@@ -77,20 +83,33 @@ class GraphRagPipeline:
         self.logger.info(
             "Initializing KB '%s' with %d file(s) using GraphRAG", kb_name, len(file_paths)
         )
+        staging = create_staging_directory(root_dir)
         try:
-            gr_config.write_settings(root_dir)
-            count = await ingestion.prepare_input(file_paths, root_dir)
+            gr_config.write_settings(staging)
+            enforce_staging_scratch_limit(staging, replacing_root=root_dir)
+            count = await ingestion.prepare_input(
+                file_paths,
+                staging,
+                replacing_root=root_dir,
+            )
             if count == 0:
                 self.logger.error("GraphRAG: no extractable documents for '%s'", kb_name)
+                shutil.rmtree(staging, ignore_errors=True)
                 self._cleanup_failed_version_dir(root_dir)
                 return False
-            await self._build(root_dir, is_update=False)
-            storage.write_meta(root_dir)
+            await self._build(staging, is_update=False)
+            storage.write_meta(staging, version_name=root_dir.name)
+            await asyncio.to_thread(
+                promote_staged_directory_with_storage_limits,
+                staging,
+                root_dir,
+            )
             self.logger.info("KB '%s' initialized with GraphRAG (%d docs)", kb_name, count)
             return True
         except Exception as exc:
             self.logger.error("Failed to initialize GraphRAG KB: %s", exc)
             self.logger.error(traceback.format_exc())
+            shutil.rmtree(staging, ignore_errors=True)
             self._cleanup_failed_version_dir(root_dir)
             raise
 
@@ -109,20 +128,33 @@ class GraphRagPipeline:
             kb_name,
             is_update,
         )
+        staging = create_staging_directory(root_dir, copy_existing=is_update)
         try:
             # Refresh settings so a changed model/endpoint is picked up.
-            gr_config.write_settings(root_dir)
-            count = await ingestion.prepare_input(file_paths, root_dir)
+            gr_config.write_settings(staging)
+            enforce_staging_scratch_limit(staging, replacing_root=root_dir)
+            count = await ingestion.prepare_input(
+                file_paths,
+                staging,
+                replacing_root=root_dir,
+            )
             if count == 0:
                 self.logger.warning("GraphRAG: no extractable documents to add for '%s'", kb_name)
+                shutil.rmtree(staging, ignore_errors=True)
                 return False
-            await self._build(root_dir, is_update=is_update)
-            storage.write_meta(root_dir)
+            await self._build(staging, is_update=is_update)
+            storage.write_meta(staging, version_name=root_dir.name)
+            await asyncio.to_thread(
+                promote_staged_directory_with_storage_limits,
+                staging,
+                root_dir,
+            )
             self.logger.info("Added %d doc(s) to GraphRAG KB '%s'", count, kb_name)
             return True
         except Exception as exc:
             self.logger.error("Failed to add documents to GraphRAG KB: %s", exc)
             self.logger.error(traceback.format_exc())
+            shutil.rmtree(staging, ignore_errors=True)
             if not is_update:
                 self._cleanup_failed_version_dir(root_dir)
             raise

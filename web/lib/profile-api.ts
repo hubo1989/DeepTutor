@@ -71,6 +71,31 @@ export async function removeAvatarImage(): Promise<void> {
   }
 }
 
+/** Download a privacy-safe archive of the signed-in account. */
+export async function getAccountExport(): Promise<Blob> {
+  const res = await apiFetch(apiUrl("/api/v1/auth/profile/export"), {
+    cache: "no-store",
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(extractDetail(data, "Failed to export account data"));
+  }
+  return res.blob();
+}
+
+/** Permanently erase the signed-in regular account after password proof. */
+export async function deleteOwnAccount(password: string): Promise<void> {
+  const res = await apiFetch(apiUrl("/api/v1/auth/profile"), {
+    method: "DELETE",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ password }),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(extractDetail(data, "Failed to delete account"));
+  }
+}
+
 /** Build the image URL for an "img:<version>" marker (version cache-busts). */
 export function avatarImageUrl(userId: string, marker: string): string {
   const version = marker.startsWith("img:") ? marker.slice(4) : "0";

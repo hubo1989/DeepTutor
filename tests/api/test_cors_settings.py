@@ -55,6 +55,18 @@ def test_cors_normalizes_common_origin_input_mistakes(monkeypatch) -> None:
     assert "http://api.example.com" in settings["allow_origins"]
 
 
+def test_authenticated_cors_rejects_wildcard_origin(monkeypatch) -> None:
+    monkeypatch.setenv("AUTH_ENABLED", "true")
+    monkeypatch.setenv("CORS_ORIGIN", "*")
+    monkeypatch.setenv("CORS_ORIGINS", "https://app.example.com, *")
+
+    settings = api_main._build_cors_settings()
+
+    assert settings["allow_origin_regex"] is None
+    assert "*" not in settings["allow_origins"]
+    assert "https://app.example.com" in settings["allow_origins"]
+
+
 def test_cors_preflight_allows_partner_patch_save() -> None:
     client = TestClient(api_main.app)
 

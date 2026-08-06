@@ -99,15 +99,27 @@ class LlamaIndexPipeline:
             if progress_callback:
                 set_progress_callback(progress_callback)
 
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(
-                None,
-                lambda: storage.create_index(documents, storage_dir, show_progress=True),
+            prepare_staging = (
+                (
+                    lambda staged: write_version_meta(
+                        kb_dir,
+                        signature,
+                        storage_dir=staged,
+                        version_name=storage_dir.name,
+                    )
+                )
+                if signature is not None
+                else None
+            )
+            await asyncio.to_thread(
+                storage.create_index,
+                documents,
+                storage_dir,
+                show_progress=True,
+                prepare_staging=prepare_staging,
             )
 
             self.logger.info(f"Index persisted to {storage_dir}")
-            if signature is not None:
-                write_version_meta(kb_dir, signature, storage_dir=storage_dir)
 
             self.logger.info(f"KB '{kb_name}' initialized successfully with LlamaIndex")
             return True
@@ -246,29 +258,51 @@ class LlamaIndexPipeline:
                 self.logger.warning("No valid documents to add")
                 return False
 
-            loop = asyncio.get_running_loop()
-
             if plan.existing_storage is not None:
                 self.logger.info(f"Loading existing index from {plan.existing_storage}...")
-                num_added = await loop.run_in_executor(
-                    None,
-                    lambda: storage.insert_documents(
-                        plan.existing_storage, plan.storage_dir, documents
-                    ),
+                prepare_staging = (
+                    (
+                        lambda staged: write_version_meta(
+                            kb_dir,
+                            signature,
+                            storage_dir=staged,
+                            version_name=plan.storage_dir.name,
+                        )
+                    )
+                    if signature is not None and plan.storage_dir != plan.existing_storage
+                    else None
+                )
+                num_added = await asyncio.to_thread(
+                    storage.insert_documents,
+                    plan.existing_storage,
+                    plan.storage_dir,
+                    documents,
+                    prepare_staging=prepare_staging,
                 )
                 self.logger.info(f"Added {num_added} documents to existing index")
-                if signature is not None and plan.storage_dir != plan.existing_storage:
-                    write_version_meta(kb_dir, signature, storage_dir=plan.storage_dir)
             else:
                 self.logger.info(f"Creating new index with {len(documents)} documents...")
                 plan.storage_dir.mkdir(parents=True, exist_ok=True)
-                num_added = await loop.run_in_executor(
-                    None,
-                    lambda: storage.create_index(documents, plan.storage_dir, show_progress=True),
+                prepare_staging = (
+                    (
+                        lambda staged: write_version_meta(
+                            kb_dir,
+                            signature,
+                            storage_dir=staged,
+                            version_name=plan.storage_dir.name,
+                        )
+                    )
+                    if signature is not None
+                    else None
+                )
+                num_added = await asyncio.to_thread(
+                    storage.create_index,
+                    documents,
+                    plan.storage_dir,
+                    show_progress=True,
+                    prepare_staging=prepare_staging,
                 )
                 self.logger.info(f"Created new index with {num_added} documents")
-                if signature is not None:
-                    write_version_meta(kb_dir, signature, storage_dir=plan.storage_dir)
 
             self.logger.info(f"Successfully added documents to KB '{kb_name}'")
             return True

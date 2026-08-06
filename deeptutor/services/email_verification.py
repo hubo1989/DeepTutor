@@ -29,6 +29,7 @@ from typing import Final
 
 from deeptutor.multi_user import identity
 from deeptutor.services.config import load_auth_settings
+from deeptutor.services.private_state import ensure_private_file, harden_sqlite_files
 
 logger = logging.getLogger(__name__)
 
@@ -103,7 +104,7 @@ def _db_path() -> Path:
 
 def _open_db() -> sqlite3.Connection:
     path = _db_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_private_file(path)
     connection = sqlite3.connect(path, timeout=10, isolation_level=None)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA busy_timeout = 10000")
@@ -143,6 +144,7 @@ def _open_db() -> sqlite3.Connection:
         "INSERT OR IGNORE INTO verification_meta(key, value) VALUES ('schema', ?)",
         (str(_SCHEMA_VERSION),),
     )
+    harden_sqlite_files(path)
     return connection
 
 
@@ -424,13 +426,13 @@ def send_verification_email(challenge: VerificationChallenge) -> None:
 
     remaining_minutes = max(1, int((challenge.expires_at - time.time()) // 60))
     message = EmailMessage()
-    message["Subject"] = "DeepTutor 注册验证码 / Verification code"
+    message["Subject"] = "导学吧注册验证码 / LearnLeader verification code"
     message["From"] = config.sender
     message["To"] = challenge.email
     message.set_content(
-        "你的 DeepTutor 注册验证码是：{code}\n\n"
+        "你的导学吧注册验证码是：{code}\n\n"
         "验证码 {minutes} 分钟内有效，最多可尝试 5 次。若不是你本人操作，请忽略此邮件。\n\n"
-        "Your DeepTutor verification code is: {code}\n\n"
+        "Your LearnLeader verification code is: {code}\n\n"
         "It expires in {minutes} minutes. If you did not request this, you can ignore this email.".format(
             code=challenge.code, minutes=remaining_minutes
         )
@@ -457,6 +459,25 @@ def send_verification_email(challenge: VerificationChallenge) -> None:
         raise EmailVerificationError("SMTP delivery failed") from exc
 
 
+def deliver_registration_challenge(
+    challenge: VerificationChallenge,
+    *,
+    deliverable: bool,
+) -> None:
+    """Background delivery with an account-existence-neutral public result."""
+    if not deliverable:
+        discard_challenge(challenge.email)
+        return
+    try:
+        send_verification_email(challenge)
+    except Exception:
+        logger.warning("Registration verification email delivery failed", exc_info=True)
+        try:
+            discard_challenge(challenge.email)
+        except Exception:
+            logger.error("Could not discard a failed registration challenge", exc_info=True)
+
+
 def email_delivery_configured() -> bool:
     return smtp_config().configured
 
@@ -470,6 +491,7 @@ __all__ = [
     "VerificationUnavailable",
     "consume_challenge",
     "check_registration_rate_limit",
+    "deliver_registration_challenge",
     "discard_challenge",
     "email_delivery_configured",
     "issue_challenge",

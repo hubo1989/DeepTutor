@@ -12,7 +12,13 @@ from __future__ import annotations
 from pydantic import ValidationError
 import pytest
 
-from deeptutor.api.routers.auth import LoginRequest, RegisterRequest
+from deeptutor.api.routers.auth import (
+    ConfirmPasswordResetRequest,
+    DeleteOwnAccountRequest,
+    EmailRegistrationRequest,
+    LoginRequest,
+    RegisterRequest,
+)
 
 # ---------------------------------------------------------------------------
 # RegisterRequest.username — the real validator
@@ -66,6 +72,40 @@ def test_register_rejects_short_password(password: str) -> None:
 
 def test_register_accepts_eight_char_password() -> None:
     assert RegisterRequest(username="admin", password="12345678").password == "12345678"
+
+
+@pytest.mark.parametrize(
+    ("model", "payload"),
+    [
+        (RegisterRequest, {"username": "admin", "password": "密" * 25}),
+        (
+            EmailRegistrationRequest,
+            {"email": "user@example.com", "password": "密" * 25},
+        ),
+        (LoginRequest, {"username": "admin", "password": "x" * 73}),
+        (DeleteOwnAccountRequest, {"password": "x" * 73}),
+        (
+            ConfirmPasswordResetRequest,
+            {
+                "email": "user@example.com",
+                "code": "123456",
+                "new_password": "x" * 73,
+            },
+        ),
+    ],
+)
+def test_all_password_inputs_enforce_bcrypt_utf8_byte_limit(model, payload) -> None:
+    with pytest.raises(ValidationError):
+        model(**payload)
+
+
+def test_password_service_rejects_overlong_input_before_bcrypt() -> None:
+    from deeptutor.services.auth import hash_password, verify_password
+
+    with pytest.raises(ValueError, match="72 UTF-8 bytes"):
+        hash_password("x" * 73)
+    valid_hash = hash_password("x" * 72)
+    assert verify_password("x" * 73, valid_hash) is False
 
 
 # ---------------------------------------------------------------------------

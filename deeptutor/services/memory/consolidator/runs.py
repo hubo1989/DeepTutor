@@ -14,8 +14,10 @@ Why an in-memory manager instead of a DB:
 
 Concurrency rules
 -----------------
-At most one **active** run per ``(layer, key)``. Starting a second run
-while the first is active returns ``RunBusyError``. Once a run reaches
+At most one **active** run per ``(owner_id, layer, key)``. Different owners
+may consolidate their own copy of the same logical document concurrently;
+starting a second run for the same owner/document returns ``RunBusyError``.
+Once a run reaches
 a terminal status (``done`` / ``cancelled`` / ``error``) it stays in
 the registry indefinitely so the UI can re-attach to see the final
 trace; older runs evict on FIFO when ``_MAX_HISTORY`` is exceeded.
@@ -33,6 +35,8 @@ from pathlib import Path
 import tempfile
 from typing import Any, Awaitable, Callable, Literal
 import uuid
+
+from deeptutor.multi_user.models import LOCAL_ADMIN_ID
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +71,7 @@ class UndoCheckpoint:
 @dataclass
 class Run:
     id: str
+    owner_id: str
     layer: str
     key: str
     mode: RunMode
@@ -123,26 +128,43 @@ class RunManager:
     def __init__(self) -> None:
         self._runs: dict[str, Run] = {}
         self._order: list[str] = []  # FIFO for eviction
-        self._active: dict[tuple[str, str], str] = {}
+        self._active: dict[tuple[str, str, str], str] = {}
         self._lock = asyncio.Lock()
 
     # ── Lookup ─────────────────────────────────────────────────────────
 
-    def get(self, run_id: str) -> Run | None:
-        return self._runs.get(run_id)
+    def get(self, run_id: str, *, owner_id: str = LOCAL_ADMIN_ID) -> Run | None:
+        run = self._runs.get(run_id)
+        if run is None or run.owner_id != owner_id:
+            return None
+        return run
 
-    def active_for(self, layer: str, key: str) -> Run | None:
-        run_id = self._active.get((layer, key))
+    def active_for(
+        self,
+        layer: str,
+        key: str,
+        *,
+        owner_id: str = LOCAL_ADMIN_ID,
+    ) -> Run | None:
+        run_id = self._active.get((owner_id, layer, key))
         if run_id is None:
             return None
         run = self._runs.get(run_id)
         return run if run is not None and run.active else None
 
-    def list_for(self, layer: str | None = None, key: str | None = None) -> list[Run]:
+    def list_for(
+        self,
+        layer: str | None = None,
+        key: str | None = None,
+        *,
+        owner_id: str = LOCAL_ADMIN_ID,
+    ) -> list[Run]:
         out: list[Run] = []
         for rid in self._order:
             run = self._runs.get(rid)
             if run is None:
+                continue
+            if run.owner_id != owner_id:
                 continue
             if layer is not None and run.layer != layer:
                 continue
@@ -156,6 +178,7 @@ class RunManager:
     async def start(
         self,
         *,
+        owner_id: str = LOCAL_ADMIN_ID,
         layer: str,
         key: str,
         mode: RunMode,
@@ -170,11 +193,17 @@ class RunManager:
         and runs the consolidator mode. The manager wires the callback to
         the event buffer + waiter machinery.
         """
+        if owner_id != LOCAL_ADMIN_ID:
+            from deeptutor.services.account_lifecycle import is_account_deletion_fenced
+
+            if is_account_deletion_fenced(owner_id):
+                raise RunBusyError("account_deletion_in_progress")
         async with self._lock:
-            if self.active_for(layer, key) is not None:
+            if self.active_for(layer, key, owner_id=owner_id) is not None:
                 raise RunBusyError(f"a run is already in progress for {layer}/{key}")
             run = Run(
                 id=uuid.uuid4().hex,
+                owner_id=owner_id,
                 layer=layer,
                 key=key,
                 mode=mode,
@@ -186,14 +215,14 @@ class RunManager:
             )
             self._runs[run.id] = run
             self._order.append(run.id)
-            self._active[(layer, key)] = run.id
+            self._active[(owner_id, layer, key)] = run.id
             self._evict_if_needed()
 
         run._task = asyncio.create_task(self._drive(run, runner))
         return run
 
-    async def cancel(self, run_id: str) -> bool:
-        run = self._runs.get(run_id)
+    async def cancel(self, run_id: str, *, owner_id: str = LOCAL_ADMIN_ID) -> bool:
+        run = self.get(run_id, owner_id=owner_id)
         if run is None or not run.active:
             return False
         run._cancel_flag.set()
@@ -201,9 +230,29 @@ class RunManager:
             run._task.cancel()
         return True
 
-    async def undo_last(self, run_id: str) -> RunEvent | None:
+    async def cancel_all_for_owner(self, owner_id: str) -> int:
+        """Cancel and await every active consolidator run for one owner."""
+        async with self._lock:
+            runs = tuple(
+                run for run in self._runs.values() if run.owner_id == owner_id and run.active
+            )
+            for run in runs:
+                run._cancel_flag.set()
+                if run._task is not None and not run._task.done():
+                    run._task.cancel()
+        tasks = tuple(run._task for run in runs if run._task is not None)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        return len(runs)
+
+    async def undo_last(
+        self,
+        run_id: str,
+        *,
+        owner_id: str = LOCAL_ADMIN_ID,
+    ) -> RunEvent | None:
         """Restore the document snapshot before the latest run write."""
-        run = self._runs.get(run_id)
+        run = self.get(run_id, owner_id=owner_id)
         if run is None:
             raise KeyError(run_id)
         if run.active:
@@ -294,7 +343,12 @@ class RunManager:
         finally:
             run.ended_at = _now_iso()
             await self._emit(run, {"stage": "run_ended", "status": run.status})
-            self._active.pop((run.layer, run.key), None)
+            active_key = (run.owner_id, run.layer, run.key)
+            # A replacement run can start after this run becomes terminal but
+            # before its finally block executes. Never let the old task remove
+            # the replacement's active index entry.
+            if self._active.get(active_key) == run.id:
+                self._active.pop(active_key, None)
             # Wake any remaining waiters so they observe the terminal state.
             for w in list(run._waiters):
                 w.set()

@@ -17,6 +17,7 @@ import logging
 from pathlib import Path
 from typing import Iterable
 
+from deeptutor.commercial.storage_limits import enforce_staging_scratch_limit
 from deeptutor.services.rag.file_routing import FileTypeRouter
 
 from . import storage
@@ -57,7 +58,12 @@ def _extract_parser_text(path: Path) -> str:
     return ""
 
 
-async def prepare_input(file_paths: Iterable[str], root_dir: Path) -> int:
+async def prepare_input(
+    file_paths: Iterable[str],
+    root_dir: Path,
+    *,
+    replacing_root: Path | None = None,
+) -> int:
     """Write parsed text for each supported file into ``root_dir/input``.
 
     Returns the number of non-empty text documents written. Parser-backed files
@@ -77,7 +83,10 @@ async def prepare_input(file_paths: Iterable[str], root_dir: Path) -> int:
     for file_path_str in classification.parser_files:
         path = Path(file_path_str)
         text = _extract_parser_text(path)
-        written += _write_doc(target_dir, path, text, used)
+        added = _write_doc(target_dir, path, text, used)
+        written += added
+        if added:
+            enforce_staging_scratch_limit(root_dir, replacing_root=replacing_root)
 
     for file_path_str in classification.text_files:
         path = Path(file_path_str)
@@ -86,7 +95,10 @@ async def prepare_input(file_paths: Iterable[str], root_dir: Path) -> int:
         except Exception as exc:  # pragma: no cover - defensive
             logger.error("GraphRAG ingestion: failed to read text %s: %s", path.name, exc)
             text = ""
-        written += _write_doc(target_dir, path, text, used)
+        added = _write_doc(target_dir, path, text, used)
+        written += added
+        if added:
+            enforce_staging_scratch_limit(root_dir, replacing_root=replacing_root)
 
     for file_path_str in classification.image_files:
         logger.warning(

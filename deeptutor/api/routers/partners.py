@@ -22,6 +22,8 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from deeptutor.core.i18n import t
+from deeptutor.multi_user.model_access import has_capability_access
+from deeptutor.multi_user.partner_access import assert_partner_allowed
 from deeptutor.partners.config.paths import get_partner_media_dir
 from deeptutor.partners.helpers import safe_filename
 from deeptutor.services.partners import (
@@ -848,6 +850,16 @@ def _default_attachment_prompt(attachments: list[ChatAttachmentRequest]) -> str:
     return t("Please use the attached file(s).")
 
 
+def _assert_partner_chat_access(partner_id: str) -> None:
+    """Authorize both the partner resource and the model it consumes."""
+    assert_partner_allowed(partner_id)
+    if not has_capability_access("llm"):
+        raise HTTPException(
+            status_code=403,
+            detail="No LLM model is assigned to your account",
+        )
+
+
 def _materialize_partner_attachments(
     partner_id: str,
     attachments: list[ChatAttachmentRequest],
@@ -892,6 +904,7 @@ def _materialize_partner_attachments(
 @router.post("/{partner_id}/chat")
 async def partner_chat_http(partner_id: str, payload: ChatMessageRequest) -> dict[str, Any]:
     """Send one HTTP message to a partner with persistent session context."""
+    _assert_partner_chat_access(partner_id)
     content = payload.content.strip()
     if not content and not payload.attachments:
         raise HTTPException(status_code=400, detail=t("api.content_required"))
@@ -983,6 +996,7 @@ async def _partner_chat_stream(
 @router.post("/{partner_id}/chat/execute-stream")
 async def partner_chat_http_stream(partner_id: str, payload: ChatMessageRequest):
     """Stream one HTTP message to a partner as server-sent events."""
+    _assert_partner_chat_access(partner_id)
     if not payload.content.strip() and not payload.attachments:
         raise HTTPException(status_code=400, detail=t("api.content_required"))
     await _ensure_running_partner(partner_id)
@@ -1007,11 +1021,26 @@ async def partner_chat_ws(ws: WebSocket, partner_id: str):
     * ``{"type": "content", "content": str}`` — the final reply;
     * ``{"type": "done"}`` / ``{"type": "error"}`` / ``{"type": "proactive"}``.
     """
-    from deeptutor.api.routers.auth import ws_auth_failed, ws_require_auth
+    from deeptutor.api.routers.auth import (
+        ws_auth_failed,
+        ws_authorize_message,
+        ws_require_auth,
+        ws_require_capability_access,
+    )
     from deeptutor.multi_user.context import reset_current_user
+    from deeptutor.multi_user.partner_access import assert_partner_allowed
 
     user_token = await ws_require_auth(ws)
     if user_token is ws_auth_failed:
+        return
+    if not await ws_require_capability_access(ws):
+        reset_current_user(user_token)
+        return
+    try:
+        assert_partner_allowed(partner_id)
+    except HTTPException as exc:
+        await ws.close(code=4003, reason=str(exc.detail)[:120])
+        reset_current_user(user_token)
         return
 
     mgr = get_partner_manager()
@@ -1072,6 +1101,9 @@ async def partner_chat_ws(ws: WebSocket, partner_id: str):
             try:
                 raw = await ws.receive_text()
             except WebSocketDisconnect:
+                disconnected.set()
+                break
+            if not await ws_authorize_message(ws):
                 disconnected.set()
                 break
             try:

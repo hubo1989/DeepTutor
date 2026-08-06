@@ -8,8 +8,13 @@ import json
 from pathlib import Path
 import shutil
 import threading
-from typing import Any
+from typing import Any, Callable
 
+from deeptutor.commercial.storage_limits import (
+    create_staging_directory,
+    owner_tree_size_bytes,
+    promote_staged_directory_with_storage_limits,
+)
 from deeptutor.services.embedding.validation import validate_embedding_batch
 from deeptutor.services.rag.index_versioning import (
     EmbeddingSignature,
@@ -84,27 +89,61 @@ def resolve_add_storage_plan(kb_dir: Path, signature: EmbeddingSignature | None)
     return AddStoragePlan(existing_storage=existing_storage, storage_dir=storage_dir)
 
 
-def create_index(documents: list[Any], storage_dir: Path, *, show_progress: bool = True) -> int:
-    index, count = ingestion.create_index_from_documents(
-        documents, storage_dir, show_progress=show_progress
-    )
-    retrievers.persist_bm25_retriever(index, storage_dir, top_k=20)
-    return count
+def create_index(
+    documents: list[Any],
+    storage_dir: Path,
+    *,
+    show_progress: bool = True,
+    prepare_staging: Callable[[Path], None] | None = None,
+) -> int:
+    staging = create_staging_directory(storage_dir)
+    try:
+        index, count = ingestion.create_index_from_documents(
+            documents, staging, show_progress=show_progress
+        )
+        retrievers.persist_bm25_retriever(index, staging, top_k=20)
+        if prepare_staging is not None:
+            prepare_staging(staging)
+        promote_staged_directory_with_storage_limits(staging, storage_dir)
+        clear_index_cache()
+        return count
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
 
 
-def insert_documents(existing_storage: Path, storage_dir: Path, documents: list[Any]) -> int:
-    index = vector_store.load_index(existing_storage)
-    _validate_persisted_embeddings(index, existing_storage)
-    if hasattr(index, "insert_nodes"):
-        count = ingestion.insert_documents_into_index(index, documents, show_progress=True)
-    else:
-        # Some tests use a tiny fake index that only implements insert().
-        for document in documents:
-            index.insert(document)
-        count = len(documents)
-    index.storage_context.persist(persist_dir=str(storage_dir))
-    retrievers.persist_bm25_retriever(index, storage_dir, top_k=20)
-    return count
+def insert_documents(
+    existing_storage: Path,
+    storage_dir: Path,
+    documents: list[Any],
+    *,
+    prepare_staging: Callable[[Path], None] | None = None,
+) -> int:
+    staging = create_staging_directory(storage_dir)
+    try:
+        # Copy-on-write keeps the readable index untouched until every related
+        # store file and optional BM25 artifact has been persisted successfully.
+        owner_tree_size_bytes(existing_storage)
+        shutil.copytree(existing_storage, staging, dirs_exist_ok=True)
+        index = vector_store.load_index(staging)
+        _validate_persisted_embeddings(index, staging)
+        if hasattr(index, "insert_nodes"):
+            count = ingestion.insert_documents_into_index(index, documents, show_progress=True)
+        else:
+            # Some tests use a tiny fake index that only implements insert().
+            for document in documents:
+                index.insert(document)
+            count = len(documents)
+        index.storage_context.persist(persist_dir=str(staging))
+        retrievers.persist_bm25_retriever(index, staging, top_k=20)
+        if prepare_staging is not None:
+            prepare_staging(staging)
+        promote_staged_directory_with_storage_limits(staging, storage_dir)
+        clear_index_cache()
+        return count
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
 
 
 def _validate_embedding_dict(embedding_dict: Any, *, label: str) -> None:
