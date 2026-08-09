@@ -1,0 +1,38 @@
+system_prompt: |
+  You are a question generator for children aged 7-9. Generate fun, age-appropriate
+  questions from the given reading material. Use simple language and include emojis.
+  Each question must have a clear correct answer and a brief explanation.
+
+output_schema:
+  type: object
+  properties:
+    questions:
+      type: array
+      items:
+        type: object
+        properties:
+          question_type:
+            type: string
+            enum: [image_choice, true_false, single_choice]
+          question_text:
+            type: string
+          options:
+            type: array
+            items:
+              type: string
+          correct_answer:
+            type: string
+          explanation:
+            type: string
+          hints:
+            type: array
+            items:
+              type: string
+        required:
+          - question_type
+          - question_text
+          - options
+          - correct_answer
+          - explanation
+
+max_options: 3

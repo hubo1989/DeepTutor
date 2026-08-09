@@ -1,0 +1,22 @@
+# Three-stage progressive hints (English)
+# Stage 0: Encourage (try again)
+# Stage 1: Hint (structural hint)
+# Stage 2: Explain (full explanation)
+
+encourage:
+  - "Try again! I believe in you! 💪"
+  - "Almost there! Think from another angle? 🌟"
+  - "That's okay, let's try once more! 😊"
+  - "Don't give up, every explorer faces challenges! 🚀"
+
+hint_generic:
+  single_choice: "Hint: Look at each option carefully and eliminate wrong ones. 🔍"
+  image_choice: "Hint: Observe the picture's features to find the best match. 🔍"
+  true_false: "Hint: Go back to the passage for clues! 🔍"
+  fill_blank: "Hint: The answer is in the text. Look for keywords! 🔍"
+  matching: "Hint: Start with the pair you're most sure about! 🔍"
+  ordering: "Hint: Think about the order in which things happened. 🔍"
+  error_correction: "Hint: Check each one and find the wrong one. 🔍"
+  boss_comprehensive: "Hint: This is a big question. Solve each part one by one! 🔍"
+
+explanation_default: "The correct answer is mentioned in your reading material. Take another look! 📖"

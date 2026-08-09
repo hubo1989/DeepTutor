@@ -1,0 +1,68 @@
+system_prompt: |
+  You are a question generator for teenagers aged 13-15. Generate challenging,
+  age-appropriate questions from the given reading material. Question types may
+  include: single choice, true/false, fill-in-the-blank, matching, ordering,
+  error correction, and comprehensive boss questions.
+  Focus on understanding, analysis, and application skills.
+
+output_schema:
+  type: object
+  properties:
+    questions:
+      type: array
+      items:
+        type: object
+        properties:
+          question_type:
+            type: string
+            enum:
+              - single_choice
+              - true_false
+              - fill_blank
+              - matching
+              - ordering
+              - error_correction
+              - boss_comprehensive
+          question_text:
+            type: string
+          options:
+            type: array
+            items:
+              type: string
+          correct_answer:
+            type: string
+          acceptable_answers:
+            type: array
+            items:
+              type: string
+          correct_answer_ids:
+            type: array
+            items:
+              type: string
+          matching_pairs:
+            type: array
+            items:
+              type: array
+              items:
+                type: string
+          ordering_sequence:
+            type: array
+            items:
+              type: string
+          sub_questions:
+            type: array
+            items:
+              type: object
+          explanation:
+            type: string
+          hints:
+            type: array
+            items:
+              type: string
+        required:
+          - question_type
+          - question_text
+          - correct_answer
+          - explanation
+
+max_options: 4

@@ -1,0 +1,66 @@
+system_prompt: |
+  你是一位面向 13-15 岁青少年的出题老师。请根据给定的学习材料，生成适合这个年龄段的题目。
+  题型可以包括：单选题、判断题、填空题、配对题、排序题、纠错题、综合大题。
+  题目要注重理解、分析和应用能力，鼓励深度思考。
+
+output_schema:
+  type: object
+  properties:
+    questions:
+      type: array
+      items:
+        type: object
+        properties:
+          question_type:
+            type: string
+            enum:
+              - single_choice
+              - true_false
+              - fill_blank
+              - matching
+              - ordering
+              - error_correction
+              - boss_comprehensive
+          question_text:
+            type: string
+          options:
+            type: array
+            items:
+              type: string
+          correct_answer:
+            type: string
+          acceptable_answers:
+            type: array
+            items:
+              type: string
+          correct_answer_ids:
+            type: array
+            items:
+              type: string
+          matching_pairs:
+            type: array
+            items:
+              type: array
+              items:
+                type: string
+          ordering_sequence:
+            type: array
+            items:
+              type: string
+          sub_questions:
+            type: array
+            items:
+              type: object
+          explanation:
+            type: string
+          hints:
+            type: array
+            items:
+              type: string
+        required:
+          - question_type
+          - question_text
+          - correct_answer
+          - explanation
+
+max_options: 4

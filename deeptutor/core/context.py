@@ -81,4 +81,8 @@ class UnifiedContext:
     persona_context: str = ""
     skills_manifest: str = ""
     source_manifest: str = ""
+    # Kid-mode profile context: when a child is using the app, these are set
+    # so downstream tools can personalize content and apply safety filters.
+    kid_profile_id: str = ""
+    kid_age_band: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
