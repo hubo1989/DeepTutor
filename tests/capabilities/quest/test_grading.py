@@ -17,6 +17,7 @@ from deeptutor.services.gamification.models import Question
 # Single choice
 # ---------------------------------------------------------------------------
 
+
 class TestSingleChoiceGrading:
     def test_correct(self):
         q = Question(
@@ -59,11 +60,22 @@ class TestSingleChoiceGrading:
 # True / False
 # ---------------------------------------------------------------------------
 
+
 class TestTrueFalseGrading:
-    @pytest.mark.parametrize("answer,expected", [
-        ("true", True), ("True", True), ("TRUE", True), ("对", True), ("正确", True),
-        ("false", False), ("False", False), ("错", False), ("错误", False),
-    ])
+    @pytest.mark.parametrize(
+        "answer,expected",
+        [
+            ("true", True),
+            ("True", True),
+            ("TRUE", True),
+            ("对", True),
+            ("正确", True),
+            ("false", False),
+            ("False", False),
+            ("错", False),
+            ("错误", False),
+        ],
+    )
     def test_various_inputs(self, answer, expected):
         q = Question(
             text="The sun is hot.",
@@ -93,6 +105,7 @@ class TestTrueFalseGrading:
 # ---------------------------------------------------------------------------
 # Fill blank
 # ---------------------------------------------------------------------------
+
 
 class TestFillBlankGrading:
     def test_exact_match(self):
@@ -137,6 +150,7 @@ class TestFillBlankGrading:
 # Matching
 # ---------------------------------------------------------------------------
 
+
 class TestMatchingGrading:
     def test_correct_order_independent(self):
         q = Question(
@@ -161,6 +175,7 @@ class TestMatchingGrading:
 # ---------------------------------------------------------------------------
 # Ordering
 # ---------------------------------------------------------------------------
+
 
 class TestOrderingGrading:
     def test_correct_order(self):
@@ -193,6 +208,7 @@ class TestOrderingGrading:
 # ---------------------------------------------------------------------------
 # Error correction
 # ---------------------------------------------------------------------------
+
 
 class TestErrorCorrectionGrading:
     def test_correct_by_id(self):
@@ -230,6 +246,7 @@ class TestErrorCorrectionGrading:
 # Boss comprehensive
 # ---------------------------------------------------------------------------
 
+
 class TestBossComprehensiveGrading:
     def test_all_sub_correct(self):
         q = Question(
@@ -260,6 +277,7 @@ class TestBossComprehensiveGrading:
 # Determinism test (100x same answer → same result)
 # ---------------------------------------------------------------------------
 
+
 class TestDeterminism:
     def test_deterministic_100_runs(self):
         """Same question + same answer must always produce the same result (100 runs)."""
@@ -280,13 +298,26 @@ class TestDeterminism:
 # grade_level
 # ---------------------------------------------------------------------------
 
+
 class TestGradeLevel:
     def test_all_correct(self):
         questions = [
-            Question(question_id="q1", text="Q1", question_type="single_choice",
-                     options=["a", "b"], correct_answer="a", points=10),
-            Question(question_id="q2", text="Q2", question_type="single_choice",
-                     options=["x", "y"], correct_answer="x", points=10),
+            Question(
+                question_id="q1",
+                text="Q1",
+                question_type="single_choice",
+                options=["a", "b"],
+                correct_answer="a",
+                points=10,
+            ),
+            Question(
+                question_id="q2",
+                text="Q2",
+                question_type="single_choice",
+                options=["x", "y"],
+                correct_answer="x",
+                points=10,
+            ),
         ]
         answers = {"q1": "a", "q2": "x"}
         result = GradingService.grade_level(questions, answers)
@@ -299,10 +330,22 @@ class TestGradeLevel:
 
     def test_partial(self):
         questions = [
-            Question(question_id="q1", text="Q1", question_type="single_choice",
-                     options=["a", "b"], correct_answer="a", points=10),
-            Question(question_id="q2", text="Q2", question_type="single_choice",
-                     options=["x", "y"], correct_answer="x", points=10),
+            Question(
+                question_id="q1",
+                text="Q1",
+                question_type="single_choice",
+                options=["a", "b"],
+                correct_answer="a",
+                points=10,
+            ),
+            Question(
+                question_id="q2",
+                text="Q2",
+                question_type="single_choice",
+                options=["x", "y"],
+                correct_answer="x",
+                points=10,
+            ),
         ]
         answers = {"q1": "a", "q2": "y"}  # q2 wrong
         result = GradingService.grade_level(questions, answers)

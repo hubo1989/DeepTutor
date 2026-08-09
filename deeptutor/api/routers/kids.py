@@ -38,6 +38,7 @@ router = APIRouter()
 # Pydantic request / response models
 # ---------------------------------------------------------------------------
 
+
 class ThemeSummary(BaseModel):
     """Lightweight public theme summary for card display."""
 
@@ -147,6 +148,7 @@ class ProgressResponse(BaseModel):
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _theme_to_summary(theme: PublicTheme) -> ThemeSummary:
     """Convert a PublicTheme dataclass to a ThemeSummary response model."""
     return ThemeSummary(
@@ -221,6 +223,7 @@ def _map_to_response(qmap: QuestMap) -> QuestMapResponse:
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
+
 
 @router.get("/kids/public-themes", response_model=list[ThemeSummary])
 async def list_public_themes(

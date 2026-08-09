@@ -132,6 +132,7 @@ class TestCapabilityMatrix:
 # check_capability with mocked kid role
 # ---------------------------------------------------------------------------
 
+
 class TestCheckCapabilityKid:
     """Test check_capability with a mocked kid role (since CurrentUser.role
     is Literal['admin','user'], we mock _resolve_role)."""
@@ -161,6 +162,7 @@ class TestCheckCapabilityKid:
 # require_guardian dependency
 # ---------------------------------------------------------------------------
 
+
 class TestRequireGuardian:
     @patch("deeptutor.services.kid_profiles.guard.get_current_user")
     def test_guardian_passes(self, mock_get):
@@ -183,6 +185,7 @@ class TestRequireGuardian:
 # require_kid_or_guardian dependency
 # ---------------------------------------------------------------------------
 
+
 class TestRequireKidOrGuardian:
     @patch("deeptutor.services.kid_profiles.guard.get_current_user")
     def test_guardian_passes(self, mock_get):
@@ -203,6 +206,7 @@ class TestRequireKidOrGuardian:
 # ---------------------------------------------------------------------------
 # Unknown role handling
 # ---------------------------------------------------------------------------
+
 
 class TestUnknownRole:
     @patch("deeptutor.services.kid_profiles.guard._resolve_role", return_value="unknown")

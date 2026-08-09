@@ -17,24 +17,37 @@ class TestHintStages:
 
     def test_stage_0_encourage(self):
         service = HintService(language="zh")
-        q = Question(text="What is 1+1?", question_type="single_choice",
-                     options=["1", "2", "3"], correct_answer="2")
+        q = Question(
+            text="What is 1+1?",
+            question_type="single_choice",
+            options=["1", "2", "3"],
+            correct_answer="2",
+        )
         hint = service.get_hint(q, 0)
         assert hint  # non-empty
         assert "💪" in hint or "🌟" in hint or "😊" in hint or "🚀" in hint
 
     def test_stage_1_structural_hint_with_options(self):
         service = HintService(language="zh")
-        q = Question(text="What is 1+1?", question_type="single_choice",
-                     options=["1", "2", "3"], correct_answer="2",
-                     hints=["Count on your fingers!"])
+        q = Question(
+            text="What is 1+1?",
+            question_type="single_choice",
+            options=["1", "2", "3"],
+            correct_answer="2",
+            hints=["Count on your fingers!"],
+        )
         hint = service.get_hint(q, 1)
         assert hint == "Count on your fingers!"
 
     def test_stage_1_structural_hint_no_stored_hints(self):
         service = HintService(language="zh")
-        q = Question(text="What is 1+1?", question_type="single_choice",
-                     options=["1", "2", "3"], correct_answer="2", hints=[])
+        q = Question(
+            text="What is 1+1?",
+            question_type="single_choice",
+            options=["1", "2", "3"],
+            correct_answer="2",
+            hints=[],
+        )
         hint = service.get_hint(q, 1)
         assert "提示" in hint
 
@@ -65,8 +78,9 @@ class TestHintStages:
     def test_stage_clamped(self):
         """Stage beyond MAX_STAGE should be clamped to MAX_STAGE."""
         service = HintService(language="zh")
-        q = Question(text="Test", question_type="true_false", correct_answer="true",
-                     explanation="Explained.")
+        q = Question(
+            text="Test", question_type="true_false", correct_answer="true", explanation="Explained."
+        )
         hint = service.get_hint(q, 99)
         assert hint == "Explained."
 
@@ -88,15 +102,19 @@ class TestHintLanguageEnglish:
 
     def test_english_structural_hint(self):
         service = HintService(language="en")
-        q = Question(text="Test", question_type="single_choice",
-                     options=["a", "b"], correct_answer="a", hints=[])
+        q = Question(
+            text="Test",
+            question_type="single_choice",
+            options=["a", "b"],
+            correct_answer="a",
+            hints=[],
+        )
         hint = service.get_hint(q, 1)
         assert "Hint" in hint or "hint" in hint.lower()
 
     def test_english_default_explanation(self):
         service = HintService(language="en")
-        q = Question(text="Test", question_type="true_false",
-                     correct_answer="true", explanation="")
+        q = Question(text="Test", question_type="true_false", correct_answer="true", explanation="")
         hint = service.get_hint(q, 2)
         assert "reading material" in hint.lower()
 
@@ -105,17 +123,26 @@ class TestGetExplanation:
     @pytest.mark.asyncio
     async def test_no_llm_returns_stored_explanation(self):
         service = HintService(language="zh")
-        q = Question(text="Test", question_type="single_choice",
-                     options=["a", "b"], correct_answer="a",
-                     explanation="Stored explanation.")
+        q = Question(
+            text="Test",
+            question_type="single_choice",
+            options=["a", "b"],
+            correct_answer="a",
+            explanation="Stored explanation.",
+        )
         result = await service.get_explanation(q)
         assert result == "Stored explanation."
 
     @pytest.mark.asyncio
     async def test_no_llm_no_explanation_returns_default(self):
         service = HintService(language="zh")
-        q = Question(text="Test", question_type="single_choice",
-                     options=["a", "b"], correct_answer="a", explanation="")
+        q = Question(
+            text="Test",
+            question_type="single_choice",
+            options=["a", "b"],
+            correct_answer="a",
+            explanation="",
+        )
         result = await service.get_explanation(q)
         assert "阅读材料" in result
 
@@ -126,8 +153,13 @@ class TestGetExplanation:
                 return "This is an LLM-generated explanation for children."
 
         service = HintService(language="zh")
-        q = Question(text="Test", question_type="single_choice",
-                     options=["a", "b"], correct_answer="a", explanation="Stored.")
+        q = Question(
+            text="Test",
+            question_type="single_choice",
+            options=["a", "b"],
+            correct_answer="a",
+            explanation="Stored.",
+        )
         result = await service.get_explanation(q, llm_client=MockLLM())
         assert result == "This is an LLM-generated explanation for children."
 
@@ -138,8 +170,12 @@ class TestGetExplanation:
                 raise RuntimeError("LLM error")
 
         service = HintService(language="zh")
-        q = Question(text="Test", question_type="single_choice",
-                     options=["a", "b"], correct_answer="a",
-                     explanation="Safe fallback explanation.")
+        q = Question(
+            text="Test",
+            question_type="single_choice",
+            options=["a", "b"],
+            correct_answer="a",
+            explanation="Safe fallback explanation.",
+        )
         result = await service.get_explanation(q, llm_client=FailingLLM())
         assert result == "Safe fallback explanation."

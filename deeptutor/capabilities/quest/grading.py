@@ -19,6 +19,7 @@ from deeptutor.services.gamification.models import Question
 # Result types
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class LevelResult:
     """Aggregate grading result for a full level (all questions).
@@ -45,6 +46,7 @@ class LevelResult:
 # ---------------------------------------------------------------------------
 # GradingService
 # ---------------------------------------------------------------------------
+
 
 class GradingService:
     """Deterministic, zero-LLM grading for all question types."""

@@ -478,14 +478,10 @@ app.include_router(unified_ws.router, prefix="/api/v1", tags=["unified-ws"])
 app.include_router(quiz_judge.router, prefix="/api/v1", tags=["quiz-judge"])
 
 # Kid profiles — gamified learning account management
-app.include_router(
-    profiles.router, prefix="/api/v1", tags=["profiles"], dependencies=_auth
-)
+app.include_router(profiles.router, prefix="/api/v1", tags=["profiles"], dependencies=_auth)
 
 # Kids gamified learning — themes, maps, progress
-app.include_router(
-    kids.router, prefix="/api/v1", tags=["kids"], dependencies=_auth
-)
+app.include_router(kids.router, prefix="/api/v1", tags=["kids"], dependencies=_auth)
 
 
 @app.get("/")

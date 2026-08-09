@@ -27,6 +27,7 @@ from typing import Any, Protocol
 # Result types
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class FilterResult:
     """Outcome of a safety filter check.
@@ -53,35 +54,113 @@ class FilterResult:
 # Each entry is matched case-insensitively as a whole-word or substring.
 WORDLIST: list[str] = [
     # --- Violence ---
-    "kill", "murder", "blood", "gore", "torture", "stab", "shoot", "gun",
-    "weapon", "bullet", "bomb", "explosive", "assault", "rape",
-    "fight", "brawl", "attack", "strangle", "poison", "drown",
-    "杀", "杀人", "杀戮", "谋杀", "流血", "酷刑", "刺杀", "枪杀", "炸弹",
-    "爆炸", "武器", "子弹", "袭击", "强暴", "打架", "斗殴", "攻击",
-    "勒死", "下毒", "淹死",
+    "kill",
+    "murder",
+    "blood",
+    "gore",
+    "torture",
+    "stab",
+    "shoot",
+    "gun",
+    "weapon",
+    "bullet",
+    "bomb",
+    "explosive",
+    "assault",
+    "rape",
+    "fight",
+    "brawl",
+    "attack",
+    "strangle",
+    "poison",
+    "drown",
+    "杀",
+    "杀人",
+    "杀戮",
+    "谋杀",
+    "流血",
+    "酷刑",
+    "刺杀",
+    "枪杀",
+    "炸弹",
+    "爆炸",
+    "武器",
+    "子弹",
+    "袭击",
+    "强暴",
+    "打架",
+    "斗殴",
+    "攻击",
+    "勒死",
+    "下毒",
+    "淹死",
     # --- Sexual / Adult ---
-    "sex", "porn", "nude", "naked", "erotic", "adult content",
-    "色情", "裸体", "性爱", "成人内容", "淫秽",
+    "sex",
+    "porn",
+    "nude",
+    "naked",
+    "erotic",
+    "adult content",
+    "色情",
+    "裸体",
+    "性爱",
+    "成人内容",
+    "淫秽",
     # --- Self-harm ---
-    "suicide", "self-harm", "cut myself", "kill myself", "end my life",
-    "ended his life", "ended her life", "took his life", "took her life",
-    "took his own life", "took her own life",
-    "自杀", "自残", "割腕", "轻生", "结束生命", "结束自己的生命",
+    "suicide",
+    "self-harm",
+    "cut myself",
+    "kill myself",
+    "end my life",
+    "ended his life",
+    "ended her life",
+    "took his life",
+    "took her life",
+    "took his own life",
+    "took her own life",
+    "自杀",
+    "自残",
+    "割腕",
+    "轻生",
+    "结束生命",
+    "结束自己的生命",
     # --- Drugs ---
-    "drug", "cocaine", "heroin", "marijuana", "weed", "meth",
-    "吸毒", "毒品", "可卡因", "海洛因", "大麻", "冰毒",
+    "drug",
+    "cocaine",
+    "heroin",
+    "marijuana",
+    "weed",
+    "meth",
+    "吸毒",
+    "毒品",
+    "可卡因",
+    "海洛因",
+    "大麻",
+    "冰毒",
     # --- Profanity (common) ---
-    "fuck", "shit", "damn", "bitch", "asshole", "bastard",
+    "fuck",
+    "shit",
+    "damn",
+    "bitch",
+    "asshole",
+    "bastard",
     # --- Other inappropriate ---
-    "gambling", "casino", "alcohol", "cigarette", "drunk",
-    "赌博", "赌场", "酒精", "香烟", "酗酒",
+    "gambling",
+    "casino",
+    "alcohol",
+    "cigarette",
+    "drunk",
+    "赌博",
+    "赌场",
+    "酒精",
+    "香烟",
+    "酗酒",
 ]
 
 # Pre-compile regex patterns for performance.
 # Each term is matched as a case-insensitive substring.
 _TERM_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
-    (term, re.compile(re.escape(term), re.IGNORECASE))
-    for term in WORDLIST
+    (term, re.compile(re.escape(term), re.IGNORECASE)) for term in WORDLIST
 ]
 
 
@@ -98,6 +177,7 @@ def _mask(text: str, flagged: list[str]) -> str:
 # LLM protocol (optional hook)
 # ---------------------------------------------------------------------------
 
+
 class LLMClient(Protocol):
     """Minimal protocol the LLM review hook expects."""
 
@@ -109,6 +189,7 @@ class LLMClient(Protocol):
 # ---------------------------------------------------------------------------
 # SafetyFilter
 # ---------------------------------------------------------------------------
+
 
 class SafetyFilter:
     """Two-stage safety filter for children's content.
@@ -187,7 +268,9 @@ class SafetyFilter:
             response = await llm_client.complete(prompt)
             response_lower = response.strip().lower()
             if response_lower.startswith("unsafe"):
-                reason = response.split(":", 1)[-1].strip() if ":" in response else "LLM flagged content"
+                reason = (
+                    response.split(":", 1)[-1].strip() if ":" in response else "LLM flagged content"
+                )
                 return FilterResult(
                     passed=False,
                     reason=f"LLM review: {reason}",

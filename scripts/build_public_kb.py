@@ -101,8 +101,7 @@ def main() -> int:
     parser.add_argument(
         "--theme",
         default="all",
-        help="Theme ID to build (e.g. 'dino-world'), or 'all' for every theme. "
-        "Default: all",
+        help="Theme ID to build (e.g. 'dino-world'), or 'all' for every theme. Default: all",
     )
     parser.add_argument(
         "--list",

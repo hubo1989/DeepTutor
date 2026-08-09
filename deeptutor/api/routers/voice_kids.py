@@ -33,6 +33,7 @@ router = APIRouter()
 # Pydantic models
 # ---------------------------------------------------------------------------
 
+
 class TTSRequest(BaseModel):
     """Request body for POST /kids/tts."""
 

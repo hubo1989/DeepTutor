@@ -20,23 +20,20 @@ import pytest
 def temp_data_dirs(tmp_path, monkeypatch):
     """Redirect all data directories to temp paths."""
     profiles_path = tmp_path / "profiles.json"
-    monkeypatch.setattr(
-        "deeptutor.services.kid_profiles.store._PROFILES_PATH", profiles_path
-    )
+    monkeypatch.setattr("deeptutor.services.kid_profiles.store._PROFILES_PATH", profiles_path)
     pin_dir = tmp_path / "pins"
     pin_dir.mkdir(exist_ok=True)
     monkeypatch.setattr("deeptutor.services.kid_profiles.pin._PIN_DIR", pin_dir)
     game_dir = tmp_path / "gamification"
     game_dir.mkdir(exist_ok=True)
-    monkeypatch.setattr(
-        "deeptutor.services.gamification.store._GAMIFICATION_DIR", game_dir
-    )
+    monkeypatch.setattr("deeptutor.services.gamification.store._GAMIFICATION_DIR", game_dir)
     return tmp_path
 
 
 # ---------------------------------------------------------------------------
 # Profile Store CRUD tests
 # ---------------------------------------------------------------------------
+
 
 class TestProfileStore:
     def test_create_and_load_all(self, temp_data_dirs):
@@ -133,6 +130,7 @@ class TestProfileStore:
 # PIN Service tests
 # ---------------------------------------------------------------------------
 
+
 class TestPinService:
     def test_pin_round_trip(self, temp_data_dirs):
         from deeptutor.services.kid_profiles.pin import has_pin, set_pin, verify_pin
@@ -199,6 +197,7 @@ class TestPinService:
 # Gamification init on profile creation
 # ---------------------------------------------------------------------------
 
+
 class TestGamificationInit:
     def test_gamification_state_created_with_profile(self, temp_data_dirs):
         """When a profile is created, gamification state should be initialized."""
@@ -231,6 +230,7 @@ class TestGamificationInit:
 # Router schema validation (Pydantic models)
 # ---------------------------------------------------------------------------
 
+
 class TestRouterSchemas:
     def test_create_profile_request_valid(self):
         from deeptutor.api.routers.profiles import CreateProfileRequest
@@ -259,9 +259,7 @@ class TestRouterSchemas:
     def test_switch_profile_request_to_guardian_with_pin(self):
         from deeptutor.api.routers.profiles import SwitchProfileRequest
 
-        req = SwitchProfileRequest(
-            profile_id="kid-1", direction="to_guardian", pin="1234"
-        )
+        req = SwitchProfileRequest(profile_id="kid-1", direction="to_guardian", pin="1234")
         assert req.direction == "to_guardian"
         assert req.pin == "1234"
 
@@ -277,6 +275,7 @@ class TestRouterSchemas:
 # ---------------------------------------------------------------------------
 # Route handler logic (direct function call with mocked dependencies)
 # ---------------------------------------------------------------------------
+
 
 class TestCreateProfileHandler:
     def test_create_profile_calls_store(self, temp_data_dirs):

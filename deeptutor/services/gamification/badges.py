@@ -44,6 +44,7 @@ class BadgeRule:
 # Individual badge check functions
 # ---------------------------------------------------------------------------
 
+
 def _check_first_clear(state: ProgressState) -> bool:
     """Awarded when the child clears at least one level (any map)."""
     for mp in state.maps.values():

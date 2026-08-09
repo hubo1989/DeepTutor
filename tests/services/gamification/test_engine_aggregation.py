@@ -28,6 +28,7 @@ from deeptutor.services.gamification.models import (
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _make_level_progress(
     *,
     stars: int = 0,
@@ -56,6 +57,7 @@ def _recent_timestamp(days_ago: int = 0) -> str:
 # compute_weekly_report
 # ---------------------------------------------------------------------------
 
+
 class TestComputeWeeklyReport:
     def test_empty_progress(self):
         """Empty ProgressState should produce zeroed report."""
@@ -78,12 +80,18 @@ class TestComputeWeeklyReport:
                     map_id="map1",
                     levels={
                         "lvl_001": _make_level_progress(
-                            stars=2, best_correct_pct=0.8, attempts=1,
-                            cleared=True, last_played_at=ts,
+                            stars=2,
+                            best_correct_pct=0.8,
+                            attempts=1,
+                            cleared=True,
+                            last_played_at=ts,
                         ),
                         "lvl_002": _make_level_progress(
-                            stars=3, best_correct_pct=1.0, attempts=2,
-                            cleared=True, last_played_at=ts,
+                            stars=3,
+                            best_correct_pct=1.0,
+                            attempts=2,
+                            cleared=True,
+                            last_played_at=ts,
                         ),
                     },
                 ),
@@ -106,8 +114,11 @@ class TestComputeWeeklyReport:
                     map_id="map1",
                     levels={
                         "lvl_001": _make_level_progress(
-                            stars=2, best_correct_pct=0.7, attempts=1,
-                            cleared=True, last_played_at=old_ts,
+                            stars=2,
+                            best_correct_pct=0.7,
+                            attempts=1,
+                            cleared=True,
+                            last_played_at=old_ts,
                         ),
                     },
                 ),
@@ -127,8 +138,11 @@ class TestComputeWeeklyReport:
                     map_id="map1",
                     levels={
                         "lvl_001": _make_level_progress(
-                            stars=1, best_correct_pct=0.6, attempts=1,
-                            cleared=True, last_played_at=old_ts,
+                            stars=1,
+                            best_correct_pct=0.6,
+                            attempts=1,
+                            cleared=True,
+                            last_played_at=old_ts,
                         ),
                     },
                 ),
@@ -148,11 +162,15 @@ class TestComputeWeeklyReport:
                     map_id="map1",
                     levels={
                         "lvl_001": _make_level_progress(
-                            stars=2, best_correct_pct=0.8, attempts=1,
-                            cleared=True, last_played_at=ts,
+                            stars=2,
+                            best_correct_pct=0.8,
+                            attempts=1,
+                            cleared=True,
+                            last_played_at=ts,
                         ),
                         "lvl_002": _make_level_progress(
-                            attempts=0, last_played_at="",
+                            attempts=0,
+                            last_played_at="",
                         ),
                     },
                 ),
@@ -166,6 +184,7 @@ class TestComputeWeeklyReport:
 # ---------------------------------------------------------------------------
 # identify_weak_topics
 # ---------------------------------------------------------------------------
+
 
 class TestIdentifyWeakTopics:
     def test_empty_progress(self):
@@ -183,10 +202,12 @@ class TestIdentifyWeakTopics:
                     map_id="map1",
                     levels={
                         "lvl_001": _make_level_progress(
-                            best_correct_pct=0.4, attempts=2,
+                            best_correct_pct=0.4,
+                            attempts=2,
                         ),
                         "lvl_002": _make_level_progress(
-                            best_correct_pct=0.9, attempts=1,
+                            best_correct_pct=0.9,
+                            attempts=1,
                         ),
                     },
                 ),
@@ -300,6 +321,7 @@ class TestIdentifyWeakTopics:
 # ---------------------------------------------------------------------------
 # recommend_review
 # ---------------------------------------------------------------------------
+
 
 class TestRecommendReview:
     def test_empty_weak_topics(self):

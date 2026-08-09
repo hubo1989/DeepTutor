@@ -33,6 +33,7 @@ from deeptutor.services.gamification.engine import (
 # Base XP
 # ---------------------------------------------------------------------------
 
+
 class TestBaseXP:
     def test_zero_correct(self):
         assert base_xp_for_correct(0) == 0
@@ -50,6 +51,7 @@ class TestBaseXP:
 # ---------------------------------------------------------------------------
 # Diminishing returns (replay)
 # ---------------------------------------------------------------------------
+
 
 class TestDiminishingReturns:
     def test_default_factor_halves(self):
@@ -69,6 +71,7 @@ class TestDiminishingReturns:
 # XP cap
 # ---------------------------------------------------------------------------
 
+
 class TestXPCap:
     def test_under_cap(self):
         assert apply_xp_cap(100, cap=200) == 100
@@ -86,6 +89,7 @@ class TestXPCap:
 # ---------------------------------------------------------------------------
 # Combo bonus
 # ---------------------------------------------------------------------------
+
 
 class TestComboBonus:
     def test_no_combo(self):
@@ -105,6 +109,7 @@ class TestComboBonus:
 # Boss bonus
 # ---------------------------------------------------------------------------
 
+
 class TestBossBonus:
     def test_normal_level(self):
         assert compute_boss_bonus(100, is_boss=False) == 100
@@ -116,6 +121,7 @@ class TestBossBonus:
 # ---------------------------------------------------------------------------
 # Full award_xp
 # ---------------------------------------------------------------------------
+
 
 class TestAwardXP:
     def test_zero_correct_returns_zero(self):
@@ -156,9 +162,7 @@ class TestAwardXP:
 
     def test_replay_with_combo_and_boss(self):
         # 3 correct × 10 × 2.0 × 1.5 × 0.5 = 45 XP
-        result = award_xp(
-            current_xp=0, correct_count=3, combo=3, is_boss=True, is_replay=True
-        )
+        result = award_xp(current_xp=0, correct_count=3, combo=3, is_boss=True, is_replay=True)
         assert result == 45
 
     def test_daily_cap_truncates_xp(self):
@@ -208,6 +212,7 @@ class TestAwardXP:
 # Star grading
 # ---------------------------------------------------------------------------
 
+
 class TestGradeStars:
     def test_zero_pct(self):
         assert grade_stars(0.0) == 0
@@ -238,6 +243,7 @@ class TestGradeStars:
 # Unlock logic
 # ---------------------------------------------------------------------------
 
+
 class TestCheckUnlock:
     def test_first_level_normal(self):
         # No previous level result (treat as always unlocked)
@@ -250,13 +256,21 @@ class TestCheckUnlock:
         assert check_unlock(prev_level_result=0.59, is_boss_level=False, all_prev_stars=[]) is False
 
     def test_boss_unlock_all_prev_starred(self):
-        assert check_unlock(prev_level_result=0.90, is_boss_level=True, all_prev_stars=[1, 2, 3]) is True
+        assert (
+            check_unlock(prev_level_result=0.90, is_boss_level=True, all_prev_stars=[1, 2, 3])
+            is True
+        )
 
     def test_boss_unlock_missing_star(self):
-        assert check_unlock(prev_level_result=0.90, is_boss_level=True, all_prev_stars=[1, 0, 3]) is False
+        assert (
+            check_unlock(prev_level_result=0.90, is_boss_level=True, all_prev_stars=[1, 0, 3])
+            is False
+        )
 
     def test_boss_unlock_all_zero(self):
-        assert check_unlock(prev_level_result=0.90, is_boss_level=True, all_prev_stars=[0, 0]) is False
+        assert (
+            check_unlock(prev_level_result=0.90, is_boss_level=True, all_prev_stars=[0, 0]) is False
+        )
 
     def test_boss_unlock_empty_prev(self):
         assert check_unlock(prev_level_result=1.0, is_boss_level=True, all_prev_stars=[]) is True
@@ -268,6 +282,7 @@ class TestCheckUnlock:
 # ---------------------------------------------------------------------------
 # Streak computation
 # ---------------------------------------------------------------------------
+
 
 class TestUpdateStreak:
     def test_empty_history_first_day(self):
@@ -316,6 +331,7 @@ class TestUpdateStreak:
 # Level computation
 # ---------------------------------------------------------------------------
 
+
 class TestComputeLevel:
     def test_zero_xp(self):
         assert compute_level(0) == 1
@@ -355,6 +371,7 @@ class TestComputeLevel:
 # ---------------------------------------------------------------------------
 # Combo interruption behavior
 # ---------------------------------------------------------------------------
+
 
 class TestComboInterruption:
     def test_combo_reset_on_wrong_answer(self):

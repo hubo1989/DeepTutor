@@ -20,6 +20,7 @@ from deeptutor.services.gamification.models import Question
 # validate_schema
 # ---------------------------------------------------------------------------
 
+
 class TestValidateSchema:
     def test_valid_single_choice(self):
         raw = {
@@ -117,6 +118,7 @@ class TestValidateSchema:
 # check_answerability
 # ---------------------------------------------------------------------------
 
+
 class TestCheckAnswerability:
     def test_answerable_single_choice(self):
         q = Question(
@@ -161,6 +163,7 @@ class TestCheckAnswerability:
 # ForgingService — template mode (no LLM)
 # ---------------------------------------------------------------------------
 
+
 class TestForgingTemplateMode:
     @pytest.mark.asyncio
     async def test_generate_template_questions(self):
@@ -195,13 +198,16 @@ class TestForgingTemplateMode:
     @pytest.mark.asyncio
     async def test_template_fallback_on_llm_failure(self):
         """When LLM raises an exception, template questions should be generated."""
+
         class FailingLLM:
             async def complete(self, prompt, **kwargs):
                 raise RuntimeError("LLM unavailable")
 
         service = ForgingService()
-        chunks = ["Photosynthesis is how plants make food from sunlight. "
-                   "Chlorophyll gives leaves their green color."]
+        chunks = [
+            "Photosynthesis is how plants make food from sunlight. "
+            "Chlorophyll gives leaves their green color."
+        ]
         questions = await service.generate_questions(
             chunks=chunks,
             age_band="7-9",
@@ -230,19 +236,20 @@ class TestForgingTemplateMode:
 # ForgingService — LLM mode
 # ---------------------------------------------------------------------------
 
+
 class TestForgingLLMMode:
     @pytest.mark.asyncio
     async def test_generate_with_mock_llm(self):
         class MockLLM:
             async def complete(self, prompt, **kwargs):
                 return (
-                    '```json\n'
+                    "```json\n"
                     '{"questions": [\n'
                     '  {"question_type": "single_choice", "question_text": "What is 2+2?", '
                     '   "options": ["3", "4", "5"], "correct_answer": "4", '
                     '   "explanation": "2+2 equals 4.", "hints": ["Think about counting."]}\n'
-                    ']}\n'
-                    '```'
+                    "]}\n"
+                    "```"
                 )
 
         service = ForgingService()

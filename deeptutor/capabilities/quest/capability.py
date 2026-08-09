@@ -75,7 +75,9 @@ class KidQuestCapability(BaseCapability):
             context: The unified request context with child profile info.
             stream: The stream bus to emit events to.
         """
-        profile_id = context.kid_profile_id or str(context.metadata.get("kid_profile_id", "default-kid"))
+        profile_id = context.kid_profile_id or str(
+            context.metadata.get("kid_profile_id", "default-kid")
+        )
         age_band = context.kid_age_band or str(context.metadata.get("kid_age_band", "7-9"))
         language = context.language or "zh"
 
@@ -93,19 +95,24 @@ class KidQuestCapability(BaseCapability):
             )
             if not chunks:
                 # Use default content if no source material
-                chunks = [
-                    "恐龙是生活在很久很久以前的动物。它们有的很大，有的很小。"
-                    "有些恐龙吃植物，有些吃肉。三角龙是一种头上长着三个角的恐龙。",
-                    "恐龙蛋是恐龙宝宝出生的地方。恐龙妈妈会找安全的地方下蛋。",
-                ] if language == "zh" else [
-                    "Dinosaurs lived a very long time ago. Some were big and some were small. "
-                    "Some dinosaurs ate plants and some ate meat. Triceratops had three horns.",
-                    "Dinosaur eggs are where baby dinosaurs are born. "
-                    "Dinosaur mothers find safe places to lay eggs.",
-                ]
+                chunks = (
+                    [
+                        "恐龙是生活在很久很久以前的动物。它们有的很大，有的很小。"
+                        "有些恐龙吃植物，有些吃肉。三角龙是一种头上长着三个角的恐龙。",
+                        "恐龙蛋是恐龙宝宝出生的地方。恐龙妈妈会找安全的地方下蛋。",
+                    ]
+                    if language == "zh"
+                    else [
+                        "Dinosaurs lived a very long time ago. Some were big and some were small. "
+                        "Some dinosaurs ate plants and some ate meat. Triceratops had three horns.",
+                        "Dinosaur eggs are where baby dinosaurs are born. "
+                        "Dinosaur mothers find safe places to lay eggs.",
+                    ]
+                )
 
             await stream.content(
-                text=f"📚 已加载学习材料（{len(chunks)} 段）" if language == "zh"
+                text=f"📚 已加载学习材料（{len(chunks)} 段）"
+                if language == "zh"
                 else f"📚 Loaded {len(chunks)} reading passages",
                 source=_SOURCE,
                 stage="sourcing",
@@ -113,9 +120,7 @@ class KidQuestCapability(BaseCapability):
 
         # ---- Stage 2: Forging ----
         async with stream.stage("forging", source=_SOURCE):
-            questions = await self._forging_stage(
-                chunks, age_band, stream, llm_client
-            )
+            questions = await self._forging_stage(chunks, age_band, stream, llm_client)
             if not questions:
                 await stream.error(
                     message="无法生成题目" if language == "zh" else "Failed to generate questions",
@@ -125,7 +130,8 @@ class KidQuestCapability(BaseCapability):
                 return
 
             await stream.content(
-                text=f"⚔️ 已锻造 {len(questions)} 道题目！" if language == "zh"
+                text=f"⚔️ 已锻造 {len(questions)} 道题目！"
+                if language == "zh"
                 else f"⚔️ Forged {len(questions)} questions!",
                 source=_SOURCE,
                 stage="forging",
@@ -134,7 +140,9 @@ class KidQuestCapability(BaseCapability):
         # ---- Stage 3: Questing ----
         async with stream.stage("questing", source=_SOURCE):
             hint_service = self._hints_factory(safety_filter=self._safety, language=language)
-            map_key = context.metadata.get("map_key", f"quest:{source_type}:{source_id or theme_id}")
+            map_key = context.metadata.get(
+                "map_key", f"quest:{source_type}:{source_id or theme_id}"
+            )
 
             result = await run_quest_round(
                 questions=questions,
@@ -271,7 +279,9 @@ class KidQuestCapability(BaseCapability):
             A list of validated :class:`Question` objects.
         """
         # Check cache
-        content_hash = compute_content_hash(chunks, age_band, AGE_BAND_QUESTION_MATRIX.get(age_band, []))
+        content_hash = compute_content_hash(
+            chunks, age_band, AGE_BAND_QUESTION_MATRIX.get(age_band, [])
+        )
         cached_map = get_cached(content_hash)
         if cached_map is not None and cached_map.levels:
             # Return questions from the first cached level

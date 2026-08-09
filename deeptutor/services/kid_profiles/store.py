@@ -58,7 +58,9 @@ def _profile_to_dict(profile: Any) -> dict[str, Any]:
             "consent": {
                 "agreed": consent.get("agreed", False) if isinstance(consent, dict) else False,
                 "agreed_at": consent.get("agreed_at", "") if isinstance(consent, dict) else "",
-                "guardian_user_id": consent.get("guardian_user_id", "") if isinstance(consent, dict) else "",
+                "guardian_user_id": consent.get("guardian_user_id", "")
+                if isinstance(consent, dict)
+                else "",
             },
             "settings": profile.get("settings", {}),
         }
@@ -99,9 +101,13 @@ def _dict_to_profile(data: dict[str, Any]) -> Any:
         role=data.get("role", "kid"),
         created_at=data.get("created_at", ""),
         consent=GuardianConsent(
-            agreed=bool(consent_data.get("agreed", False)) if isinstance(consent_data, dict) else False,
+            agreed=bool(consent_data.get("agreed", False))
+            if isinstance(consent_data, dict)
+            else False,
             agreed_at=consent_data.get("agreed_at", "") if isinstance(consent_data, dict) else "",
-            guardian_user_id=consent_data.get("guardian_user_id", "") if isinstance(consent_data, dict) else "",
+            guardian_user_id=consent_data.get("guardian_user_id", "")
+            if isinstance(consent_data, dict)
+            else "",
         ),
         settings=dict(data.get("settings", {})),
     )
@@ -110,6 +116,7 @@ def _dict_to_profile(data: dict[str, Any]) -> Any:
 # ---------------------------------------------------------------------------
 # Public CRUD API
 # ---------------------------------------------------------------------------
+
 
 def load_all(guardian_user_id: str) -> list[Any]:
     """

@@ -17,12 +17,8 @@ def temp_metrics_file(tmp_path, monkeypatch):
     metrics_dir.mkdir(exist_ok=True)
     metrics_file = metrics_dir / "metrics.jsonl"
 
-    monkeypatch.setattr(
-        "deeptutor.services.gamification.metrics._METRICS_DIR", metrics_dir
-    )
-    monkeypatch.setattr(
-        "deeptutor.services.gamification.metrics._METRICS_FILE", metrics_file
-    )
+    monkeypatch.setattr("deeptutor.services.gamification.metrics._METRICS_DIR", metrics_dir)
+    monkeypatch.setattr("deeptutor.services.gamification.metrics._METRICS_FILE", metrics_file)
     return metrics_file
 
 

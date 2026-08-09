@@ -43,7 +43,9 @@ _DEFAULT_ENCOURAGE_EN: list[str] = [
 ]
 
 _DEFAULT_EXPLANATION_ZH: str = "这道题的正确答案已经在阅读材料中提到啦，再仔细看看吧！📖"
-_DEFAULT_EXPLANATION_EN: str = "The correct answer is mentioned in your reading material. Take another look! 📖"
+_DEFAULT_EXPLANATION_EN: str = (
+    "The correct answer is mentioned in your reading material. Take another look! 📖"
+)
 
 
 class HintService:

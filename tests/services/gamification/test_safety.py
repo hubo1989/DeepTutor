@@ -13,6 +13,7 @@ from deeptutor.services.gamification.safety import WORDLIST, FilterResult, Safet
 # Wordlist filter
 # ---------------------------------------------------------------------------
 
+
 class TestWordlistFilter:
     def test_clean_text_passes(self):
         result = SafetyFilter.filter("The quick brown fox jumps over the lazy dog.")
@@ -75,6 +76,7 @@ class TestWordlistFilter:
 # check_question
 # ---------------------------------------------------------------------------
 
+
 class TestCheckQuestion:
     def test_clean_question_passes(self):
         q = Question(
@@ -123,6 +125,7 @@ class TestCheckQuestion:
 # check_explanation
 # ---------------------------------------------------------------------------
 
+
 class TestCheckExplanation:
     def test_clean_explanation_passes(self):
         result = SafetyFilter.check_explanation("Plants need sunlight to grow.", "7-9")
@@ -136,6 +139,7 @@ class TestCheckExplanation:
 # ---------------------------------------------------------------------------
 # LLM review (optional)
 # ---------------------------------------------------------------------------
+
 
 class TestLLMReview:
     @pytest.mark.asyncio
@@ -155,7 +159,9 @@ class TestLLMReview:
             async def complete(self, prompt, **kwargs):
                 return "SAFE"
 
-        result = await SafetyFilter.llm_review("A nice story about friendship.", "7-9", llm_client=SafeLLM())
+        result = await SafetyFilter.llm_review(
+            "A nice story about friendship.", "7-9", llm_client=SafeLLM()
+        )
         assert result.passed is True
 
     @pytest.mark.asyncio
@@ -164,7 +170,9 @@ class TestLLMReview:
             async def complete(self, prompt, **kwargs):
                 return "UNSAFE: Contains scary imagery"
 
-        result = await SafetyFilter.llm_review("A ghost story for kids.", "7-9", llm_client=UnsafeLLM())
+        result = await SafetyFilter.llm_review(
+            "A ghost story for kids.", "7-9", llm_client=UnsafeLLM()
+        )
         assert result.passed is False
         assert "LLM" in result.reason or "scary" in result.reason.lower()
 
@@ -182,21 +190,25 @@ class TestLLMReview:
 # Red Team Tests — adversarial content injection
 # ---------------------------------------------------------------------------
 
+
 class TestRedTeamViolence:
     """Red team: violence-related content injection attempts."""
 
-    @pytest.mark.parametrize("malicious_text", [
-        "杀人",
-        "打架斗殴",
-        "武器库",
-        "枪杀事件",
-        "炸弹爆炸",
-        "用刀刺杀",
-        "How to kill someone",
-        "Buy weapons online",
-        "He stabbed the victim",
-        "Gunfight at the corral",
-    ])
+    @pytest.mark.parametrize(
+        "malicious_text",
+        [
+            "杀人",
+            "打架斗殴",
+            "武器库",
+            "枪杀事件",
+            "炸弹爆炸",
+            "用刀刺杀",
+            "How to kill someone",
+            "Buy weapons online",
+            "He stabbed the victim",
+            "Gunfight at the corral",
+        ],
+    )
     def test_violence_blocked(self, malicious_text):
         """All violence-related content should be blocked."""
         result = SafetyFilter.filter(malicious_text)
@@ -205,10 +217,33 @@ class TestRedTeamViolence:
     def test_violence_interception_rate(self):
         """Violence category interception rate should be >= 98%."""
         violence_samples = [
-            "杀人", "杀", "杀戮", "谋杀", "流血", "酷刑", "刺杀", "枪杀",
-            "炸弹", "爆炸", "武器", "子弹", "袭击", "强暴",
-            "kill", "murder", "blood", "gore", "torture", "stab", "shoot",
-            "gun", "weapon", "bullet", "bomb", "explosive", "assault",
+            "杀人",
+            "杀",
+            "杀戮",
+            "谋杀",
+            "流血",
+            "酷刑",
+            "刺杀",
+            "枪杀",
+            "炸弹",
+            "爆炸",
+            "武器",
+            "子弹",
+            "袭击",
+            "强暴",
+            "kill",
+            "murder",
+            "blood",
+            "gore",
+            "torture",
+            "stab",
+            "shoot",
+            "gun",
+            "weapon",
+            "bullet",
+            "bomb",
+            "explosive",
+            "assault",
             "He wants to kill the dragon.",
             "The assassin stabbed his target.",
             "She bought a gun for protection.",
@@ -223,18 +258,21 @@ class TestRedTeamViolence:
 class TestRedTeamSexual:
     """Red team: sexual/adult content injection attempts."""
 
-    @pytest.mark.parametrize("malicious_text", [
-        "色情内容",
-        "裸体照片",
-        "性爱场景",
-        "成人内容",
-        "淫秽物品",
-        "porn video",
-        "nude pictures",
-        "adult content warning",
-        "erotic story",
-        "This is sexual content",
-    ])
+    @pytest.mark.parametrize(
+        "malicious_text",
+        [
+            "色情内容",
+            "裸体照片",
+            "性爱场景",
+            "成人内容",
+            "淫秽物品",
+            "porn video",
+            "nude pictures",
+            "adult content warning",
+            "erotic story",
+            "This is sexual content",
+        ],
+    )
     def test_sexual_blocked(self, malicious_text):
         """All sexual content should be blocked."""
         result = SafetyFilter.filter(malicious_text)
@@ -243,8 +281,17 @@ class TestRedTeamSexual:
     def test_sexual_interception_rate(self):
         """Sexual category interception rate should be >= 98%."""
         sexual_samples = [
-            "色情", "裸体", "性爱", "成人内容", "淫秽",
-            "sex", "porn", "nude", "naked", "erotic", "adult content",
+            "色情",
+            "裸体",
+            "性爱",
+            "成人内容",
+            "淫秽",
+            "sex",
+            "porn",
+            "nude",
+            "naked",
+            "erotic",
+            "adult content",
             "The website contains porn.",
             "She posed nude for the magazine.",
             "Adult content is restricted.",
@@ -257,18 +304,21 @@ class TestRedTeamSexual:
 class TestRedTeamSelfHarm:
     """Red team: self-harm content injection attempts."""
 
-    @pytest.mark.parametrize("malicious_text", [
-        "自杀",
-        "自残行为",
-        "割腕",
-        "轻生念头",
-        "想要自杀",
-        "suicide methods",
-        "self-harm guide",
-        "kill myself",
-        "end my life",
-        "How to self-harm safely",
-    ])
+    @pytest.mark.parametrize(
+        "malicious_text",
+        [
+            "自杀",
+            "自残行为",
+            "割腕",
+            "轻生念头",
+            "想要自杀",
+            "suicide methods",
+            "self-harm guide",
+            "kill myself",
+            "end my life",
+            "How to self-harm safely",
+        ],
+    )
     def test_self_harm_blocked(self, malicious_text):
         """All self-harm content should be blocked."""
         result = SafetyFilter.filter(malicious_text)
@@ -277,8 +327,15 @@ class TestRedTeamSelfHarm:
     def test_self_harm_interception_rate(self):
         """Self-harm category interception rate should be >= 98%."""
         self_harm_samples = [
-            "自杀", "自残", "割腕", "轻生",
-            "suicide", "self-harm", "cut myself", "kill myself", "end my life",
+            "自杀",
+            "自残",
+            "割腕",
+            "轻生",
+            "suicide",
+            "self-harm",
+            "cut myself",
+            "kill myself",
+            "end my life",
             "I want to kill myself.",
             "She attempted suicide last night.",
             "Self-harm is a serious issue.",
@@ -292,18 +349,21 @@ class TestRedTeamSelfHarm:
 class TestRedTeamDrugs:
     """Red team: drug-related content injection attempts."""
 
-    @pytest.mark.parametrize("malicious_text", [
-        "毒品交易",
-        "大麻合法化",
-        "吸毒成瘾",
-        "冰毒制作",
-        "海洛因",
-        "buy cocaine",
-        "marijuana dealers",
-        "heroin addiction",
-        "meth recipe",
-        "Where to buy drugs",
-    ])
+    @pytest.mark.parametrize(
+        "malicious_text",
+        [
+            "毒品交易",
+            "大麻合法化",
+            "吸毒成瘾",
+            "冰毒制作",
+            "海洛因",
+            "buy cocaine",
+            "marijuana dealers",
+            "heroin addiction",
+            "meth recipe",
+            "Where to buy drugs",
+        ],
+    )
     def test_drugs_blocked(self, malicious_text):
         """All drug-related content should be blocked."""
         result = SafetyFilter.filter(malicious_text)
@@ -312,8 +372,18 @@ class TestRedTeamDrugs:
     def test_drugs_interception_rate(self):
         """Drugs category interception rate should be >= 98%."""
         drug_samples = [
-            "吸毒", "毒品", "可卡因", "海洛因", "大麻", "冰毒",
-            "drug", "cocaine", "heroin", "marijuana", "weed", "meth",
+            "吸毒",
+            "毒品",
+            "可卡因",
+            "海洛因",
+            "大麻",
+            "冰毒",
+            "drug",
+            "cocaine",
+            "heroin",
+            "marijuana",
+            "weed",
+            "meth",
             "He was arrested for cocaine possession.",
             "The marijuana was confiscated.",
             "Drug dealers operate in the area.",
@@ -329,9 +399,7 @@ class TestRedTeamMixedInjection:
 
     def test_violence_in_normal_context(self):
         """Violence term embedded in educational text should be caught."""
-        result = SafetyFilter.filter(
-            "在自然界中，有些动物会杀人其他动物来获取食物。"
-        )
+        result = SafetyFilter.filter("在自然界中，有些动物会杀人其他动物来获取食物。")
         assert result.passed is False
 
     def test_drugs_in_quiz_context(self):
@@ -343,16 +411,12 @@ class TestRedTeamMixedInjection:
 
     def test_self_harm_in_explanation(self):
         """Self-harm term in an explanation should be caught."""
-        result = SafetyFilter.filter(
-            "When feeling sad, never consider suicide. Talk to someone."
-        )
+        result = SafetyFilter.filter("When feeling sad, never consider suicide. Talk to someone.")
         assert result.passed is False
 
     def test_multiple_categories_in_one_text(self):
         """Multiple categories of harmful content in one text should all be flagged."""
-        result = SafetyFilter.filter(
-            "The movie had drugs, weapons, and sexual content."
-        )
+        result = SafetyFilter.filter("The movie had drugs, weapons, and sexual content.")
         assert result.passed is False
         assert len(result.flagged_terms) >= 3
 
@@ -388,18 +452,51 @@ class TestRedTeamOverallInterception:
         """The combined interception rate across all categories should be >= 98%."""
         all_malicious = [
             # Violence
-            "杀人", "打架", "武器", "枪杀", "炸弹", "kill", "murder", "stab",
-            "gun", "weapon", "bomb",
+            "杀人",
+            "打架",
+            "武器",
+            "枪杀",
+            "炸弹",
+            "kill",
+            "murder",
+            "stab",
+            "gun",
+            "weapon",
+            "bomb",
             # Sexual
-            "色情", "裸体", "性爱", "成人内容", "porn", "nude", "sex",
+            "色情",
+            "裸体",
+            "性爱",
+            "成人内容",
+            "porn",
+            "nude",
+            "sex",
             # Self-harm
-            "自杀", "自残", "割腕", "轻生", "suicide", "self-harm", "kill myself",
+            "自杀",
+            "自残",
+            "割腕",
+            "轻生",
+            "suicide",
+            "self-harm",
+            "kill myself",
             # Drugs
-            "毒品", "大麻", "吸毒", "cocaine", "heroin", "marijuana", "meth",
+            "毒品",
+            "大麻",
+            "吸毒",
+            "cocaine",
+            "heroin",
+            "marijuana",
+            "meth",
             # Profanity
-            "fuck", "shit", "damn", "bitch",
+            "fuck",
+            "shit",
+            "damn",
+            "bitch",
             # Other
-            "赌博", "casino", "alcohol", "drunk",
+            "赌博",
+            "casino",
+            "alcohol",
+            "drunk",
         ]
         blocked = sum(1 for t in all_malicious if not SafetyFilter.filter(t).passed)
         rate = blocked / len(all_malicious)

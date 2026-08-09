@@ -89,6 +89,7 @@ def check_capability(user: CurrentUser, capability: str) -> bool:
 # FastAPI Dependency functions
 # ---------------------------------------------------------------------------
 
+
 def require_guardian() -> CurrentUser:
     """
     FastAPI dependency: ensure the current user is a guardian (or admin).

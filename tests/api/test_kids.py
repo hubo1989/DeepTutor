@@ -19,17 +19,13 @@ import pytest
 def temp_data_dirs(tmp_path, monkeypatch):
     """Redirect all data directories to temp paths."""
     profiles_path = tmp_path / "profiles.json"
-    monkeypatch.setattr(
-        "deeptutor.services.kid_profiles.store._PROFILES_PATH", profiles_path
-    )
+    monkeypatch.setattr("deeptutor.services.kid_profiles.store._PROFILES_PATH", profiles_path)
     pin_dir = tmp_path / "pins"
     pin_dir.mkdir(exist_ok=True)
     monkeypatch.setattr("deeptutor.services.kid_profiles.pin._PIN_DIR", pin_dir)
     game_dir = tmp_path / "gamification"
     game_dir.mkdir(exist_ok=True)
-    monkeypatch.setattr(
-        "deeptutor.services.gamification.store._GAMIFICATION_DIR", game_dir
-    )
+    monkeypatch.setattr("deeptutor.services.gamification.store._GAMIFICATION_DIR", game_dir)
     # Also redirect public_kb root for theme tests
     public_kb_root = tmp_path / "public_kb"
     public_kb_root.mkdir(exist_ok=True)
@@ -103,6 +99,7 @@ levels:
 # Public Themes API
 # ---------------------------------------------------------------------------
 
+
 class TestPublicThemesAPI:
     """Tests for GET /kids/public-themes."""
 
@@ -146,6 +143,7 @@ class TestPublicThemesAPI:
 # ---------------------------------------------------------------------------
 # Map Generation API
 # ---------------------------------------------------------------------------
+
 
 class TestGenerateMapAPI:
     """Tests for POST /kids/maps."""
@@ -198,6 +196,7 @@ class TestGenerateMapAPI:
 # Maps List API
 # ---------------------------------------------------------------------------
 
+
 class TestMapsListAPI:
     """Tests for GET /kids/maps."""
 
@@ -220,6 +219,7 @@ class TestMapsListAPI:
 # ---------------------------------------------------------------------------
 # Progress API
 # ---------------------------------------------------------------------------
+
 
 class TestProgressAPI:
     """Tests for GET /kids/progress/{profile_id}."""
@@ -280,6 +280,7 @@ class TestProgressAPI:
 # Router schema validation
 # ---------------------------------------------------------------------------
 
+
 class TestRouterSchemas:
     """Verify the Pydantic request/response models in the kids router."""
 
@@ -305,9 +306,7 @@ class TestRouterSchemas:
         """GenerateMapRequest for personal KB source."""
         from deeptutor.api.routers.kids import GenerateMapRequest
 
-        req = GenerateMapRequest(
-            source="personal", kb_name="my-kb", age_band="10-12"
-        )
+        req = GenerateMapRequest(source="personal", kb_name="my-kb", age_band="10-12")
         assert req.source == "personal"
         assert req.kb_name == "my-kb"
 
@@ -400,6 +399,7 @@ class TestRouterSchemas:
 # ---------------------------------------------------------------------------
 # Engine consistency checks
 # ---------------------------------------------------------------------------
+
 
 class TestEngineConsistency:
     """Verify engine functions used by the API produce expected results."""

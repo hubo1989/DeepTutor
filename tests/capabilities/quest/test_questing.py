@@ -23,6 +23,7 @@ from deeptutor.services.gamification.models import Question
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 class MockStreamBus(StreamBus):
     """A StreamBus subclass that auto-feeds pre-queued answers.
 
@@ -52,6 +53,7 @@ class MockStreamBus(StreamBus):
 def temp_gamification_dir(tmp_path, monkeypatch):
     """Redirect gamification data to a temp path."""
     import deeptutor.services.gamification.store as store_mod
+
     gamedir = tmp_path / "gamification"
     gamedir.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(store_mod, "_GAMIFICATION_DIR", gamedir)
@@ -85,6 +87,7 @@ def simple_questions():
 # ---------------------------------------------------------------------------
 # Basic quest round
 # ---------------------------------------------------------------------------
+
 
 class TestQuestRound:
     @pytest.mark.asyncio
@@ -167,6 +170,7 @@ class TestQuestRound:
 # Event emission
 # ---------------------------------------------------------------------------
 
+
 class TestEventEmission:
     @pytest.mark.asyncio
     async def test_item_presented_emitted(self, temp_gamification_dir, simple_questions):
@@ -181,9 +185,9 @@ class TestEventEmission:
         )
         # Check item_presented events exist
         presented = [
-            e for e in bus.events
-            if e.type == StreamEventType.CONTENT
-            and e.metadata.get("sub_type") == "item_presented"
+            e
+            for e in bus.events
+            if e.type == StreamEventType.CONTENT and e.metadata.get("sub_type") == "item_presented"
         ]
         assert len(presented) == 2
 
@@ -199,9 +203,9 @@ class TestEventEmission:
             age_band="7-9",
         )
         judged = [
-            e for e in bus.events
-            if e.type == StreamEventType.CONTENT
-            and e.metadata.get("sub_type") == "item_judged"
+            e
+            for e in bus.events
+            if e.type == StreamEventType.CONTENT and e.metadata.get("sub_type") == "item_judged"
         ]
         assert len(judged) >= 2
         assert judged[0].metadata["is_correct"] is True
@@ -218,9 +222,9 @@ class TestEventEmission:
             age_band="7-9",
         )
         cleared = [
-            e for e in bus.events
-            if e.type == StreamEventType.RESULT
-            and e.metadata.get("sub_type") == "level_cleared"
+            e
+            for e in bus.events
+            if e.type == StreamEventType.RESULT and e.metadata.get("sub_type") == "level_cleared"
         ]
         assert len(cleared) == 1
         assert cleared[0].metadata["stars"] == 3
@@ -238,14 +242,13 @@ class TestEventEmission:
             map_key="test_map",
             age_band="7-9",
         )
-        hints = [
-            e for e in bus.events
-            if e.metadata.get("sub_type") == "hint"
-        ]
+        hints = [e for e in bus.events if e.metadata.get("sub_type") == "hint"]
         assert len(hints) >= 1  # at least one hint emitted
 
     @pytest.mark.asyncio
-    async def test_explanation_emitted_after_exhausting_attempts(self, temp_gamification_dir, simple_questions):
+    async def test_explanation_emitted_after_exhausting_attempts(
+        self, temp_gamification_dir, simple_questions
+    ):
         # q1 all wrong → explanation shown
         bus = MockStreamBus(answer_queue=["3", "3", "3", "true"])
         await run_quest_round(
@@ -256,16 +259,14 @@ class TestEventEmission:
             map_key="test_map",
             age_band="7-9",
         )
-        explanations = [
-            e for e in bus.events
-            if e.metadata.get("sub_type") == "explanation"
-        ]
+        explanations = [e for e in bus.events if e.metadata.get("sub_type") == "explanation"]
         assert len(explanations) >= 1
 
 
 # ---------------------------------------------------------------------------
 # Gamification state update
 # ---------------------------------------------------------------------------
+
 
 class TestStateUpdate:
     @pytest.mark.asyncio
@@ -280,6 +281,7 @@ class TestStateUpdate:
             age_band="7-9",
         )
         from deeptutor.services.gamification.store import load
+
         state = load("test-state-1")
         assert state is not None
         assert state.total_xp > 0  # earned some XP
@@ -297,6 +299,7 @@ class TestStateUpdate:
             age_band="7-9",
         )
         from deeptutor.services.gamification.store import load
+
         state = load("test-state-2")
         assert state is not None
         assert state.streak_days >= 1
@@ -313,6 +316,7 @@ class TestStateUpdate:
             age_band="7-9",
         )
         from deeptutor.services.gamification.store import load
+
         state = load("test-state-3")
         assert state is not None
         assert "test_map" in state.maps
@@ -333,6 +337,7 @@ class TestStateUpdate:
             age_band="7-9",
         )
         from deeptutor.services.gamification.store import load
+
         state = load("test-state-4")
         assert state is not None
         # First clear badge should be earned (60%+ → cleared)

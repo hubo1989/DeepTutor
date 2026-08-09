@@ -116,6 +116,7 @@ MAX_REGENERATION_ATTEMPTS: int = 2
 # Validation
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class ValidationResult:
     """Result of validating a raw question dictionary.
@@ -178,11 +179,16 @@ def validate_schema(raw: dict[str, Any]) -> ValidationResult:
     # specific validation per type
     if q_type in ("single_choice", "image_choice"):
         if correct_answer and options and correct_answer not in options:
-            errors.append(
-                f"correct_answer {correct_answer!r} not in options {options}"
-            )
+            errors.append(f"correct_answer {correct_answer!r} not in options {options}")
     elif q_type == "true_false":
-        if correct_answer and correct_answer.lower() not in ("true", "false", "对", "错", "正确", "错误"):
+        if correct_answer and correct_answer.lower() not in (
+            "true",
+            "false",
+            "对",
+            "错",
+            "正确",
+            "错误",
+        ):
             errors.append(f"true_false correct_answer must be true/false, got {correct_answer!r}")
     elif q_type == "fill_blank":
         acceptable = raw.get("acceptable_answers", [])
@@ -215,11 +221,14 @@ def validate_schema(raw: dict[str, Any]) -> ValidationResult:
         acceptable_answers=acceptable,
         correct_answer_ids=[str(i) for i in raw.get("correct_answer_ids", [])],
         matching_pairs=[
-            [str(p[0]), str(p[1])] for p in raw.get("matching_pairs", [])
+            [str(p[0]), str(p[1])]
+            for p in raw.get("matching_pairs", [])
             if isinstance(p, (list, tuple)) and len(p) >= 2
         ],
         ordering_sequence=[str(s) for s in raw.get("ordering_sequence", [])],
-        sub_questions=raw.get("sub_questions", []) if isinstance(raw.get("sub_questions"), list) else [],
+        sub_questions=raw.get("sub_questions", [])
+        if isinstance(raw.get("sub_questions"), list)
+        else [],
     )
 
     return ValidationResult(valid=True, errors=[], question=question)
@@ -268,6 +277,7 @@ def check_answerability(q: Question) -> bool:
 # ForgingService
 # ---------------------------------------------------------------------------
 
+
 class ForgingService:
     """Question generation service.
 
@@ -310,9 +320,7 @@ class ForgingService:
             q_types = list(supported)
 
         if llm_client is not None:
-            questions = await self._generate_with_llm(
-                chunks, age_band, q_types, llm_client, count
-            )
+            questions = await self._generate_with_llm(chunks, age_band, q_types, llm_client, count)
         else:
             questions = self._generate_template(chunks, age_band, q_types, count)
 
@@ -467,7 +475,7 @@ class ForgingService:
             q_type = q_types[generated % len(q_types)] if q_types else "single_choice"
 
             if q_type == "true_false":
-                is_true = (generated % 2 == 0)
+                is_true = generated % 2 == 0
                 q = Question(
                     question_id=f"tpl_tf_{generated}",
                     text=f"True or False: The word '{correct_word}' is related to what we just learned.",
@@ -481,7 +489,7 @@ class ForgingService:
                 questions.append(q)
                 generated += 1
             elif q_type in ("single_choice", "image_choice"):
-                opts = [correct_word] + distractors[:max_opts - 1]
+                opts = [correct_word] + distractors[: max_opts - 1]
                 # Deduplicate while preserving order
                 seen: set[str] = set()
                 unique_opts: list[str] = []
@@ -507,7 +515,7 @@ class ForgingService:
                 generated += 1
             else:
                 # For other types, still make a single_choice
-                opts = [correct_word] + distractors[:max_opts - 1]
+                opts = [correct_word] + distractors[: max_opts - 1]
                 seen2: set[str] = set()
                 unique_opts2: list[str] = []
                 for o in opts:
@@ -553,10 +561,40 @@ class ForgingService:
 
         # Filter common stop words
         stop_words = {
-            "the", "and", "for", "are", "but", "not", "you", "all", "can",
-            "her", "was", "one", "our", "out", "day", "had", "has", "his",
-            "how", "its", "may", "new", "now", "old", "see", "way", "who",
-            "did", "get", "let", "say", "she", "too", "use",
+            "the",
+            "and",
+            "for",
+            "are",
+            "but",
+            "not",
+            "you",
+            "all",
+            "can",
+            "her",
+            "was",
+            "one",
+            "our",
+            "out",
+            "day",
+            "had",
+            "has",
+            "his",
+            "how",
+            "its",
+            "may",
+            "new",
+            "now",
+            "old",
+            "see",
+            "way",
+            "who",
+            "did",
+            "get",
+            "let",
+            "say",
+            "she",
+            "too",
+            "use",
         }
         filtered = [
             (word, freq)

@@ -52,6 +52,7 @@ def _sanitize_profile_id(profile_id: str) -> str:
 # Serialization (ProgressState ↔ dict)
 # ---------------------------------------------------------------------------
 
+
 def state_to_dict(state: ProgressState) -> dict[str, Any]:
     """Serialize a ProgressState to a JSON-safe dictionary."""
     return {
@@ -135,6 +136,7 @@ def dict_to_state(data: dict[str, Any]) -> ProgressState:
 # Migration framework
 # ---------------------------------------------------------------------------
 
+
 def migrate(data: dict[str, Any], from_version: int, to_version: int) -> dict[str, Any]:
     """
     Migrate a data dictionary from one schema version to another.
@@ -170,6 +172,7 @@ _MIGRATIONS: dict[int, Any] = {}
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
 
 def _now_iso() -> str:
     """Return the current UTC time in ISO 8601 format."""

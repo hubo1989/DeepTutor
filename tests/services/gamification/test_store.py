@@ -31,9 +31,7 @@ def temp_gamification_dir(tmp_path, monkeypatch):
     """Redirect the gamification data directory to a temp path."""
     gamedir = tmp_path / "gamification"
     gamedir.mkdir(parents=True, exist_ok=True)
-    monkeypatch.setattr(
-        "deeptutor.services.gamification.store._GAMIFICATION_DIR", gamedir
-    )
+    monkeypatch.setattr("deeptutor.services.gamification.store._GAMIFICATION_DIR", gamedir)
     return gamedir
 
 
@@ -42,7 +40,11 @@ def sample_state() -> ProgressState:
     """Create a ProgressState with some progress for round-trip tests."""
     mp = MapProgress(map_id="map1", unlocked=True)
     mp.levels["lvl1"] = LevelProgress(
-        level_id="lvl1", stars=2, best_correct_pct=0.85, attempts=1, cleared=True,
+        level_id="lvl1",
+        stars=2,
+        best_correct_pct=0.85,
+        attempts=1,
+        cleared=True,
         last_played_at="2024-01-15T10:00:00+00:00",
     )
     mp.levels["lvl2"] = LevelProgress(level_id="lvl2", stars=0, attempts=0)
@@ -68,6 +70,7 @@ def sample_state() -> ProgressState:
 # ---------------------------------------------------------------------------
 # Serialization round-trip
 # ---------------------------------------------------------------------------
+
 
 class TestRoundTrip:
     def test_save_then_load(self, temp_gamification_dir, sample_state):
@@ -110,6 +113,7 @@ class TestRoundTrip:
 # init_if_absent
 # ---------------------------------------------------------------------------
 
+
 class TestInitIfAbsent:
     def test_creates_new_state(self, temp_gamification_dir):
         state = init_if_absent("new-kid")
@@ -136,6 +140,7 @@ class TestInitIfAbsent:
 # Migration
 # ---------------------------------------------------------------------------
 
+
 class TestMigration:
     def test_no_migration_needed(self):
         data = {"schema_version": 1, "profile_id": "test"}
@@ -158,6 +163,7 @@ class TestMigration:
 # ---------------------------------------------------------------------------
 # Atomic write integrity
 # ---------------------------------------------------------------------------
+
 
 class TestAtomicWrite:
     def test_concurrent_writes_no_corruption(self, temp_gamification_dir):
@@ -201,6 +207,7 @@ class TestAtomicWrite:
 # ---------------------------------------------------------------------------
 # Path safety
 # ---------------------------------------------------------------------------
+
 
 class TestPathSafety:
     def test_safe_profile_id(self, temp_gamification_dir):

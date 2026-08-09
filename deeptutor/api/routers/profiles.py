@@ -44,6 +44,7 @@ router = APIRouter()
 # Request / Response schemas (Pydantic)
 # ---------------------------------------------------------------------------
 
+
 class CreateProfileRequest(BaseModel):
     nickname: str = Field(..., min_length=1, max_length=50)
     avatar: str = Field(default="🧒", max_length=100)
@@ -78,6 +79,7 @@ class SwitchProfileResponse(BaseModel):
 # Helper functions
 # ---------------------------------------------------------------------------
 
+
 def _profile_to_response(profile: KidProfile) -> ProfileResponse:
     return ProfileResponse(
         profile_id=profile.profile_id,
@@ -101,6 +103,7 @@ def _get_client_ip(request: Request) -> str:
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
+
 
 @router.post("/profiles", response_model=ProfileResponse, status_code=status.HTTP_201_CREATED)
 async def create_kid_profile(

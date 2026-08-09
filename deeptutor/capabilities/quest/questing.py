@@ -271,9 +271,7 @@ async def _settle_level(
     state.max_combo = max(state.max_combo, max_combo)
 
     # Update streak
-    streak_days, streak_history = game_engine.update_streak(
-        state.streak_history, today
-    )
+    streak_days, streak_history = game_engine.update_streak(state.streak_history, today)
     state.streak_days = streak_days
     state.streak_history = streak_history
 
@@ -291,7 +289,9 @@ async def _settle_level(
     level_progress.attempts += 1
     level_progress.stars = max(level_progress.stars, result.stars)
     level_progress.best_correct_pct = max(level_progress.best_correct_pct, result.score_pct)
-    level_progress.cleared = level_progress.cleared or (result.score_pct >= game_engine.STAR_1_THRESHOLD)
+    level_progress.cleared = level_progress.cleared or (
+        result.score_pct >= game_engine.STAR_1_THRESHOLD
+    )
     level_progress.last_played_at = now
 
     # Check map completion

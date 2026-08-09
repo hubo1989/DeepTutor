@@ -69,6 +69,7 @@ def sample_quest_map(sample_questions):
 # compute_content_hash
 # ---------------------------------------------------------------------------
 
+
 class TestContentHash:
     def test_deterministic_hash(self):
         chunks = ["Hello world", "Goodbye world"]
@@ -100,6 +101,7 @@ class TestContentHash:
 # ---------------------------------------------------------------------------
 # Save / load round-trip
 # ---------------------------------------------------------------------------
+
 
 class TestCacheRoundTrip:
     def test_save_then_load(self, temp_quest_cache_dir, sample_quest_map):
@@ -161,6 +163,7 @@ class TestCacheRoundTrip:
 # ---------------------------------------------------------------------------
 # Cache miss / hit
 # ---------------------------------------------------------------------------
+
 
 class TestCacheHitMiss:
     def test_cache_miss_returns_none(self, temp_quest_cache_dir):

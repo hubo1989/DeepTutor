@@ -61,6 +61,7 @@ def _make_state_with_daily_goal() -> ProgressState:
 # Individual badge tests
 # ---------------------------------------------------------------------------
 
+
 class TestFirstClear:
     def test_no_levels_cleared(self):
         state = _make_empty_state()
@@ -147,6 +148,7 @@ class TestDailyGoal:
 # Combined badge tests
 # ---------------------------------------------------------------------------
 
+
 class TestCheckAll:
     def test_empty_state_no_badges(self):
         state = _make_empty_state()
@@ -179,6 +181,7 @@ class TestCheckAll:
 # ---------------------------------------------------------------------------
 # Registry tests
 # ---------------------------------------------------------------------------
+
 
 class TestBadgeRegistry:
     def test_all_six_badges_defined(self):

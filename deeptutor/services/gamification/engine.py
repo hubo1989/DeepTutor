@@ -35,8 +35,8 @@ DEFAULT_DAILY_XP_CAP: int = 200
 
 # Multipliers
 COMBO_MULTIPLIER: float = 1.5  # applied at combo milestones
-BOSS_MULTIPLIER: float = 2.0   # boss levels double the XP
-REPLAY_FACTOR: float = 0.5     # already-cleared levels yield half XP
+BOSS_MULTIPLIER: float = 2.0  # boss levels double the XP
+REPLAY_FACTOR: float = 0.5  # already-cleared levels yield half XP
 
 # Star thresholds (percentage of correct answers)
 STAR_1_THRESHOLD: float = 0.60
@@ -50,6 +50,7 @@ UNLOCK_CORRECT_THRESHOLD: float = 0.60
 # ---------------------------------------------------------------------------
 # Core XP computation
 # ---------------------------------------------------------------------------
+
 
 def base_xp_for_correct(correct_count: int) -> int:
     """Compute raw XP from correct answers (10 XP per correct answer).
@@ -183,6 +184,7 @@ def award_xp(
 # Star grading
 # ---------------------------------------------------------------------------
 
+
 def grade_stars(correct_pct: float) -> int:
     """
     Convert a correctness percentage to a 1-3 star rating.
@@ -210,6 +212,7 @@ def grade_stars(correct_pct: float) -> int:
 # ---------------------------------------------------------------------------
 # Unlock logic
 # ---------------------------------------------------------------------------
+
 
 def check_unlock(
     prev_level_result: float,
@@ -244,6 +247,7 @@ def check_unlock(
 # ---------------------------------------------------------------------------
 # Streak computation
 # ---------------------------------------------------------------------------
+
 
 def update_streak(
     streak_history: Sequence[str],
@@ -314,6 +318,7 @@ def _parse_date_safely(date_str: str) -> date | None:
 # Level computation
 # ---------------------------------------------------------------------------
 
+
 def compute_level(total_xp: int) -> int:
     """
     Compute the child's level (1-10) from total XP.
@@ -369,6 +374,7 @@ def progress_to_next_level(total_xp: int) -> float:
 # ---------------------------------------------------------------------------
 # Weekly report computation
 # ---------------------------------------------------------------------------
+
 
 def compute_weekly_report(progress: "ProgressState", days: int = 7) -> dict:
     """Compute weekly learning statistics from a ProgressState.

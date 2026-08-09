@@ -94,9 +94,7 @@ class TestIsAvailable:
         assert SourceResolver.is_available("public", "solar-system") is True
 
     def test_public_existing_multiplication(self) -> None:
-        assert (
-            SourceResolver.is_available("public", "multiplication-kingdom") is True
-        )
+        assert SourceResolver.is_available("public", "multiplication-kingdom") is True
 
     def test_public_nonexistent(self) -> None:
         assert SourceResolver.is_available("public", "nonexistent") is False
