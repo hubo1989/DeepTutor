@@ -1,0 +1,31 @@
+theme_id: multiplication-kingdom
+title:
+  zh: "乘法王国"
+  en: "Multiplication Kingdom"
+age_band: "7-9"
+description:
+  zh: "在乘法王国里快乐学习乘法口诀！"
+  en: "Learn multiplication tables happily in the Multiplication Kingdom!"
+icon: "✖️"
+levels:
+  - id: lvl_001
+    title: { zh: "2的乘法", en: "Times 2" }
+    difficulty: "入门"
+    source_files: ["01-times-2.md"]
+  - id: lvl_002
+    title: { zh: "5的乘法", en: "Times 5" }
+    difficulty: "进阶"
+    source_files: ["02-times-5.md"]
+  - id: lvl_003
+    title: { zh: "10的乘法", en: "Times 10" }
+    difficulty: "进阶"
+    source_files: ["03-times-10.md"]
+  - id: lvl_004
+    title: { zh: "乘法口诀小妙招", en: "Times Tables Tricks" }
+    difficulty: "熟练"
+    source_files: ["04-times-tables-tricks.md"]
+  - id: lvl_005
+    title: { zh: "生活中的乘法", en: "Real-World Problems" }
+    difficulty: "精通"
+    is_boss: true
+    source_files: ["05-real-world-problems.md"]

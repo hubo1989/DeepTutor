@@ -22,7 +22,6 @@ from deeptutor.knowledge.kb_types import (
     LIGHTRAG_SERVER_KB_TYPE,
     LINKED_KB_TYPE,
     OBSIDIAN_KB_TYPE,
-    PUBLIC_KB_TYPE,
     SUBAGENT_KB_TYPE,
     external_root_of,
     is_connected_kb,
