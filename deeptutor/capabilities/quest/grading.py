@@ -12,10 +12,8 @@ guaranteed by making the grade function a pure function.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
 
 from deeptutor.services.gamification.models import Question
-
 
 # ---------------------------------------------------------------------------
 # Result types

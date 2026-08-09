@@ -19,8 +19,8 @@ message and exits gracefully.
 from __future__ import annotations
 
 import argparse
-import sys
 from pathlib import Path
+import sys
 
 # Resolve project root relative to this script (scripts/build_public_kb.py →
 # project root is two levels up).

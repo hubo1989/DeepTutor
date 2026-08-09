@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import pytest
 
-from deeptutor.capabilities.quest.hints import HintService, STAGES, MAX_STAGE
+from deeptutor.capabilities.quest.hints import MAX_STAGE, STAGES, HintService
 from deeptutor.services.gamification.models import Question
 
 

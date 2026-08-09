@@ -10,8 +10,8 @@ All writes use ``atomic_write_json`` for crash safety.
 
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
+import json
 from pathlib import Path
 from typing import Any
 from uuid import uuid4

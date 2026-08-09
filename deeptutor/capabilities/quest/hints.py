@@ -21,7 +21,6 @@ from typing import Any
 from deeptutor.services.gamification.models import Question
 from deeptutor.services.gamification.safety import SafetyFilter
 
-
 # ---------------------------------------------------------------------------
 # Stage constants
 # ---------------------------------------------------------------------------

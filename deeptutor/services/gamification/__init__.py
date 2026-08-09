@@ -5,6 +5,7 @@ This package contains the pure-function game engine (XP, stars, unlocks,
 streaks), badge definitions, and JSON persistence for child learning profiles.
 """
 
+from deeptutor.services.gamification.badges import BADGE_RULES, check_all
 from deeptutor.services.gamification.engine import (
     apply_diminishing_returns,
     apply_xp_cap,
@@ -22,7 +23,6 @@ from deeptutor.services.gamification.models import (
     Question,
     QuestMap,
 )
-from deeptutor.services.gamification.badges import BADGE_RULES, check_all
 from deeptutor.services.gamification.store import init_if_absent, load, save
 
 __all__ = [

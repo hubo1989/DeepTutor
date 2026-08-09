@@ -4,8 +4,8 @@ Profiles API Router — Kid profile CRUD + role switching.
 
 from __future__ import annotations
 
-import logging
 from datetime import datetime, timezone
+import logging
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -20,8 +20,14 @@ from deeptutor.services.kid_profiles.models import GuardianConsent, KidProfile
 from deeptutor.services.kid_profiles.pin import has_pin, set_pin, verify_pin
 from deeptutor.services.kid_profiles.store import (
     create as create_profile,
+)
+from deeptutor.services.kid_profiles.store import (
     delete as delete_profile,
+)
+from deeptutor.services.kid_profiles.store import (
     get as get_profile,
+)
+from deeptutor.services.kid_profiles.store import (
     load_all as load_all_profiles,
 )
 from deeptutor.services.login_rate_limit import (

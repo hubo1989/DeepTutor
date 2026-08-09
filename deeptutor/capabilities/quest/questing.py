@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from deeptutor.capabilities.quest.grading import GradingService, LevelResult
-from deeptutor.capabilities.quest.hints import HintService, MAX_STAGE
+from deeptutor.capabilities.quest.hints import MAX_STAGE, HintService
 from deeptutor.core.stream import StreamEvent, StreamEventType
 from deeptutor.core.stream_bus import StreamBus
 from deeptutor.services.gamification import badges as badge_engine
@@ -32,7 +32,6 @@ from deeptutor.services.gamification import store as game_store
 from deeptutor.services.gamification.models import (
     LevelProgress,
     MapProgress,
-    ProgressState,
     Question,
 )
 from deeptutor.services.gamification.safety import SafetyFilter

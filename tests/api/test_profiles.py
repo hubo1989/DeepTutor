@@ -282,15 +282,16 @@ class TestCreateProfileHandler:
     def test_create_profile_calls_store(self, temp_data_dirs):
         """Test the handler logic directly (not through HTTP)."""
         from deeptutor.api.routers.profiles import CreateProfileRequest
-        from deeptutor.services.kid_profiles.store import create as create_profile, get
+        from deeptutor.services.kid_profiles.store import create as create_profile
+        from deeptutor.services.kid_profiles.store import get
 
         # Simulate the handler logic
         req = CreateProfileRequest(
             nickname="TestKid", avatar="🧒", age_band="7-9", consent_agreed=True
         )
-        from deeptutor.services.kid_profiles.models import GuardianConsent, KidProfile
-
         from datetime import datetime, timezone
+
+        from deeptutor.services.kid_profiles.models import GuardianConsent, KidProfile
 
         now = datetime.now(timezone.utc).isoformat()
         profile = KidProfile(

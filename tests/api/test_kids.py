@@ -129,8 +129,8 @@ class TestPublicThemesAPI:
         """The _theme_to_summary helper should produce correct fields."""
         _create_test_theme(temp_data_dirs, "test-theme")
 
-        from deeptutor.services.gamification.public_themes import load_theme
         from deeptutor.api.routers.kids import _theme_to_summary
+        from deeptutor.services.gamification.public_themes import load_theme
 
         theme = load_theme("test-theme")
         assert theme is not None
@@ -154,8 +154,8 @@ class TestGenerateMapAPI:
         """_build_quest_map_from_theme should create proper QuestMap structure."""
         _create_test_theme(temp_data_dirs, "test-theme")
 
-        from deeptutor.services.gamification.public_themes import load_theme
         from deeptutor.api.routers.kids import _build_quest_map_from_theme
+        from deeptutor.services.gamification.public_themes import load_theme
 
         theme = load_theme("test-theme")
         assert theme is not None
@@ -176,11 +176,11 @@ class TestGenerateMapAPI:
         """_map_to_response should serialize QuestMap to response model."""
         _create_test_theme(temp_data_dirs, "test-theme")
 
-        from deeptutor.services.gamification.public_themes import load_theme
         from deeptutor.api.routers.kids import (
             _build_quest_map_from_theme,
             _map_to_response,
         )
+        from deeptutor.services.gamification.public_themes import load_theme
 
         theme = load_theme("test-theme")
         assert theme is not None
@@ -234,8 +234,8 @@ class TestProgressAPI:
             mock_user.role = "user"  # Not admin/guardian
             mock.return_value = mock_user
 
-            import pytest as _pytest
             from fastapi import HTTPException
+            import pytest as _pytest
 
             with _pytest.raises(HTTPException) as exc_info:
                 require_guardian()

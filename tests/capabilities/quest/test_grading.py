@@ -13,7 +13,6 @@ import pytest
 from deeptutor.capabilities.quest.grading import GradingService, LevelResult
 from deeptutor.services.gamification.models import Question
 
-
 # ---------------------------------------------------------------------------
 # Single choice
 # ---------------------------------------------------------------------------

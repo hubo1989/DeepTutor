@@ -22,15 +22,14 @@ up to 2 regeneration attempts.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 import hashlib
 import json
 import re
-from dataclasses import dataclass, field
 from typing import Any, Sequence
 
 from deeptutor.services.gamification.models import Question
 from deeptutor.services.gamification.safety import SafetyFilter
-
 
 # ---------------------------------------------------------------------------
 # Question type definitions
@@ -496,7 +495,7 @@ class ForgingService:
 
                 q = Question(
                     question_id=f"tpl_sc_{generated}",
-                    text=f"Which of the following appears in the reading material?",
+                    text="Which of the following appears in the reading material?",
                     question_type="single_choice",
                     options=unique_opts,
                     correct_answer=correct_word,
@@ -519,7 +518,7 @@ class ForgingService:
                     continue
                 q = Question(
                     question_id=f"tpl_misc_{generated}",
-                    text=f"Which word was featured in the lesson?",
+                    text="Which word was featured in the lesson?",
                     question_type="single_choice",
                     options=unique_opts2,
                     correct_answer=correct_word,

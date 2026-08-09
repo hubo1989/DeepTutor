@@ -16,7 +16,6 @@ from deeptutor.capabilities.quest.forging import (
 )
 from deeptutor.services.gamification.models import Question
 
-
 # ---------------------------------------------------------------------------
 # validate_schema
 # ---------------------------------------------------------------------------

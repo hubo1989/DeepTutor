@@ -5,8 +5,10 @@ Covers every capability × every role combination.
 
 from __future__ import annotations
 
-import pytest
+from unittest.mock import MagicMock, patch
+
 from fastapi import HTTPException
+import pytest
 
 from deeptutor.multi_user.models import CurrentUser, UserScope
 from deeptutor.services.kid_profiles.guard import (
@@ -15,7 +17,6 @@ from deeptutor.services.kid_profiles.guard import (
     require_guardian,
     require_kid_or_guardian,
 )
-from unittest.mock import patch, MagicMock
 
 
 def _make_user(role: str, user_id: str = "test-user") -> CurrentUser:

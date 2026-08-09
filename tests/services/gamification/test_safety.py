@@ -6,9 +6,8 @@ from __future__ import annotations
 
 import pytest
 
-from deeptutor.services.gamification.safety import FilterResult, SafetyFilter, WORDLIST
 from deeptutor.services.gamification.models import Question
-
+from deeptutor.services.gamification.safety import WORDLIST, FilterResult, SafetyFilter
 
 # ---------------------------------------------------------------------------
 # Wordlist filter

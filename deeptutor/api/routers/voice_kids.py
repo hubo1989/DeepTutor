@@ -17,9 +17,8 @@ frontend can fall back to the browser-native ``speechSynthesis`` API.
 from __future__ import annotations
 
 import logging
-from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 
 from deeptutor.multi_user.context import get_current_user
@@ -109,8 +108,9 @@ async def kids_tts(
 
     # Attempt backend TTS synthesis
     try:
-        from deeptutor.services.voice import synthesize_speech
         import base64
+
+        from deeptutor.services.voice import synthesize_speech
 
         audio_bytes, content_type = await synthesize_speech(
             body.text,

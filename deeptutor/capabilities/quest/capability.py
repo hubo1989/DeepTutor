@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from deeptutor.capabilities.quest.forging import ForgingService, AGE_BAND_QUESTION_MATRIX
+from deeptutor.capabilities.quest.forging import AGE_BAND_QUESTION_MATRIX, ForgingService
 from deeptutor.capabilities.quest.hints import HintService
 from deeptutor.capabilities.quest.quest_cache import (
     compute_content_hash,

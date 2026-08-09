@@ -17,9 +17,8 @@ import json
 from pathlib import Path
 from typing import Any, Sequence
 
-from deeptutor.services.gamification.models import Level, Question, QuestMap
 from deeptutor.services.file_io import atomic_write_json
-
+from deeptutor.services.gamification.models import Level, Question, QuestMap
 
 _CACHE_DIR = Path("data/user/gamification/quests")
 

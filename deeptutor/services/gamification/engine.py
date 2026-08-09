@@ -16,7 +16,10 @@ Conventions:
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
-from typing import Sequence
+from typing import TYPE_CHECKING, Sequence
+
+if TYPE_CHECKING:
+    from deeptutor.services.gamification.models import ProgressState, QuestMap
 
 # ---------------------------------------------------------------------------
 # XP thresholds for level computation.

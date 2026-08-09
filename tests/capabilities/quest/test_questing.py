@@ -14,11 +14,10 @@ import pytest
 
 from deeptutor.capabilities.quest.grading import LevelResult
 from deeptutor.capabilities.quest.hints import HintService
-from deeptutor.capabilities.quest.questing import run_quest_round, MAX_WRONG_ATTEMPTS
+from deeptutor.capabilities.quest.questing import MAX_WRONG_ATTEMPTS, run_quest_round
 from deeptutor.core.stream import StreamEventType
 from deeptutor.core.stream_bus import StreamBus
 from deeptutor.services.gamification.models import Question
-
 
 # ---------------------------------------------------------------------------
 # Helpers

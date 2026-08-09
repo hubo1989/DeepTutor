@@ -19,10 +19,9 @@ and the forging pipeline must regenerate it.
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
+import re
 from typing import Any, Protocol
-
 
 # ---------------------------------------------------------------------------
 # Result types
