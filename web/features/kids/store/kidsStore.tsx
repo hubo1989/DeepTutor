@@ -142,7 +142,7 @@ function kidsReducer(state: KidsStoreState, action: KidsAction): KidsStoreState 
     case "NEXT_QUESTION": {
       const nextIdx = state.currentIndex + 1;
       if (nextIdx >= state.questions.length) {
-        return { ...state, phase: "presenting", currentIndex: nextIdx };
+        return { ...state, phase: "level_complete" };
       }
       return {
         ...state,

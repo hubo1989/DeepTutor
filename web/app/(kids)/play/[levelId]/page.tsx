@@ -160,6 +160,8 @@ export default function PlayPage() {
 
       setSummaryData({ stars, xpEarned: xp, newBadges: [] });
       store.completeLevel(xp);
+      // Immediately show summary after completing the last question
+      setShowSummary(true);
     } else {
       store.nextQuestion();
     }
@@ -292,8 +294,8 @@ export default function PlayPage() {
         onClose={() => store.hideHint()}
       />
 
-      {/* Next button (after submit) */}
-      {submitted && (
+      {/* Next button (after submit) or See Results (level complete) */}
+      {(submitted || store.phase === "level_complete") && (
         <button
           className="w-full flex items-center justify-center gap-2 py-4 font-bold text-white transition-opacity hover:opacity-90"
           style={{
@@ -304,11 +306,10 @@ export default function PlayPage() {
             fontSize: kidsTheme.typography.buttonSize,
             minHeight: kidsTheme.sizing.buttonMinHeight,
           }}
+          disabled={feedback !== null}
+          aria-disabled={feedback !== null}
           onClick={() => {
-            if (feedback !== null) {
-              // Wait for animation
-              return;
-            }
+            if (feedback !== null) return;
             handleFeedbackComplete();
           }}
         >
@@ -320,9 +321,7 @@ export default function PlayPage() {
       <FeedbackOverlay
         type={feedback}
         comboCount={store.combo}
-        onComplete={() => {
-          setFeedback(null);
-        }}
+        onComplete={handleFeedbackComplete}
       />
     </div>
   );
@@ -349,6 +348,14 @@ function checkAnswer(question: Question, answer: string): boolean {
       return question.acceptable_answers.some(
         (a) => a.trim().toLowerCase() === ans,
       );
+
+    case "matching":
+      // Answer is "left|right;;left|right;;..." — compare normalized
+      return answer.trim() === question.correct_answer.trim();
+
+    case "ordering":
+      // Answer is "item;;item;;..." — compare normalized
+      return answer.trim() === question.correct_answer.trim();
 
     default:
       return false;

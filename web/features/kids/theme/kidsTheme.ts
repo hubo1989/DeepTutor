@@ -20,6 +20,7 @@ export const kidsTheme = {
   colors: {
     primary: "#6C5CE7",
     primaryHover: "#5A4BD1",
+    accent: "#0984E3",
     success: "#00B894",
     successBg: "#E6FFF9",
     danger: "#FF7675",
@@ -31,6 +32,11 @@ export const kidsTheme = {
     boss: "#E84393",
     xpBar: "#6C5CE7",
     streakFlame: "#FF7675",
+  },
+  /** Font families for kids UI. */
+  fonts: {
+    body: "Geist, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
+    heading: "Geist, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
   },
   /** Tap-target minimums — large for small hands. */
   sizing: {

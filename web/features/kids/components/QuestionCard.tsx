@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import { Check, X } from "lucide-react";
 import { kidsTheme } from "@/features/kids/theme/kidsTheme";
 import type { Question } from "@/lib/kids-types";
@@ -189,12 +189,22 @@ function renderQuestionBody(
 
     case "matching":
       return (
-        <MatchingDisplay pairs={question.matching_pairs} />
+        <MatchingInteraction
+          pairs={question.matching_pairs}
+          selectedValue={selectedValue}
+          onSelect={onSelect}
+          submitted={submitted}
+        />
       );
 
     case "ordering":
       return (
-        <OrderingDisplay sequence={question.ordering_sequence} />
+        <OrderingInteraction
+          sequence={question.ordering_sequence}
+          selectedValue={selectedValue}
+          onSelect={onSelect}
+          submitted={submitted}
+        />
       );
 
     case "error_correction":
@@ -374,58 +384,240 @@ function FillBlankInput({
   );
 }
 
-function MatchingDisplay({ pairs }: { pairs: [string, string][] }) {
+function MatchingInteraction({
+  pairs,
+  selectedValue,
+  onSelect,
+  submitted,
+}: {
+  pairs: [string, string][];
+  selectedValue: string;
+  onSelect: (value: string) => void;
+  submitted: boolean;
+}) {
+  // Build a shuffled list of right-side items for the child to pick from.
+  // The correct answer is encoded as "leftItem|rightItem" pairs joined by ";;".
+  const correctAnswer = pairs
+    .map((p) => `${p[0]}|${p[1]}`)
+    .join(";;");
+
+  // If the child hasn't submitted yet, they tap pairs in order.
+  // For simplicity in the kids UI, we present each left item with a dropdown
+  // of right items to choose from.
+  const [selections, setSelections] = useState<Record<string, string>>({});
+  const rightItems = pairs.map((p) => p[1]);
+
+  const handleChange = (left: string, right: string) => {
+    if (submitted) return;
+    const newSel = { ...selections, [left]: right };
+    setSelections(newSel);
+    // Emit answer only when all pairs are matched
+    if (pairs.every((p) => newSel[p[0]])) {
+      const answer = pairs.map((p) => `${p[0]}|${newSel[p[0]]}`).join(";;");
+      onSelect(answer);
+    }
+  };
+
+  // Sync from external selectedValue (e.g. after re-render)
+  useEffect(() => {
+    if (selectedValue && selectedValue.includes(";;")) {
+      const parsed: Record<string, string> = {};
+      for (const part of selectedValue.split(";;")) {
+        const [l, r] = part.split("|");
+        if (l && r) parsed[l] = r;
+      }
+      setSelections(parsed);
+    }
+  }, []);
+
   return (
-    <div className="space-y-2">
-      {pairs.map((pair, idx) => (
-        <div
-          key={idx}
-          className="flex items-center gap-3 p-3"
-          style={{
-            backgroundColor: "var(--muted)",
-            borderRadius: kidsTheme.borderRadius.chip,
-          }}
-        >
-          <span className="font-semibold" style={{ color: "var(--foreground)" }}>
-            {pair[0]}
-          </span>
-          <span style={{ color: kidsTheme.colors.primary }}>{"<->"}</span>
-          <span className="font-semibold" style={{ color: "var(--foreground)" }}>
-            {pair[1]}
-          </span>
-        </div>
-      ))}
+    <div className="space-y-3">
+      <p className="text-sm font-medium mb-2" style={{ color: "var(--muted-foreground)" }}>
+        Match each item on the left with the correct answer!
+      </p>
+      {pairs.map((pair, idx) => {
+        const leftItem = pair[0];
+        const selectedRight = selections[leftItem] || "";
+        const isCorrectMatch = submitted && selectedRight === pair[1];
+
+        return (
+          <div
+            key={idx}
+            className="flex items-center gap-3 p-3"
+            style={{
+              backgroundColor: submitted
+                ? isCorrectMatch
+                  ? kidsTheme.colors.successBg
+                  : kidsTheme.colors.dangerBg
+                : "var(--muted)",
+              borderRadius: kidsTheme.borderRadius.chip,
+            }}
+          >
+            <span className="font-semibold flex-1" style={{ color: "var(--foreground)" }}>
+              {leftItem}
+            </span>
+            <select
+              className="px-3 py-2 text-sm font-medium"
+              style={{
+                backgroundColor: "var(--background)",
+                border: "1px solid var(--border)",
+                borderRadius: kidsTheme.borderRadius.chip,
+                color: "var(--foreground)",
+                cursor: submitted ? "default" : "pointer",
+              }}
+              value={selectedRight}
+              onChange={(e) => handleChange(leftItem, e.target.value)}
+              disabled={submitted}
+            >
+              <option value="">Choose...</option>
+              {rightItems.map((r, ri) => (
+                <option key={ri} value={r}>{r}</option>
+              ))}
+            </select>
+            {submitted && isCorrectMatch && (
+              <Check className="w-5 h-5" style={{ color: kidsTheme.colors.success }} />
+            )}
+            {submitted && !isCorrectMatch && selectedRight && (
+              <X className="w-5 h-5" style={{ color: kidsTheme.colors.danger }} />
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }
 
-function OrderingDisplay({ sequence }: { sequence: string[] }) {
+function OrderingInteraction({
+  sequence,
+  selectedValue,
+  onSelect,
+  submitted,
+}: {
+  sequence: string[];
+  selectedValue: string;
+  onSelect: (value: string) => void;
+  submitted: boolean;
+}) {
+  // The child taps items in the order they think is correct.
+  // The correct answer is the original sequence joined by ";;".
+  const [userOrder, setUserOrder] = useState<string[]>([]);
+  const [available, setAvailable] = useState<string[]>([]);
+
+  // Shuffle the items on mount so the child has to reorder them
+  useEffect(() => {
+    const shuffled = [...sequence].sort(() => Math.random() - 0.5);
+    setAvailable(shuffled);
+    setUserOrder([]);
+  }, []);
+
+  // Sync from external selectedValue
+  useEffect(() => {
+    if (selectedValue && selectedValue.includes(";;")) {
+      setUserOrder(selectedValue.split(";;"));
+      setAvailable([]);
+    }
+  }, []);
+
+  const correctAnswer = sequence.join(";;");
+
+  const handlePick = (item: string) => {
+    if (submitted) return;
+    const newOrder = [...userOrder, item];
+    const newAvailable = available.filter((a) => a !== item);
+    setUserOrder(newOrder);
+    setAvailable(newAvailable);
+    // Emit answer when all items are placed
+    if (newOrder.length === sequence.length) {
+      onSelect(newOrder.join(";;"));
+    }
+  };
+
+  const handleRemove = (item: string) => {
+    if (submitted) return;
+    const newOrder = userOrder.filter((a) => a !== item);
+    const newAvailable = [...available, item];
+    setUserOrder(newOrder);
+    setAvailable(newAvailable);
+  };
+
+  const isCorrectOrder = submitted && userOrder.join(";;") === correctAnswer;
+
   return (
-    <div className="flex flex-col gap-2">
-      {sequence.map((item, idx) => (
+    <div className="space-y-3">
+      <p className="text-sm font-medium mb-2" style={{ color: "var(--muted-foreground)" }}>
+        Tap the items in the correct order!
+      </p>
+
+      {/* User's ordered list */}
+      <div className="space-y-2">
+        {userOrder.map((item, idx) => {
+          const isCorrectPos = submitted && sequence[idx] === item;
+          return (
+            <button
+              key={idx}
+              className="flex items-center gap-3 p-3 w-full text-left"
+              style={{
+                backgroundColor: submitted
+                  ? isCorrectPos
+                    ? kidsTheme.colors.successBg
+                    : kidsTheme.colors.dangerBg
+                  : `${kidsTheme.colors.primary}15`,
+                borderRadius: kidsTheme.borderRadius.chip,
+                cursor: submitted ? "default" : "pointer",
+              }}
+              onClick={() => handleRemove(item)}
+              disabled={submitted}
+            >
+              <span
+                className="flex items-center justify-center font-bold text-sm"
+                style={{
+                  width: "1.75rem",
+                  height: "1.75rem",
+                  borderRadius: "50%",
+                  backgroundColor: submitted
+                    ? isCorrectPos
+                      ? kidsTheme.colors.success
+                      : kidsTheme.colors.danger
+                    : kidsTheme.colors.primary,
+                  color: "white",
+                }}
+              >
+                {idx + 1}
+              </span>
+              <span style={{ color: "var(--foreground)" }}>{item}</span>
+              {submitted && isCorrectPos && (
+                <Check className="w-4 h-4 ml-auto" style={{ color: kidsTheme.colors.success }} />
+              )}
+            </button>
+          );
+        })}
+      </div>
+
+      {/* Available items to pick */}
+      {available.length > 0 && (
         <div
-          key={idx}
-          className="flex items-center gap-3 p-3"
+          className="flex flex-wrap gap-2 p-3"
           style={{
             backgroundColor: "var(--muted)",
             borderRadius: kidsTheme.borderRadius.chip,
           }}
         >
-          <span
-            className="flex items-center justify-center font-bold text-sm"
-            style={{
-              width: "1.75rem",
-              height: "1.75rem",
-              borderRadius: "50%",
-              backgroundColor: kidsTheme.colors.primary,
-              color: "white",
-            }}
-          >
-            {idx + 1}
-          </span>
-          <span style={{ color: "var(--foreground)" }}>{item}</span>
+          {available.map((item, idx) => (
+            <button
+              key={idx}
+              className="px-4 py-2 font-medium transition-opacity hover:opacity-80"
+              style={{
+                backgroundColor: kidsTheme.colors.primary,
+                color: "white",
+                borderRadius: kidsTheme.borderRadius.button,
+              }}
+              onClick={() => handlePick(item)}
+            >
+              {item}
+            </button>
+          ))}
         </div>
-      ))}
+      )}
     </div>
   );
 }
