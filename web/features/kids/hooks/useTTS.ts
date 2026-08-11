@@ -249,7 +249,7 @@ function playBase64Audio(base64Data: string, contentType: string): Promise<void>
         }
         byteArrays.push(new Uint8Array(byteNumbers));
       }
-      const blob = new Blob(byteArrays, { type: contentType });
+      const blob = new Blob(byteArrays as BlobPart[], { type: contentType });
       const url = URL.createObjectURL(blob);
       const audio = new Audio(url);
 
