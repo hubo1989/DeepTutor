@@ -119,7 +119,7 @@ export default function MapPage() {
             backgroundColor: kidsTheme.colors.primary,
             borderRadius: kidsTheme.borderRadius.button,
           }}
-          onClick={() => router.push("/home")}
+          onClick={() => router.push("/kids-home")}
         >
           Back to Home
         </button>
@@ -132,7 +132,7 @@ export default function MapPage() {
       {/* Header */}
       <div className="flex items-center gap-3">
         <button
-          onClick={() => router.push("/home")}
+          onClick={() => router.push("/kids-home")}
           className="p-2 rounded-full hover:bg-[var(--muted)]"
           aria-label="Back"
         >

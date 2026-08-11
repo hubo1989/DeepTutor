@@ -72,7 +72,7 @@ export default function RewardsPage() {
       {/* Header */}
       <div className="flex items-center gap-3">
         <button
-          onClick={() => router.push("/home")}
+          onClick={() => router.push("/kids-home")}
           className="p-2 rounded-full hover:bg-[var(--muted)]"
           aria-label="Back"
         >

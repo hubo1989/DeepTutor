@@ -168,7 +168,7 @@ export default function PlayPage() {
   }, [store, isLastQuestion]);
 
   const handleContinue = useCallback(() => {
-    router.push("/home");
+    router.push("/kids-home");
   }, [router]);
 
   const handleRetry = useCallback(() => {
@@ -226,7 +226,7 @@ export default function PlayPage() {
       {/* Header */}
       <div className="flex items-center gap-3">
         <button
-          onClick={() => router.push("/home")}
+          onClick={() => router.push("/kids-home")}
           className="p-2 rounded-full hover:bg-[var(--muted)]"
           aria-label="Back"
         >
