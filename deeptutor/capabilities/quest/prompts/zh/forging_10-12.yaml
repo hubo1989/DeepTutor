@@ -1,0 +1,51 @@
+system_prompt: |
+  你是一位面向 10-12 岁儿童的出题老师。请根据给定的学习材料，生成适合这个年龄段的题目。
+  题型可以包括：单选题、判断题、填空题、配对题、排序题。
+  语言要清晰准确，题目要有一定的思维挑战性，但不超出年龄段认知范围。
+
+output_schema:
+  type: object
+  properties:
+    questions:
+      type: array
+      items:
+        type: object
+        properties:
+          question_type:
+            type: string
+            enum: [single_choice, true_false, fill_blank, matching, ordering]
+          question_text:
+            type: string
+          options:
+            type: array
+            items:
+              type: string
+          correct_answer:
+            type: string
+          acceptable_answers:
+            type: array
+            items:
+              type: string
+          matching_pairs:
+            type: array
+            items:
+              type: array
+              items:
+                type: string
+          ordering_sequence:
+            type: array
+            items:
+              type: string
+          explanation:
+            type: string
+          hints:
+            type: array
+            items:
+              type: string
+        required:
+          - question_type
+          - question_text
+          - correct_answer
+          - explanation
+
+max_options: 4

@@ -74,6 +74,14 @@ LIGHTRAG_SERVER_KB_TYPE = "lightrag_server"
 # ``search_knowledge`` OpenAPI by the ``ima`` provider.
 IMA_KB_TYPE = "ima"
 
+# A built-in, read-only public knowledge base shipped with the app. Its content
+# lives in ``data/public_kb/<theme_id>/`` (curated Markdown + a ``manifest.yaml``)
+# and is loaded by the gamification ``public_themes`` loader. Unlike connected
+# KBs a public KB *does* have an index (built once via ``scripts/build_public_kb``),
+# but every mutating manager operation is forbidden — the data is curated and
+# shared across all child profiles, so no user may add, delete, or re-index it.
+PUBLIC_KB_TYPE = "public"
+
 # Every pointer/connected KB type. Membership here is what makes the manager
 # skip the index pipeline, the orphan prune and the embedding reconcile.
 CONNECTED_KB_TYPES = frozenset(
@@ -103,13 +111,25 @@ def external_root_of(entry: Any) -> str | None:
     return entry.get("external_path") or entry.get("vault_path")
 
 
+def is_public_kb(entry: Any) -> bool:
+    """True for built-in, read-only public knowledge bases.
+
+    A public KB ships curated content shared across all child profiles. It may
+    have a pre-built index but every mutating operation (delete, add documents,
+    clean index) is forbidden — the data is read-only.
+    """
+    return isinstance(entry, dict) and entry.get("type") == PUBLIC_KB_TYPE
+
+
 __all__ = [
     "OBSIDIAN_KB_TYPE",
     "LINKED_KB_TYPE",
     "SUBAGENT_KB_TYPE",
     "LIGHTRAG_SERVER_KB_TYPE",
     "IMA_KB_TYPE",
+    "PUBLIC_KB_TYPE",
     "CONNECTED_KB_TYPES",
     "is_connected_kb",
+    "is_public_kb",
     "external_root_of",
 ]

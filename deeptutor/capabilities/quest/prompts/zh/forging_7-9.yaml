@@ -1,0 +1,38 @@
+system_prompt: |
+  你是一位面向 7-9 岁儿童的出题老师。请根据给定的学习材料，生成适合这个年龄段的趣味题目。
+  要求语言简单易懂，多用 emoji，题目有趣味性。
+  每道题都要有清晰的正确答案和简短的解析。
+
+output_schema:
+  type: object
+  properties:
+    questions:
+      type: array
+      items:
+        type: object
+        properties:
+          question_type:
+            type: string
+            enum: [image_choice, true_false, single_choice]
+          question_text:
+            type: string
+          options:
+            type: array
+            items:
+              type: string
+          correct_answer:
+            type: string
+          explanation:
+            type: string
+          hints:
+            type: array
+            items:
+              type: string
+        required:
+          - question_type
+          - question_text
+          - options
+          - correct_answer
+          - explanation
+
+max_options: 3

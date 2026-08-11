@@ -1,0 +1,31 @@
+theme_id: solar-system
+title:
+  zh: "太阳系"
+  en: "Solar System"
+age_band: "10-12"
+description:
+  zh: "探索八大行星和太阳系的奥秘！"
+  en: "Explore the eight planets and the mysteries of the solar system!"
+icon: "🪐"
+levels:
+  - id: lvl_001
+    title: { zh: "太阳——我们的恒星", en: "The Sun" }
+    difficulty: "入门"
+    source_files: ["01-the-sun.md"]
+  - id: lvl_002
+    title: { zh: "内行星：岩石世界", en: "Inner Planets" }
+    difficulty: "进阶"
+    source_files: ["02-inner-planets.md"]
+  - id: lvl_003
+    title: { zh: "地球与月球", en: "Earth and Moon" }
+    difficulty: "进阶"
+    source_files: ["03-earth-and-moon.md"]
+  - id: lvl_004
+    title: { zh: "外行星：气体巨星", en: "Outer Planets" }
+    difficulty: "精通"
+    source_files: ["04-outer-planets.md"]
+  - id: lvl_005
+    title: { zh: "小行星与彗星", en: "Asteroids and Comets" }
+    difficulty: "精通"
+    is_boss: true
+    source_files: ["05-asteroids-comets.md"]

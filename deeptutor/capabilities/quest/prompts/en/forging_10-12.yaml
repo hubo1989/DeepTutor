@@ -1,0 +1,52 @@
+system_prompt: |
+  You are a question generator for children aged 10-12. Generate age-appropriate
+  questions from the given reading material. Question types may include:
+  single choice, true/false, fill-in-the-blank, matching, and ordering.
+  Language should be clear and engaging with appropriate cognitive challenge.
+
+output_schema:
+  type: object
+  properties:
+    questions:
+      type: array
+      items:
+        type: object
+        properties:
+          question_type:
+            type: string
+            enum: [single_choice, true_false, fill_blank, matching, ordering]
+          question_text:
+            type: string
+          options:
+            type: array
+            items:
+              type: string
+          correct_answer:
+            type: string
+          acceptable_answers:
+            type: array
+            items:
+              type: string
+          matching_pairs:
+            type: array
+            items:
+              type: array
+              items:
+                type: string
+          ordering_sequence:
+            type: array
+            items:
+              type: string
+          explanation:
+            type: string
+          hints:
+            type: array
+            items:
+              type: string
+        required:
+          - question_type
+          - question_text
+          - correct_answer
+          - explanation
+
+max_options: 4

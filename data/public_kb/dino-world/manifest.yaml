@@ -1,0 +1,31 @@
+theme_id: dino-world
+title:
+  zh: "恐龙世界"
+  en: "Dino World"
+age_band: "7-9"
+description:
+  zh: "穿越史前时代，认识各种恐龙！"
+  en: "Travel through prehistoric times and meet amazing dinosaurs!"
+icon: "🦕"
+levels:
+  - id: lvl_001
+    title: { zh: "什么是恐龙？", en: "What Are Dinosaurs?" }
+    difficulty: "入门"
+    source_files: ["01-what-are-dinosaurs.md"]
+  - id: lvl_002
+    title: { zh: "三叠纪时代", en: "The Triassic Period" }
+    difficulty: "进阶"
+    source_files: ["02-triassic-period.md"]
+  - id: lvl_003
+    title: { zh: "侏罗纪巨人", en: "Jurassic Giants" }
+    difficulty: "熟练"
+    source_files: ["03-jurassic-giants.md"]
+  - id: lvl_004
+    title: { zh: "恐龙的食性", en: "Dinosaur Diets" }
+    difficulty: "精通"
+    source_files: ["04-dinosaur-diets.md"]
+  - id: lvl_005
+    title: { zh: "大灭绝", en: "The Great Extinction" }
+    difficulty: "精通"
+    is_boss: true
+    source_files: ["05-great-extinction.md"]

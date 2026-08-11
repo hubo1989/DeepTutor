@@ -315,6 +315,7 @@ from deeptutor.api.routers import (
     co_writer,
     dashboard,
     imports,
+    kids,
     knowledge,
     mastery_path,
     mcp_settings,
@@ -324,6 +325,7 @@ from deeptutor.api.routers import (
     partners,
     personas,
     plugins_api,
+    profiles,
     question,
     question_notebook,
     quiz_judge,
@@ -474,6 +476,12 @@ app.include_router(unified_ws.router, prefix="/api/v1", tags=["unified-ws"])
 # Quiz AI-judge WebSocket — same caveat as unified_ws above; auth is checked
 # inside the handler so the WS upgrade isn't rejected by an HTTP-style dep.
 app.include_router(quiz_judge.router, prefix="/api/v1", tags=["quiz-judge"])
+
+# Kid profiles — gamified learning account management
+app.include_router(profiles.router, prefix="/api/v1", tags=["profiles"], dependencies=_auth)
+
+# Kids gamified learning — themes, maps, progress
+app.include_router(kids.router, prefix="/api/v1", tags=["kids"], dependencies=_auth)
 
 
 @app.get("/")
