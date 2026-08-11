@@ -1,6 +1,6 @@
 name: Docker Release
 
-# Triggered when a GitHub Release is published.
+# Triggered when a GitHub Release is published, or manually via workflow_dispatch.
 # Builds a multi-platform Docker image and pushes it to GitHub Container Registry (GHCR).
 #
 # Image: ghcr.io/${{ github.repository_owner }}/deeptutor
@@ -8,11 +8,25 @@ name: Docker Release
 #   - Version tag stripped of 'v' prefix (e.g. release v1.2.3 → image tag 1.2.3)
 #   - latest (always points to the most recently published release)
 #
+# Note: GitHub does not fire the `release` event for releases that are created
+# or modified through the REST API. workflow_dispatch is the fallback for those
+# cases — pass `version` (e.g. 1.6.0) to tag the image explicitly.
+#
 # Platforms: linux/amd64, linux/arm64
 
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref to build (tag/branch/SHA); defaults to the workflow ref.'
+        required: false
+        default: ''
+      version:
+        description: 'Extra image tag (e.g. 1.6.0). Empty = release semver / latest only.'
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -26,6 +40,9 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          # On manual dispatch, build the requested ref; otherwise the tag/branch that triggered the run.
+          ref: ${{ inputs.ref || github.ref }}
 
       # Required for linux/arm64 cross-compilation on GitHub-hosted ubuntu runners
       - name: Set up QEMU
@@ -43,8 +60,9 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # Extract tags from the release:
-      #   type=semver strips the leading 'v' (v1.2.3 → 1.2.3)
+      #   type=semver strips the leading 'v' (v1.2.3 → 1.2.3) — active on release events
       #   type=raw adds a 'latest' tag on every published release
+      #   On manual dispatch, type=raw,value=<version> tags the image with the supplied version.
       - name: Extract Docker metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -53,6 +71,7 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=raw,value=latest
+            type=raw,value=${{ inputs.version }},enable=${{ inputs.version != '' }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
