@@ -109,10 +109,10 @@ python -m pip install -e .
 ( cd web && npm ci --legacy-peer-deps )
 
 deeptutor init
-deeptutor start
+deeptutor start --dev
 ```
 
-Les installations depuis les sources exécutent Next.js en mode dev contre le répertoire `web/` local ; tout le reste (structure de configuration, ports, arrêt avec `Ctrl+C`) correspond à l'Option 1.
+`deeptutor start` compile une fois le frontend `web/` local en production puis le réutilise ; `--dev` lance Next.js en HMR. Structure de configuration, ports et `Ctrl+C` correspondent à l'Option 1.
 
 <details>
 <summary><b>Environnement Conda</b> (à la place de <code>venv</code>)</summary>
@@ -143,11 +143,11 @@ pip install -e ".[math-animator]"   # addon Manim ; nécessite LaTeX/ffmpeg/libs
 
 **Modifier les dépendances frontend :** exécutez `npm install --legacy-peer-deps` pour actualiser `web/package-lock.json`, puis commitez `web/package.json` et `web/package-lock.json`.
 
-**Serveur de développement bloqué :** si `deeptutor start` signale un frontend existant qui ne répond pas, arrêtez le PID qu'il affiche. Si aucun processus Next.js ne tourne réellement, les fichiers de verrou sont périmés — supprimez-les et réessayez :
+**Serveur de développement bloqué :** si `deeptutor start --dev` signale un frontend existant qui ne répond pas, arrêtez le PID qu'il affiche. Si aucun processus Next.js ne tourne réellement, les fichiers de verrou sont périmés — supprimez-les et réessayez :
 
 ```bash
 rm -f web/.next/dev/lock web/.next/lock
-deeptutor start
+deeptutor start --dev
 ```
 
 </details>
@@ -162,7 +162,7 @@ Un conteneur pour l'application Web complète. Images sur GitHub Container Regis
 - `ghcr.io/hkuds/deeptutor:latest` — version stable
 - `ghcr.io/hkuds/deeptutor:pre` — pré-version, si disponible
 
-> Voir [CONTAINERIZATION.md](./CONTAINERIZATION.md) pour les déploiements podman/rootless/système de fichiers racine en lecture seule et le guide complet par installation.
+> Voir [CONTAINERIZATION.md](../../CONTAINERIZATION.md) pour les déploiements podman/rootless/système de fichiers racine en lecture seule et le guide complet par installation.
 
 ```bash
 docker run --rm --name deeptutor \
@@ -227,7 +227,7 @@ Puis dans **Paramètres → Modèles**, pointez l'URL de base du fournisseur ver
 
 Docker Desktop (macOS/Windows) résout généralement `host.docker.internal` sans `--add-host`. Sur Linux, le drapeau est la façon portable de créer ce nom d'hôte avec les versions modernes de Docker Engine.
 
-**Alternative Linux — réseau hôte :** ajoutez `--network=host` et supprimez les drapeaux `-p`. Le conteneur partage directement le réseau hôte, ouvrez donc [http://127.0.0.1:3782](http://127.0.0.1:3782) (ou le `frontend_port` dans `system.json`), et les services hôtes sont accessibles avec des URLs localhost normales comme `http://127.0.0.1:11434/v1`. Notez que le réseau hôte expose les ports du conteneur directement sur l'hôte et peut entrer en conflit avec des services existants — pour les maintenir sur loopback, définissez `BACKEND_HOST=127.0.0.1` et `FRONTEND_HOST=127.0.0.1` (voir [CONTAINERIZATION.md](./CONTAINERIZATION.md)).
+**Alternative Linux — réseau hôte :** ajoutez `--network=host` et supprimez les drapeaux `-p`. Le conteneur partage directement le réseau hôte, ouvrez donc [http://127.0.0.1:3782](http://127.0.0.1:3782) (ou le `frontend_port` dans `system.json`), et les services hôtes sont accessibles avec des URLs localhost normales comme `http://127.0.0.1:11434/v1`. Notez que le réseau hôte expose les ports du conteneur directement sur l'hôte et peut entrer en conflit avec des services existants — pour les maintenir sur loopback, définissez `BACKEND_HOST=127.0.0.1` et `FRONTEND_HOST=127.0.0.1` (voir [CONTAINERIZATION.md](../../CONTAINERIZATION.md)).
 
 </details>
 
@@ -308,7 +308,7 @@ Tout ce qui se trouve sous `data/user/settings/` est du JSON/YAML brut. La page 
 | `system.json` | Ports backend/frontend, base d'API publique, CORS, vérification SSL, répertoire des pièces jointes et limites de téléversement/extraction |
 | `auth.json` | Basculement d'authentification optionnel, nom d'utilisateur, hachage de mot de passe, paramètres de jeton/cookie |
 | `integrations.json` | Paramètres d'intégration PocketBase et sidecar optionnels |
-| `interface.json` | Langue de l'interface / thème / préférences de barre latérale |
+| `interface.json` | Langue de l'interface et de sortie du modèle / thème / préférences de barre latérale |
 | `main.yaml` | Valeurs par défaut du comportement d'exécution et injection de chemin |
 | `agents.yaml` | Paramètres de température et de jetons pour les capacités/outils |
 
@@ -492,7 +492,7 @@ Le Memory Graph montre toute la pyramide — la synthèse L3 au centre, L2 dans 
 <img src="../../assets/figs/web-1.4.6+/settings/00-setting%20overview.png" alt="Hub Settings de DeepTutor" width="900">
 </div>
 
-Settings est le plan de contrôle opérationnel, avec une bande de statut en direct (Backend, LLM, Embedding, Recherche) et une carte par zone : **Apparence** (thème, langue de l'interface, style des blocs de code), **Réseau** (base d'API, ports, CORS), **Modèles** (LLM, Embedding, Recherche, Texte-à-Parole, Parole-à-Texte, Génération d'Images, Génération de Vidéos), **Base de Connaissances** (moteur d'analyse de documents), **Chat** (outils, paramètres par capacité, limites des pièces jointes), **Partners & Agents** (les sous-agents que vous pouvez consulter depuis un tour), et **Memory** (les budgets du consolidateur).
+Settings est le plan de contrôle opérationnel, avec une bande de statut en direct (santé du backend et mémoire résidente en direct sur l'arborescence de processus) et une carte par zone : **Apparence** (thème, langue de l'interface et de sortie du modèle, style des blocs de code), **Réseau** (base d'API, ports, CORS), **Modèles** (LLM, Embedding, Recherche, Texte-à-Parole, Parole-à-Texte, Génération d'Images, Génération de Vidéos), **Base de Connaissances** (moteur d'analyse de documents), **Chat** (outils, paramètres par capacité, limites des pièces jointes), **Partners & Agents** (les sous-agents que vous pouvez consulter depuis un tour), et **Memory** (les budgets du consolidateur).
 
 <div align="center">
 <img src="../../assets/figs/web-1.4.6+/settings/01-appearance%20settings.png" alt="Paramètres d'apparence et thèmes DeepTutor" width="900">
@@ -500,7 +500,9 @@ Settings est le plan de contrôle opérationnel, avec une bande de statut en dir
 
 La plupart des sections utilisent un flux brouillon-et-application, vous pouvez donc tester un fournisseur avant de vous y engager. Quatre thèmes sont livrés dans la boîte — Default, Cream, Dark et Glass. Les fichiers `.env` à la racine du projet sont intentionnellement ignorés ; la configuration d'exécution vit sous `data/user/settings/*.json` sauf si `DEEPTUTOR_HOME` ou `deeptutor start --home` pointe l'application ailleurs.
 
-**OAuth OpenAI Codex (expérimental).** Choisir **OpenAI Codex** sous Modèles → LLM remplace les champs de clé API par une connexion navigateur qui s'exécute contre votre propre forfait ChatGPT, donc aucune `OPENAI_API_KEY` n'est nécessaire. Les jetons résident uniquement dans `data/system/user-secrets/<owner>/private/openai-codex/` — en dehors de tout arbre que le sandbox d'exécution peut atteindre — et DeepTutor ne lit ni ne modifie jamais votre connexion CLI `~/.codex`. La liste de modèles provient du catalogue en direct de ce compte ; se connecter publie le profil, mais celui-ci ne devient le modèle actif que si aucun LLM n'est encore configuré, donc cela ne redirige jamais un déploiement à votre insu. Parce qu'un jeton autorise le forfait d'une seule personne, le profil n'est pas partageable via les attributions utilisateur — chaque compte doit se connecter pour lui-même, et le navigateur doit pouvoir atteindre la machine qui exécute le backend (sur un serveur distant, exécutez plutôt `deeptutor provider login openai-codex` là-bas). Les erreurs de quota et les échecs de catalogue sont rapportés tels quels et ne basculent jamais vers un fournisseur payant. Ce chemin de compatibilité est expérimental : l'interface en amont peut changer.
+**OAuth OpenAI Codex (expérimental).** Choisir **OpenAI Codex** sous Modèles → LLM remplace les champs de clé API par une connexion navigateur qui s'exécute contre votre propre forfait ChatGPT, donc aucune `OPENAI_API_KEY` n'est nécessaire. Les jetons résident uniquement dans `data/system/user-secrets/<owner>/private/openai-codex/` — dans le déploiement Compose multi-conteneurs, en dehors de tout arbre que le sandbox d'exécution peut atteindre — et DeepTutor ne lit ni ne modifie jamais votre connexion CLI `~/.codex`. La liste de modèles provient du catalogue en direct de ce compte ; se connecter publie le profil, mais celui-ci ne devient le modèle actif que si aucun LLM n'est encore configuré, donc cela ne redirige jamais un déploiement à votre insu. Parce qu'un jeton autorise le forfait d'une seule personne, le profil n'est pas partageable via les attributions utilisateur — chaque compte doit se connecter pour lui-même, utilisateurs ordinaires compris : leur carte se trouve sous Modèles → LLM, et les modèles, le catalogue et la déconnexion qui en résultent restent privés à ce compte, et le navigateur doit pouvoir atteindre la machine qui exécute le backend (sur un serveur distant, exécutez plutôt `deeptutor provider login openai-codex` là-bas). Les erreurs de quota et les échecs de catalogue sont rapportés tels quels et ne basculent jamais vers un fournisseur payant. Ce chemin de compatibilité est expérimental : l'interface en amont peut changer.
+
+Les déploiements locaux par défaut Docker et Podman utilisent des réseaux loopback séparés et nécessitent un pont temporaire pendant la connexion. Suivez le [guide du pont OAuth Codex local temporaire](../../CONTAINERIZATION.md#temporary-local-codex-oauth-bridge) pour les commandes exactes de Docker, Compose, Podman et d'arrêt.
 
 Pour un déploiement distant, le `localhost` du navigateur et le `localhost` du serveur sont deux machines différentes, donc un simple proxy inverse ne peut pas à lui seul acheminer le callback localhost du navigateur jusqu'au serveur. Utilisez un tunnel SSH comme pont de callback. Le tunnel atteint le port Web déjà publié ; Next.js ne réécrit que le chemin de callback exact vers le courtier de callback public, et ce courtier valide `state` avant de router vers l'opération OAuth d'origine. L'écouteur de callback reste sur le loopback du backend, les ports `1455` et `1457` ne sont pas publiés, et ce chemin prend en charge le réseau bridge Docker par défaut.
 
@@ -591,7 +593,7 @@ Le dépôt inclut un [`SKILL.md`](SKILL.md) racine — un document de passation 
 | Commande | Description |
 |:---|:---|
 | `deeptutor init` | Créer ou mettre à jour `data/user/settings` pour l'espace de travail actuel |
-| `deeptutor start [--home PATH]` | Lancer le backend + frontend ensemble |
+| `deeptutor start [--home PATH] [--dev]` | Lancer le backend + frontend ensemble |
 | `deeptutor serve [--port PORT]` | Démarrer uniquement le backend FastAPI |
 | `deeptutor run <capacité> <message>` | Exécuter un seul tour de capacité (`chat`, `deep_solve`, `deep_question`, `deep_research`, `visualize`, `math_animator`, `mastery_path`) ; ajoutez `--format json` pour la sortie NDJSON |
 | `deeptutor chat` | REPL interactif avec contrôles de capacité, outil, KB, carnet et historique |

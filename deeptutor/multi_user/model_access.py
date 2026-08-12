@@ -1,7 +1,24 @@
 """Server-side model grant resolution and redacted model views.
 
-Platform LLM assignments and source permissions are resolved here; user-owned
-provider credentials are still resolved only from the BYOK vault at runtime.
+Grants carry LLM assignments only (grant v2): embedding and search always
+resolve from the deployment's active profiles, so per-user grants for them
+were never enforced and are not stored.
+
+Three sources reach an ordinary user, and :func:`redacted_model_access` is the
+one place all three are resolved:
+
+* ``admin`` models assigned to the user through a grant;
+* ``personal`` owner-bound profiles the user signed in for themselves (see
+  :mod:`deeptutor.multi_user.personal_models`) — OAuth providers such as Codex
+  authenticate one individual's plan, so those profiles are never lent through
+  grants and are only ever surfaced to the owner; and
+* ``byok`` owner-bound API-key profiles the user stored in the BYOK vault (see
+  :mod:`deeptutor.multi_user.byok_vault`), gated by the deployment's BYOK
+  policy and the user's grant.
+
+Everything downstream — the option list, the capability gate, and selection
+validation — reads that one function, so the three can never disagree about
+what a user may use.
 """
 
 from __future__ import annotations
@@ -107,6 +124,14 @@ def redacted_model_access(user_id: str | None = None) -> dict[str, list[dict[str
                 "available": bool(byok_enabled and allowed),
             }
         )
+    if user_id == user.id:
+        # Only ever the caller's OWN personal models. An administrator
+        # inspecting somebody's grants asks for that user's id, and their
+        # personal sign-in is not the administrator's business — nor is it in
+        # the grant editor's gift to assign.
+        from .personal_models import personal_llm_rows
+
+        result["llm"].extend(personal_llm_rows())
     return result
 
 
@@ -124,7 +149,7 @@ def allowed_llm_options() -> dict[str, Any]:
             "label": item.get("name") or item.get("model") or item.get("model_id"),
             "model": item.get("model") or "",
             "provider": "",
-            "source": "admin",
+            "source": item.get("source") or "admin",
             "is_active_default": False,
         }
         for item in access
@@ -208,8 +233,11 @@ def apply_allowed_llm_selection(selection: dict[str, Any] | None) -> dict[str, A
             "profile_id": profile_id,
             "generation": int(profile.get("generation") or 0),
         }
-    if source != "platform":
-        raise PermissionError("Execution source must be platform or byok")
+    if source not in ("platform", "personal"):
+        raise PermissionError("Execution source must be platform, personal, or byok")
+    # ``personal`` models are owner-bound OAuth sign-ins (e.g. Codex); validate
+    # them exactly like a platform grant — by profile/model id against the
+    # redacted access list, which already carries the personal rows.
     if user.is_admin:
         return selection
     profile_id = str(selection.get("profile_id") or "")

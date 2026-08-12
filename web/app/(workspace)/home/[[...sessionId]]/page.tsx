@@ -96,13 +96,14 @@ import {
 } from "@/lib/research-types";
 import { listKnowledgeBases } from "@/lib/knowledge-api";
 import { getSubagentSettings } from "@/lib/subagents-api";
-import { listLLMOptions, type LLMOption } from "@/lib/llm-options";
+import { useLLMOptions } from "@/hooks/useLLMOptions";
 import {
   getEnabledOptionalTools,
   invalidateEnabledOptionalToolsCache,
 } from "@/lib/tools-settings";
 import { downloadChatMarkdown } from "@/lib/chat-export";
 import { buildChatOutline } from "@/lib/chat-outline";
+import { isPlaceholderSessionTitle } from "@/lib/session-title";
 import type { SpaceMemoryFile } from "@/lib/space-items";
 import {
   selectedBooksToPayload,
@@ -380,12 +381,13 @@ export default function ChatPage() {
         : new URLSearchParams(window.location.search).get("agent");
   }
   const agentPreselectDoneRef = useRef(false);
-  const [llmOptions, setLLMOptions] = useState<LLMOption[]>([]);
-  const [activeLLMDefault, setActiveLLMDefault] = useState<LLMSelection | null>(
-    null,
-  );
-  const [llmOptionsLoading, setLLMOptionsLoading] = useState(true);
-  const [llmOptionsError, setLLMOptionsError] = useState(false);
+  const {
+    options: llmOptions,
+    activeDefault: activeLLMDefault,
+    loading: llmOptionsLoading,
+    error: llmOptionsError,
+    refresh: refreshLLMOptions,
+  } = useLLMOptions();
   const [capabilityConfigs, setCapabilityConfigs] =
     useState<CapabilityPlaygroundConfigMap>({});
   // User-toggleable tools the user has enabled in /settings/tools. This is
@@ -694,8 +696,9 @@ export default function ChatPage() {
     [state.messages],
   );
   const persistedSessionTitle = state.sessionTitle.trim();
-  const displaySessionTitle =
-    persistedSessionTitle || firstUserTitle || t("New chat");
+  const displaySessionTitle = isPlaceholderSessionTitle(persistedSessionTitle)
+    ? firstUserTitle || t("New chat")
+    : persistedSessionTitle;
   const canRenameSession = Boolean(state.sessionId);
   const titleInputRef = useRef<HTMLInputElement | null>(null);
   const skipTitleCommitRef = useRef(false);
@@ -1086,29 +1089,6 @@ export default function ChatPage() {
     void refreshUserEnabledTools();
   }, [refreshUserEnabledTools]);
 
-  const refreshLLMOptions = useCallback(
-    async (options?: { force?: boolean }) => {
-      setLLMOptionsLoading(true);
-      try {
-        const payload = await listLLMOptions({ force: options?.force });
-        setLLMOptions(payload.options);
-        setActiveLLMDefault(payload.active);
-        setLLMOptionsError(false);
-      } catch {
-        setLLMOptionsError(true);
-        setLLMOptions([]);
-        setActiveLLMDefault(null);
-      } finally {
-        setLLMOptionsLoading(false);
-      }
-    },
-    [],
-  );
-
-  useEffect(() => {
-    void refreshLLMOptions();
-  }, [refreshLLMOptions]);
-
   useEffect(() => {
     if (state.llmSelection || !activeLLMDefault) return;
     setLLMSelection(activeLLMDefault);
@@ -1118,7 +1098,7 @@ export default function ChatPage() {
     if (typeof window === "undefined") return;
     const refresh = () => {
       void refreshKnowledgeBases({ force: true });
-      void refreshLLMOptions({ force: true });
+      void refreshLLMOptions({ force: true, background: true });
       // Picks up toggles the user changed in another tab (/settings/tools).
       invalidateEnabledOptionalToolsCache();
       void refreshUserEnabledTools({ force: true });

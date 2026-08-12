@@ -100,6 +100,16 @@ def is_connected_kb(entry: Any) -> bool:
     return isinstance(entry, dict) and entry.get("type") in CONNECTED_KB_TYPES
 
 
+def supports_local_raw_files(entry: Any) -> bool:
+    """Whether the KB owns a DeepTutor-managed local ``raw/`` directory.
+
+    Connected KBs are pointers to external resources.  Some point at a local
+    folder and others at a remote service, but neither kind participates in
+    DeepTutor's raw-file upload and management API.
+    """
+    return isinstance(entry, dict) and not is_connected_kb(entry)
+
+
 def external_root_of(entry: Any) -> str | None:
     """Absolute path a connected KB points at, or ``None`` for ordinary KBs.
 
@@ -131,5 +141,6 @@ __all__ = [
     "CONNECTED_KB_TYPES",
     "is_connected_kb",
     "is_public_kb",
+    "supports_local_raw_files",
     "external_root_of",
 ]

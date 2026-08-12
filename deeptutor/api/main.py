@@ -211,6 +211,24 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Failed to close MCP connections: {e}")
 
+    # Close pooled LLM SDK clients so their keep-alive sockets and transports
+    # are released deterministically instead of waiting for interpreter GC.
+    try:
+        from deeptutor.services.llm.provider_factory import close_runtime_provider_pool
+
+        await close_runtime_provider_pool()
+        logger.info("LLM provider pool closed")
+    except Exception as e:
+        logger.warning(f"Failed to close LLM provider pool: {e}")
+
+    try:
+        from deeptutor.core.agentic.client import close_agentic_client_pool
+
+        await close_agentic_client_pool()
+        logger.info("Agentic LLM client pool closed")
+    except Exception as e:
+        logger.warning(f"Failed to close agentic LLM client pool: {e}")
+
     # Stop EventBus
     try:
         from deeptutor.events.event_bus import get_event_bus
@@ -407,6 +425,15 @@ app.include_router(
     prefix="/api/v1/question-notebook",
     tags=["question-notebook"],
     dependencies=_auth,
+)
+# Public UI-settings read (auth pages bootstrap the interface language
+# before a session exists, so GET /api/v1/settings/ui must not be gated
+# by _auth). Mounted first so the path resolves here, not on the gated
+# settings router below.
+app.include_router(
+    settings.public_router,
+    prefix="/api/v1/settings",
+    tags=["settings"],
 )
 app.include_router(
     settings.router, prefix="/api/v1/settings", tags=["settings"], dependencies=_auth
