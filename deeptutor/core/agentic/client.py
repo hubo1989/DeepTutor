@@ -202,7 +202,7 @@ def _wrap_token_quota(
     from deeptutor.multi_user.token_quota import current_user_quota_policy
 
     # BYOK calls still need the request-rate/token safety gate; only the
-    # platform path may skip wrapping when no user quota is configured.  The
+    # platform path may skip metering when no user quota is configured.  The
     # source is carried by LLMClientConfig so this remains correct when the
     # request ContextVar does not survive a thread/async boundary.
     normalized_source: Literal["platform", "byok"] = "byok" if source == "byok" else "platform"
@@ -211,7 +211,17 @@ def _wrap_token_quota(
         and current_user_quota_policy() is None
         and not commercial_usage_required(source=normalized_source)
     ):
-        return client
+        # No metering is configured, but callers still attach internal kwargs
+        # (``_commercial_request_id``); wrap so they are stripped rather than
+        # leaked to the provider's ``create()``. ``meter=False`` makes the
+        # wrapper a pure passthrough with no reservation overhead.
+        return _TokenQuotaClient(
+            client,
+            source=normalized_source,
+            provider=provider,
+            model=model,
+            meter=False,
+        )
     return _TokenQuotaClient(
         client,
         source=normalized_source,
@@ -228,6 +238,7 @@ class _TokenQuotaClient:
         source: Literal["platform", "byok"] = "platform",
         provider: str | None = None,
         model: str | None = None,
+        meter: bool = True,
     ) -> None:
         self._client = client
         self.chat = SimpleNamespace(
@@ -236,6 +247,7 @@ class _TokenQuotaClient:
                 source=source,
                 provider=provider,
                 model=model,
+                meter=meter,
             ),
         )
 
@@ -251,11 +263,17 @@ class _TokenQuotaCompletions:
         source: Literal["platform", "byok"] = "platform",
         provider: str | None = None,
         model: str | None = None,
+        meter: bool = True,
     ) -> None:
         self._completions = completions
         self._source = source
         self._provider = provider
         self._model = model
+        # When False the wrapper still strips DeepTutor-internal kwargs (e.g.
+        # ``_commercial_request_id``) so they never reach the provider, but it
+        # skips every quota/commercial reservation. Used for the platform path
+        # when no quota policy and no commercial metering are configured.
+        self._meter = meter
 
     async def create(self, **kwargs: Any) -> Any:
         # DeepTutor-only accounting metadata must never reach the provider.
@@ -263,6 +281,10 @@ class _TokenQuotaCompletions:
         # reuse this value so PostgreSQL can return the durable reservation
         # instead of booking a duplicate.
         commercial_request_id = kwargs.pop("_commercial_request_id", None)
+        if not self._meter:
+            # No quota/commercial metering is configured — forward untouched
+            # apart from stripping the internal metadata already popped above.
+            return await self._completions.create(**kwargs)
         requested, prompt_estimate, output_estimate = _request_token_estimate(kwargs)
         commercial_requested = _request_commercial_token_bound(kwargs, output_estimate)
         if self._source == "byok":
