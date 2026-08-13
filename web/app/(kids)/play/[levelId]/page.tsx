@@ -2,6 +2,7 @@
 
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
+import { useTranslation } from "react-i18next";
 import { ChevronLeft, Lightbulb } from "lucide-react";
 import { kidsTheme } from "@/features/kids/theme/kidsTheme";
 import { useKidsStore } from "@/features/kids/store/kidsStore";
@@ -63,6 +64,7 @@ const DEMO_QUESTIONS: Question[] = [
 
 export default function PlayPage() {
   const router = useRouter();
+  const { t } = useTranslation();
   const params = useParams<{ levelId: string }>();
   const levelId = params.levelId;
   const { profile } = useKidProfile();
@@ -228,7 +230,7 @@ export default function PlayPage() {
         <button
           onClick={() => router.push("/kids-home")}
           className="p-2 rounded-full hover:bg-[var(--muted)]"
-          aria-label="Back"
+          aria-label={t("kids.back")}
         >
           <ChevronLeft className="w-6 h-6" style={{ color: "var(--foreground)" }} />
         </button>
@@ -281,7 +283,7 @@ export default function PlayPage() {
           onClick={() => store.showHint()}
         >
           <Lightbulb className="w-5 h-5" />
-          Show Hint
+          {t("kids.showHint")}
         </button>
       )}
 
@@ -313,7 +315,7 @@ export default function PlayPage() {
             handleFeedbackComplete();
           }}
         >
-          {isLastQuestion ? "See Results" : "Next Question"}
+          {isLastQuestion ? t("kids.seeResults") : t("kids.nextQuestion")}
         </button>
       )}
 

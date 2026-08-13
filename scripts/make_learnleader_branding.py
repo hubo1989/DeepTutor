@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
-"""Generate LearnLeader (导学吧) placeholder branding assets.
+"""Generate the LearnLeader (导学吧) brand asset set from the source icon.
 
-Produces a clean indigo/violet icon mark built around the glyph 导
-("to guide / lead" — the lead character of 导学吧), plus a horizontal
-wordmark banner and the favicon set. All output is PNG so it drops into
-``web/public/`` without touching any code references.
+The source icon is an imagegen-produced 1024+ square: indigo→violet gradient
+background with a white open-book / wings emblem representing guidance and
+learning. This script resizes it for every size ``web/public/`` expects,
+makes the near-black rounded corners transparent, composites a horizontal
+banner wordmark, and produces a dark-background variant.
 
-Run:  python scripts/make_learnleader_branding.py
+Usage:
+  # 1. Generate the base icon with imagegen (see SKILL.md), then:
+  ICON_SRC=/path/to/icon.png python scripts/make_learnleader_branding.py
+
+If ICON_SRC is unset, falls back to the glyph-based generator (legacy).
 """
 from __future__ import annotations
 
@@ -17,6 +22,12 @@ from PIL import Image, ImageDraw, ImageFont
 OUT = Path("web/public")
 CJK = "/System/Library/Fonts/STHeiti Medium.ttc"
 LATIN = "/System/Library/Fonts/SFNS.ttf"
+
+import os
+
+_icon_src_env = os.environ.get("ICON_SRC", "")
+_bundled = Path(__file__).parent / "branding-source" / "learnleader-icon.png"
+ICON_SRC = Path(_icon_src_env) if _icon_src_env else (_bundled if _bundled.exists() else None)
 
 # Brand palette: indigo -> violet gradient (friendly, modern EdTech).
 TOP = (99, 102, 241, 255)      # #6366F1 indigo-500
@@ -67,6 +78,86 @@ def _draw_glyph(img: Image.Image, glyph: str, size: int, color=WHITE, ratio: flo
     x = (size - w) / 2 - bbox[0]
     y = (size - h) / 2 - bbox[1] - int(size * 0.02)
     d.text((x, y), glyph, font=font, fill=color)
+
+
+# ---------------------------------------------------------------------------
+# imagegen-source path (ICON_SRC env var)
+# ---------------------------------------------------------------------------
+
+def _load_imagegen_icon():
+    """Load the AI-generated icon and make near-black corner pixels transparent."""
+    if ICON_SRC is None or not ICON_SRC.exists():
+        return None
+    img = Image.open(ICON_SRC).convert("RGBA")
+    w, h = img.size
+    alpha = Image.new("L", (w, h), 255)
+    alpha_px = alpha.load()
+    px = img.load()
+    for y in range(h):
+        for x in range(w):
+            r, g, b, _ = px[x, y]
+            if r < 15 and g < 15 and b < 15:
+                alpha_px[x, y] = 0
+    img.putalpha(alpha)
+    return img
+
+
+def _make_icon_from(src: Image.Image, size: int, path: Path):
+    resized = src.resize((size, size), Image.LANCZOS)
+    resized.save(path)
+    print(f"  wrote {path} ({size}x{size})")
+
+
+def _make_black_icon_from(src: Image.Image, size: int, path: Path):
+    """Dark-background variant: keep the white emblem, swap gradient for ink."""
+    resized = src.resize((size, size), Image.LANCZOS).convert("RGBA")
+    w, h = resized.size
+    px = resized.load()
+    out = Image.new("RGBA", (w, h), INK)
+    out_px = out.load()
+    for y in range(h):
+        for x in range(w):
+            r, g, b, a = px[x, y]
+            if a < 128:
+                continue
+            brightness = (r + g + b) / 3
+            out_px[x, y] = (255, 255, 255, 255) if brightness > 180 else INK
+    out.save(path)
+    print(f"  wrote {path} ({size}x{size})")
+
+
+def _make_banner_from(src: Image.Image, path: Path):
+    """Horizontal wordmark: [icon] 导学吧  LearnLeader."""
+    icon_size = 220
+    pad = 24
+    gap = 28
+    cjk_size = 110
+    latin_size = 72
+    cjk_font = _font(CJK, cjk_size)
+    latin_font = _font(LATIN, latin_size)
+    tmp = Image.new("RGBA", (1, 1))
+    td = ImageDraw.Draw(tmp)
+    cjk_bbox = td.textbbox((0, 0), "导学吧", font=cjk_font)
+    latin_bbox = td.textbbox((0, 0), "LearnLeader", font=latin_font)
+    cjk_w = cjk_bbox[2] - cjk_bbox[0]
+    cjk_h = cjk_bbox[3] - cjk_bbox[1]
+    latin_w = latin_bbox[2] - latin_bbox[0]
+    latin_h = latin_bbox[3] - latin_bbox[1]
+    height = icon_size + pad * 2
+    width = int(pad + icon_size + gap + cjk_w + 24 + latin_w + pad)
+    canvas = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    icon = src.resize((icon_size, icon_size), Image.LANCZOS)
+    canvas.paste(icon, (pad, pad), icon)
+    d = ImageDraw.Draw(canvas)
+    cy = height / 2
+    x = pad + icon_size + gap
+    d.text((x - cjk_bbox[0], cy - cjk_h / 2 - cjk_bbox[1] - 4),
+           "导学吧", font=cjk_font, fill=INK)
+    x2 = x + cjk_w + 24
+    d.text((x2 - latin_bbox[0], cy - latin_h / 2 - latin_bbox[1] + 2),
+           "LearnLeader", font=latin_font, fill=TOP)
+    canvas.save(path)
+    print(f"  wrote {path} ({canvas.width}x{canvas.height})")
 
 
 def make_icon(size: int, path: Path):
@@ -138,6 +229,19 @@ def make_banner(path: Path):
 
 def main():
     OUT.mkdir(parents=True, exist_ok=True)
+    icon_src = _load_imagegen_icon()
+    if icon_src is not None:
+        print(f"Generating LearnLeader branding from imagegen icon ({ICON_SRC}) ...")
+        _make_icon_from(icon_src, 256, OUT / "logo.png")
+        _make_icon_from(icon_src, 512, OUT / "logo-ver2.png")
+        _make_black_icon_from(icon_src, 256, OUT / "logo_black.png")
+        _make_banner_from(icon_src, OUT / "banner.png")
+        _make_icon_from(icon_src, 16, OUT / "favicon-16x16.png")
+        _make_icon_from(icon_src, 32, OUT / "favicon-32x32.png")
+        _make_icon_from(icon_src, 180, OUT / "apple-touch-icon.png")
+        print("Done.")
+        return
+
     print("Generating LearnLeader branding into web/public/ ...")
     make_icon(256, OUT / "logo.png")
     make_icon(512, OUT / "logo-ver2.png")

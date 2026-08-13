@@ -176,20 +176,20 @@ export default function AppShell({ sidebar, children }: AppShellProps) {
               <Menu size={18} strokeWidth={1.7} />
             </button>
             <Link href="/" className="flex items-center gap-1.5">
-              <Image
-                src="/logo.png"
-                alt="DeepTutor"
-                width={20}
-                height={20}
-                className="h-5 w-5"
-              />
-              <Image
-                src="/banner.png"
-                alt="DeepTutor"
-                width={897}
-                height={236}
-                className="h-[18px] w-auto"
-              />
+             <Image
+               src="/logo.png"
+               alt="LearnLeader"
+               width={20}
+               height={20}
+               className="h-5 w-5"
+             />
+             <Image
+               src="/banner.png"
+               alt="LearnLeader"
+               width={897}
+               height={236}
+               className="h-[18px] w-auto"
+             />
             </Link>
           </div>
 

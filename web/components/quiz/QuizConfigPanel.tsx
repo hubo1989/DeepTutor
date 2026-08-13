@@ -628,6 +628,7 @@ function DraggableRatioBar({
   total,
   onChange,
 }: DraggableRatioBarProps) {
+  const { t } = useTranslation();
   const barRef = useRef<HTMLDivElement>(null);
   // Snapshot of the drag start: which boundary, the pointer x at start,
   // and the counts at start. We compute deltas off the snapshot rather
@@ -744,10 +745,10 @@ function DraggableRatioBar({
         return (
           <div
             key={`boundary-${qt}`}
-            role="separator"
-            aria-orientation="vertical"
-            aria-label="Drag to adjust ratio"
-            style={{ left: `${leftPct}%` }}
+           role="separator"
+           aria-orientation="vertical"
+           aria-label={t("quiz.dragToAdjustRatio")}
+           style={{ left: `${leftPct}%` }}
             onPointerDown={handleBoundaryPointerDown(i)}
             onPointerMove={handlePointerMove}
             onPointerUp={handlePointerUp}

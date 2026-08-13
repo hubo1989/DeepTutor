@@ -72,8 +72,10 @@ export function AppShellProvider({ children }: { children: React.ReactNode }) {
   const [theme, setThemeState] = useState<Theme>(() => {
     return getStoredTheme() ?? getSystemTheme();
   });
-  // Always start with "en" to match SSR; hydrate from localStorage after mount
-  const [language, setLanguageState] = useState<AppLanguage>("en");
+  // Always start with the interface default ("zh") to match SSR; hydrate from
+  // localStorage after mount. readStoredLanguage() returns the same default
+  // when the browser has no recorded choice.
+  const [language, setLanguageState] = useState<AppLanguage>("zh");
   const [activeSessionId, setActiveSessionIdState] = useState<string | null>(
     () => readStoredActiveSessionId(),
   );

@@ -61,6 +61,11 @@ export const RESPONSE_LANGUAGE_EVENT = "deeptutor:response-language";
 export const SIDEBAR_COLLAPSED_EVENT = "deeptutor:sidebar-collapsed";
 export const CODE_BLOCK_SETTINGS_EVENT = "deeptutor:code-block-settings";
 
+// The interface language defaults to Chinese. The model output language keeps
+// its own default ("en") via resolveResponseLanguage — they are separate
+// concerns surfaced as separate rows in Settings > Appearance.
+export const DEFAULT_INTERFACE_LANGUAGE: AppLanguage = "zh";
+
 export function normalizeLanguage(
   value: string | null | undefined,
 ): AppLanguage {
@@ -77,11 +82,12 @@ export function resolveResponseLanguage(
 }
 
 export function readStoredLanguage(): AppLanguage {
-  if (typeof window === "undefined") return "en";
+  if (typeof window === "undefined") return DEFAULT_INTERFACE_LANGUAGE;
   try {
-    return normalizeLanguage(window.localStorage.getItem(LANGUAGE_STORAGE_KEY));
+    const stored = window.localStorage.getItem(LANGUAGE_STORAGE_KEY);
+    return stored === null ? DEFAULT_INTERFACE_LANGUAGE : normalizeLanguage(stored);
   } catch {
-    return "en";
+    return DEFAULT_INTERFACE_LANGUAGE;
   }
 }
 

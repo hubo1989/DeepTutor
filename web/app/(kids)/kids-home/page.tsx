@@ -2,6 +2,7 @@
 
 import React, { useCallback, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
+import { useTranslation } from "react-i18next";
 import { Flame, Zap, TrendingUp, ChevronRight } from "lucide-react";
 import { kidsTheme } from "@/features/kids/theme/kidsTheme";
 import { useKidProfile } from "@/features/kids/hooks/useKidProfile";
@@ -20,6 +21,7 @@ import {
 
 export default function KidsHomePage() {
   const router = useRouter();
+  const { t } = useTranslation();
   const { profile } = useKidProfile();
   const [themes, setThemes] = useState<ThemeSummary[]>([]);
   const [maps, setMaps] = useState<MapProgressItem[]>([]);
@@ -57,7 +59,7 @@ export default function KidsHomePage() {
         }
       } catch (err) {
         if (!cancelled) {
-          setError(err instanceof Error ? err.message : "Failed to load");
+          setError(err instanceof Error ? err.message : t("kids.failedToLoad"));
         }
       } finally {
         if (!cancelled) setLoading(false);
@@ -68,7 +70,7 @@ export default function KidsHomePage() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [t]);
 
   const handleThemeClick = useCallback(
     async (theme: ThemeSummary) => {
@@ -110,7 +112,7 @@ export default function KidsHomePage() {
           }}
           onClick={() => window.location.reload()}
         >
-          Retry
+          {t("kids.retry")}
         </button>
       </div>
     );
@@ -126,10 +128,10 @@ export default function KidsHomePage() {
             className="text-2xl font-extrabold"
             style={{ color: "var(--foreground)" }}
           >
-            {profile?.nickname ?? "Friend"}!
+            {profile?.nickname ?? t("kids.friend")}!
           </h1>
           <p className="text-sm" style={{ color: "var(--muted-foreground)" }}>
-            Choose a theme to start your adventure
+            {t("kids.chooseThemeAdventure")}
           </p>
         </div>
       </div>
@@ -142,7 +144,7 @@ export default function KidsHomePage() {
           iconColor={kidsTheme.colors.xpBar}
           iconBg={`${kidsTheme.colors.xpBar}15`}
           value={dailyXp}
-          label="Today's XP"
+          label={t("kids.todayXp")}
         />
         {/* Streak */}
         <StatCard
@@ -150,8 +152,8 @@ export default function KidsHomePage() {
           iconColor={kidsTheme.colors.streakFlame}
           iconBg={`${kidsTheme.colors.streakFlame}15`}
           value={streakDays}
-          label="Streak"
-          suffix="days"
+          label={t("kids.streak")}
+          suffix={t("kids.streakSuffix")}
         />
         {/* Level */}
         <StatCard
@@ -159,8 +161,8 @@ export default function KidsHomePage() {
           iconColor={kidsTheme.colors.primary}
           iconBg={`${kidsTheme.colors.primary}15`}
           value={level}
-          label="Level"
-          prefix="Lv."
+          label={t("kids.level")}
+          prefix={t("kids.levelPrefix")}
         />
       </div>
 
@@ -173,14 +175,14 @@ export default function KidsHomePage() {
           border: "1px solid var(--border)",
         }}
       >
-        <div className="flex items-center justify-between mb-2">
-          <span className="text-sm font-semibold" style={{ color: "var(--foreground)" }}>
-            Level {level}
-          </span>
-          <span className="text-xs" style={{ color: "var(--muted-foreground)" }}>
-            {totalXp} / {nextLevelXp} XP
-          </span>
-        </div>
+      <div className="flex items-center justify-between mb-2">
+        <span className="text-sm font-semibold" style={{ color: "var(--foreground)" }}>
+          {t("kids.levelN", { n: level })}
+        </span>
+        <span className="text-xs" style={{ color: "var(--muted-foreground)" }}>
+          {t("kids.xpProgress", { current: totalXp, next: nextLevelXp })}
+        </span>
+      </div>
         <div
           className="w-full h-3 overflow-hidden"
           style={{
@@ -207,7 +209,7 @@ export default function KidsHomePage() {
             className="text-lg font-bold mb-3"
             style={{ color: "var(--foreground)" }}
           >
-            Continue Learning
+            {t("kids.continueLearning")}
           </h2>
           <div className="space-y-2">
             {maps.slice(0, 3).map((m) => (
@@ -227,7 +229,7 @@ export default function KidsHomePage() {
                     {m.title}
                   </div>
                   <div className="text-xs" style={{ color: "var(--muted-foreground)" }}>
-                    {m.cleared_levels} / {m.total_levels} levels
+                    {t("kids.levelsProgress", { cleared: m.cleared_levels, total: m.total_levels })}
                   </div>
                 </div>
                 <ChevronRight className="w-5 h-5" style={{ color: "var(--muted-foreground)" }} />
@@ -243,7 +245,7 @@ export default function KidsHomePage() {
           className="text-lg font-bold mb-3"
           style={{ color: "var(--foreground)" }}
         >
-          Choose a Theme
+          {t("kids.chooseTheme")}
         </h2>
         <div className="grid grid-cols-2 gap-3">
           {themes.map((theme) => (
@@ -266,7 +268,7 @@ export default function KidsHomePage() {
                 {theme.title_zh || theme.title_en}
               </span>
               <span className="text-xs mt-1" style={{ color: "var(--muted-foreground)" }}>
-                {theme.level_count} levels
+                {t("kids.levelCount", { count: theme.level_count })}
               </span>
             </button>
           ))}
@@ -285,7 +287,7 @@ export default function KidsHomePage() {
         onClick={() => router.push("/rewards")}
       >
         <span className="text-xl">🏆</span>
-        My Achievements
+        {t("kids.myAchievements")}
       </button>
     </div>
   );

@@ -146,18 +146,19 @@ function LoginPageContent() {
       </p>
 
       <p className="mt-3 text-center text-xs text-[var(--muted-foreground)]">
-        LearnLeader · Agent-Native Learning
+        {t("auth.brandTagline")}
       </p>
     </div>
   );
 }
 
 export default function LoginPage() {
+  const { t } = useTranslation();
   return (
     <Suspense
       fallback={
         <div className="w-full max-w-sm text-center text-sm text-[var(--muted-foreground)]">
-          Loading sign in...
+          {t("auth.loadingSignIn")}
         </div>
       }
     >
