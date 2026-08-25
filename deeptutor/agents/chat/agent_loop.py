@@ -947,13 +947,6 @@ class AgentLoop:
         try:
             return await self.client.chat.completions.create(**kwargs)
         except Exception as exc:
-            if "stream_options" in kwargs and is_stream_options_unsupported(exc):
-                retry_kwargs = dict(kwargs)
-                retry_kwargs.pop("stream_options", None)
-                retry_kwargs["_commercial_request_id"] = (
-                    f"{kwargs['_commercial_request_id']}:compat-no-stream-options"
-                )
-                return await self.client.chat.completions.create(**retry_kwargs)
             if kwargs.get("tools") and is_tool_schema_unsupported(exc):
                 # Capture the provider's raw rejection body. Without it there is
                 # no way to tell *which* parameter/shape a new model family
@@ -985,6 +978,13 @@ class AgentLoop:
                     f"{kwargs['_commercial_request_id']}:compat-no-tools"
                 )
                 self.tool_schemas = None
+                return await self.client.chat.completions.create(**retry_kwargs)
+            if "stream_options" in kwargs and is_stream_options_unsupported(exc):
+                retry_kwargs = dict(kwargs)
+                retry_kwargs.pop("stream_options", None)
+                retry_kwargs["_commercial_request_id"] = (
+                    f"{kwargs['_commercial_request_id']}:compat-no-stream-options"
+                )
                 return await self.client.chat.completions.create(**retry_kwargs)
             if is_image_input_unsupported(exc) and should_degrade_to_text(
                 self.pipeline.binding,

@@ -13,7 +13,10 @@ from deeptutor.core.trace import build_trace_metadata, merge_trace_metadata, new
 from deeptutor.services.llm.config import LLMConfig
 from deeptutor.services.llm.context_window import resolve_effective_context_window
 
-from .ask_user_trace import extract_ask_user_clarifications
+from .ask_user_trace import (
+    extract_ask_user_clarification_blocks,
+    extract_ask_user_clarifications,
+)
 from .protocol import SessionStoreProtocol
 
 #: When the summarizer's output lands within this fraction of its hard token
@@ -46,6 +49,29 @@ def trim_incomplete_tail(text: str) -> str:
     return text.rstrip()
 
 
+def expand_message_context(message: dict[str, Any]) -> list[dict[str, str]]:
+    """Expand one stored row into its true assistant/user chronology."""
+    role = str(message.get("role", "user"))
+    content = str(message.get("content", "") or "")
+    blocks = extract_ask_user_clarification_blocks(message)
+    if role != "assistant" or not blocks:
+        return [{"role": role, "content": content}] if content.strip() else []
+
+    expanded: list[dict[str, str]] = []
+    cursor = 0
+    for raw_offset, clarification in blocks:
+        offset = min(len(content), max(cursor, raw_offset))
+        prefix = content[cursor:offset]
+        if prefix.strip():
+            expanded.append({"role": "assistant", "content": prefix})
+        expanded.append({"role": "user", "content": clarification})
+        cursor = offset
+    suffix = content[cursor:]
+    if suffix.strip():
+        expanded.append({"role": "assistant", "content": suffix})
+    return expanded
+
+
 def format_messages_as_transcript(messages: list[dict[str, Any]]) -> str:
     lines: list[str] = []
     role_map = {
@@ -54,11 +80,10 @@ def format_messages_as_transcript(messages: list[dict[str, Any]]) -> str:
         "system": "System",
     }
     for item in messages:
-        content = str(item.get("content", "") or "").strip()
-        if not content:
-            continue
-        role = role_map.get(str(item.get("role", "user")), "User")
-        lines.append(f"{role}: {content}")
+        for expanded in expand_message_context(item):
+            content = expanded["content"].strip()
+            role = role_map.get(expanded["role"], "User")
+            lines.append(f"{role}: {content}")
     return "\n\n".join(lines)
 
 
@@ -142,15 +167,10 @@ class ContextBuilder:
         cleaned_summary = summary.strip()
         if cleaned_summary:
             history.append({"role": "system", "content": cleaned_summary})
-        history.extend(
-            {
-                "role": item.get("role", "user"),
-                "content": str(item.get("content", "") or ""),
-            }
-            for item in messages
-            if item.get("role") in {"user", "assistant"}
-            and str(item.get("content", "") or "").strip()
-        )
+        for item in messages:
+            for expanded in expand_message_context(item):
+                if expanded["role"] in {"user", "assistant"}:
+                    history.append(expanded)
         return history
 
     async def _append_event(

@@ -55,11 +55,19 @@ def select_ask_user_events(raw_events: str | None) -> list[dict[str, Any]]:
         return []
 
 
-def extract_ask_user_clarifications(message: dict[str, Any]) -> str:
-    """Render a message's resolved ask_user exchanges as plain context text."""
+def extract_ask_user_clarification_blocks(
+    message: dict[str, Any],
+) -> list[tuple[int, str]]:
+    """Return resolved clarifications with their assistant-content boundary.
 
+    ``ask_user`` replies arrive inside one persisted assistant row.  New rows
+    record how many user-facing assistant characters existed at each reply so
+    later context can preserve ``assistant -> user -> assistant`` chronology.
+    Older rows have no boundary and safely fall back to zero: their persisted
+    content is normally the post-reply final answer.
+    """
     pending_questions: dict[str, str] = {}
-    exchanges: list[tuple[str, str]] = []
+    blocks: list[tuple[int, str]] = []
     for event in message.get("events") or []:
         if not isinstance(event, dict):
             continue
@@ -79,6 +87,7 @@ def extract_ask_user_clarifications(message: dict[str, Any]) -> str:
         if not metadata.get("ask_user_resolved"):
             continue
         answers = metadata.get("answers") or []
+        exchanges: list[tuple[str, str]] = []
         resolved = False
         for answer in answers:
             if not isinstance(answer, dict):
@@ -94,18 +103,31 @@ def extract_ask_user_clarifications(message: dict[str, Any]) -> str:
             if preview:
                 question_text = next(iter(pending_questions.values()), "User clarification")
                 exchanges.append((question_text, preview))
+        if exchanges:
+            try:
+                content_offset = max(0, int(metadata.get("assistant_content_offset") or 0))
+            except (TypeError, ValueError):
+                content_offset = 0
+            lines = [
+                "[Earlier ask_user clarification — treat these answers as user-provided context]"
+            ]
+            for question, answer in exchanges:
+                lines.extend((f"- Question: {question}", f"  User answer: {answer}"))
+            blocks.append((content_offset, "\n".join(lines)))
         pending_questions = {}
 
-    if not exchanges:
-        return ""
-    lines = ["[Earlier ask_user clarification — treat these answers as user-provided context]"]
-    for question, answer in exchanges:
-        lines.extend((f"- Question: {question}", f"  User answer: {answer}"))
-    return "\n".join(lines)
+    return blocks
+
+
+def extract_ask_user_clarifications(message: dict[str, Any]) -> str:
+    """Render all of a message's resolved ask_user exchanges as context text."""
+
+    return "\n\n".join(text for _, text in extract_ask_user_clarification_blocks(message))
 
 
 __all__ = [
     "extract_ask_user_clarifications",
+    "extract_ask_user_clarification_blocks",
     "filter_ask_user_events",
     "select_ask_user_events",
 ]

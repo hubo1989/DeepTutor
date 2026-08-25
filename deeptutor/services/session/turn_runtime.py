@@ -111,6 +111,16 @@ def _assemble_persisted_answer(
     )
 
 
+def _stamp_ask_user_content_offset(
+    payload_event: dict[str, Any],
+    assistant_content: str,
+) -> None:
+    """Attach the replay boundary to a persisted ask_user resolution event."""
+    metadata = payload_event.get("metadata")
+    if isinstance(metadata, dict) and metadata.get("ask_user_resolved"):
+        metadata.setdefault("assistant_content_offset", len(assistant_content))
+
+
 def _clip_text(value: str, limit: int = 4000) -> str:
     text = str(value or "").strip()
     if len(text) <= limit:
@@ -2007,6 +2017,10 @@ class TurnRuntimeManager:
                     continue
                 payload_event = await self._publish_live_event(execution, event)
                 if payload_event.get("type") not in {"done", "session"}:
+                    # A card reply lives inside this assistant row. Persist
+                    # the exact user-facing answer boundary so future context
+                    # can replay assistant -> user -> assistant in order.
+                    _stamp_ask_user_content_offset(payload_event, _persisted_answer())
                     assistant_events.append(payload_event)
                 if _should_capture_assistant_content(event):
                     call_id = (event.metadata or {}).get("call_id")
