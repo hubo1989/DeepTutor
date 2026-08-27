@@ -4,6 +4,7 @@ export type AppLanguage = "en" | "zh";
 
 export const ACTIVE_SESSION_STORAGE_KEY = "deeptutor.activeSessionId.tab";
 export const LANGUAGE_STORAGE_KEY = "deeptutor-language";
+export const RESPONSE_LANGUAGE_STORAGE_KEY = "deeptutor-response-language";
 export const SIDEBAR_COLLAPSED_STORAGE_KEY = "deeptutor.sidebarCollapsed";
 export const CHAT_RESPONSE_TIMEOUT_STORAGE_KEY =
   "deeptutor.chatResponseTimeout";
@@ -56,8 +57,14 @@ export function writeStoredChatResponseTimeout(seconds: number): void {
 
 export const ACTIVE_SESSION_EVENT = "deeptutor:active-session";
 export const LANGUAGE_EVENT = "deeptutor:language";
+export const RESPONSE_LANGUAGE_EVENT = "deeptutor:response-language";
 export const SIDEBAR_COLLAPSED_EVENT = "deeptutor:sidebar-collapsed";
 export const CODE_BLOCK_SETTINGS_EVENT = "deeptutor:code-block-settings";
+
+// The interface language defaults to Chinese. The model output language keeps
+// its own default ("en") via resolveResponseLanguage — they are separate
+// concerns surfaced as separate rows in Settings > Appearance.
+export const DEFAULT_INTERFACE_LANGUAGE: AppLanguage = "zh";
 
 export function normalizeLanguage(
   value: string | null | undefined,
@@ -65,12 +72,38 @@ export function normalizeLanguage(
   return value === "zh" ? "zh" : "en";
 }
 
+export function resolveResponseLanguage(
+  value: string | null | undefined,
+  legacyLanguage: string | null | undefined = "en",
+): AppLanguage {
+  return value === "zh" || value === "en"
+    ? value
+    : normalizeLanguage(legacyLanguage);
+}
+
 export function readStoredLanguage(): AppLanguage {
-  if (typeof window === "undefined") return "en";
+  if (typeof window === "undefined") return DEFAULT_INTERFACE_LANGUAGE;
   try {
-    return normalizeLanguage(window.localStorage.getItem(LANGUAGE_STORAGE_KEY));
+    const stored = window.localStorage.getItem(LANGUAGE_STORAGE_KEY);
+    return stored === null ? DEFAULT_INTERFACE_LANGUAGE : normalizeLanguage(stored);
   } catch {
-    return "en";
+    return DEFAULT_INTERFACE_LANGUAGE;
+  }
+}
+
+/** Whether this browser has ever recorded a choice.
+ *
+ * ``readStoredLanguage`` cannot answer this: it normalizes a missing value to
+ * "en", which is indistinguishable from an explicit English selection. The
+ * bootstrap needs the difference — it may only consult the server-side
+ * preference when the browser has no choice of its own to honour.
+ */
+export function hasStoredLanguage(): boolean {
+  if (typeof window === "undefined") return false;
+  try {
+    return window.localStorage.getItem(LANGUAGE_STORAGE_KEY) !== null;
+  } catch {
+    return false;
   }
 }
 
@@ -80,6 +113,32 @@ export function writeStoredLanguage(language: AppLanguage): void {
     window.localStorage.setItem(LANGUAGE_STORAGE_KEY, language);
     window.dispatchEvent(
       new CustomEvent(LANGUAGE_EVENT, {
+        detail: { language },
+      }),
+    );
+  } catch {
+    // localStorage may be unavailable
+  }
+}
+
+export function readStoredResponseLanguage(): AppLanguage {
+  if (typeof window === "undefined") return "en";
+  try {
+    return resolveResponseLanguage(
+      window.localStorage.getItem(RESPONSE_LANGUAGE_STORAGE_KEY),
+      window.localStorage.getItem(LANGUAGE_STORAGE_KEY),
+    );
+  } catch {
+    return "en";
+  }
+}
+
+export function writeStoredResponseLanguage(language: AppLanguage): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(RESPONSE_LANGUAGE_STORAGE_KEY, language);
+    window.dispatchEvent(
+      new CustomEvent(RESPONSE_LANGUAGE_EVENT, {
         detail: { language },
       }),
     );

@@ -16,6 +16,8 @@ message when it is not installed instead of an opaque ``ImportError``.
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Callable
 import logging
 from pathlib import Path
 import shutil
@@ -29,8 +31,9 @@ from deeptutor.services.rag.index_versioning import (
 )
 from deeptutor.services.rag.kb_paths import resolve_kb_dir
 
+from . import block_policy, engine, storage
 from . import config as lr_config
-from . import engine, storage
+from .worker import OwnerLoopBridge, run_in_worker_loop
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +75,14 @@ class LightRagPipeline:
         except Exception as exc:  # pragma: no cover - best-effort
             self.logger.warning("Could not clean up failed version dir %s: %s", root_dir, exc)
 
-    async def _ingest(self, rag: Any, file_paths: List[str]) -> int:
+    async def _ingest(
+        self,
+        rag: Any,
+        file_paths: List[str],
+        *,
+        io_bridge: OwnerLoopBridge,
+        progress_callback: Callable[[int, int], Any] | None = None,
+    ) -> int:
         """Parse each file via the shared parse layer and insert it into LightRAG.
 
         Returns the number of documents successfully inserted. Per-file failures
@@ -82,7 +92,9 @@ class LightRagPipeline:
 
         parse_service = get_parse_service()
         inserted = 0
+        total = len(file_paths)
         for file_path in file_paths:
+            io_bridge.raise_if_cancelled()
             path = Path(file_path)
             try:
                 doc = parse_service.parse(path)
@@ -90,9 +102,48 @@ class LightRagPipeline:
                 self.logger.warning("LightRAG: parse failed for %s: %s", path.name, exc)
                 continue
 
-            content_list = doc.blocks or (
-                [{"type": "text", "text": doc.markdown, "page_idx": 0}] if doc.markdown else []
-            )
+            accepted_ledger: dict[str, Any] | None = None
+            attempt_id: str | None = None
+            if doc.blocks:
+                document_id = doc.source_hash or path.stem
+                decision = block_policy.prepare_content_list(
+                    doc.blocks,
+                    engine=doc.engine,
+                    source_hash=doc.source_hash,
+                    parser_signature=doc.parser_signature,
+                )
+                if decision.ledger is not None:
+                    outcome = "unknown_types" if decision.unknown_type_counts else "accepted"
+                    _, attempt_id = block_policy.write_attempt_ledger(
+                        Path(rag.working_dir).parent,
+                        document_id,
+                        decision.ledger,
+                        outcome=outcome,
+                    )
+                    counts = decision.ledger["counts"]
+                    self.logger.info(
+                        "MinerU block policy %s raw=%d filtered=%d eligible=%d unknown=%d",
+                        block_policy.POLICY_ID,
+                        counts["raw_total"],
+                        counts["filtered_total"],
+                        counts["eligible_total"],
+                        counts["unknown_total"],
+                    )
+                    if decision.unknown_type_counts:
+                        # Indexed, not dropped and not fatal — say so, because
+                        # this is the signal that the policy needs a new entry.
+                        self.logger.warning(
+                            "LightRAG: %s has MinerU block types with no policy "
+                            "entry (%s); indexing them unclassified",
+                            path.name,
+                            decision.unknown_summary(),
+                        )
+                accepted_ledger = decision.ledger
+                content_list = decision.content_list
+            else:
+                content_list = (
+                    [{"type": "text", "text": doc.markdown, "page_idx": 0}] if doc.markdown else []
+                )
             if not content_list:
                 self.logger.warning("LightRAG: empty document skipped: %s", path.name)
                 continue
@@ -103,25 +154,77 @@ class LightRagPipeline:
                 file_name=path.name,
                 doc_id=doc.source_hash or path.stem,
             )
+            io_bridge.raise_if_cancelled()
             doc_error = storage.document_error(Path(rag.working_dir), doc.source_hash or path.stem)
             if doc_error:
                 raise RuntimeError(f"{path.name}: {doc_error}")
+            if accepted_ledger is not None:
+                block_policy.write_decision_ledger(
+                    Path(rag.working_dir),
+                    doc.source_hash or path.stem,
+                    accepted_ledger,
+                    attempt_id=attempt_id,
+                )
             inserted += 1
             self.logger.info("LightRAG: inserted %s", path.name)
+            if progress_callback is not None:
+                await io_bridge.call(progress_callback, inserted, total)
         return inserted
+
+    async def _run_indexing(
+        self,
+        working_dir: Path,
+        file_paths: List[str],
+        progress_callback: Callable[[int, int], Any] | None,
+    ) -> int:
+        """Run the complete local LightRAG indexing phase off the service loop.
+
+        The RAG instance is constructed and consumed in one worker thread, so
+        its mutable stores and asyncio primitives never cross event loops.
+        DeepTutor-owned network calls and progress callbacks cross back through
+        ``OwnerLoopBridge`` and remain responsive while local JSON storage is
+        busy in the worker.
+        """
+
+        async def job(io_bridge: OwnerLoopBridge) -> int:
+            io_bridge.raise_if_cancelled()
+            rag = engine.build_rag(working_dir, io_bridge=io_bridge)
+            failed = True
+            try:
+                result = await self._ingest(
+                    rag,
+                    file_paths,
+                    io_bridge=io_bridge,
+                    progress_callback=progress_callback,
+                )
+                failed = False
+                return result
+            finally:
+                try:
+                    await engine.finalize(rag, cancel_pending=failed)
+                except BaseException:
+                    if not failed:
+                        raise
+                    self.logger.exception(
+                        "LightRAG resource cleanup failed while indexing was aborting"
+                    )
+
+        return await run_in_worker_loop(job)
 
     # ----- indexing -------------------------------------------------------
 
     async def initialize(self, kb_name: str, file_paths: List[str], **kwargs) -> bool:
         self._ensure_available()
+        progress_callback = kwargs.get("progress_callback")
         kb_dir = resolve_kb_dir(self.kb_base_dir, kb_name)
         root_dir = resolve_storage_dir_for_rebuild(kb_dir, None)
         self.logger.info(
             "Initializing KB '%s' with %d file(s) using LightRAG", kb_name, len(file_paths)
         )
         try:
-            rag = engine.build_rag(storage.working_dir(root_dir))
-            count = await self._ingest(rag, file_paths)
+            count = await self._run_indexing(
+                storage.working_dir(root_dir), file_paths, progress_callback
+            )
             if count == 0:
                 self.logger.error("LightRAG: no extractable documents for '%s'", kb_name)
                 self._cleanup_failed_version_dir(root_dir)
@@ -137,6 +240,9 @@ class LightRagPipeline:
             storage.write_meta(root_dir)
             self.logger.info("KB '%s' initialized with LightRAG (%d docs)", kb_name, count)
             return True
+        except asyncio.CancelledError:
+            self._cleanup_failed_version_dir(root_dir)
+            raise
         except Exception as exc:
             self.logger.error("Failed to initialize LightRAG KB: %s", exc)
             self.logger.error(traceback.format_exc())
@@ -145,10 +251,15 @@ class LightRagPipeline:
 
     async def add_documents(self, kb_name: str, file_paths: List[str], **kwargs) -> bool:
         self._ensure_available()
+        progress_callback = kwargs.get("progress_callback")
         kb_dir = resolve_kb_dir(self.kb_base_dir, kb_name)
         existing = resolve_storage_dir_for_read(kb_dir, None)
-        is_update = existing is not None and storage.has_output(existing)
-        root_dir = existing if is_update else resolve_storage_dir_for_rebuild(kb_dir, None)
+        if existing is not None and storage.has_output(existing):
+            is_update = True
+            root_dir = existing
+        else:
+            is_update = False
+            root_dir = resolve_storage_dir_for_rebuild(kb_dir, None)
 
         self.logger.info(
             "Adding %d document(s) to LightRAG KB '%s' (update=%s)",
@@ -157,8 +268,9 @@ class LightRagPipeline:
             is_update,
         )
         try:
-            rag = engine.build_rag(storage.working_dir(root_dir))
-            count = await self._ingest(rag, file_paths)
+            count = await self._run_indexing(
+                storage.working_dir(root_dir), file_paths, progress_callback
+            )
             if count == 0:
                 self.logger.warning("LightRAG: no extractable documents to add for '%s'", kb_name)
                 return False
@@ -174,6 +286,10 @@ class LightRagPipeline:
             storage.write_meta(root_dir)
             self.logger.info("Added %d doc(s) to LightRAG KB '%s'", count, kb_name)
             return True
+        except asyncio.CancelledError:
+            if not is_update:
+                self._cleanup_failed_version_dir(root_dir)
+            raise
         except Exception as exc:
             self.logger.error("Failed to add documents to LightRAG KB: %s", exc)
             self.logger.error(traceback.format_exc())
@@ -203,7 +319,7 @@ class LightRagPipeline:
         try:
             self._ensure_available()
             rag = engine.build_rag(storage.working_dir(root_dir))
-            answer = await engine.query(rag, query, mode)
+            answer, sources = await engine.query_with_sources(rag, query, mode)
         except lr_config.LightRagNotAvailableError as exc:
             return self._error_result(query, exc, error_type="not_configured")
         except Exception as exc:
@@ -215,7 +331,7 @@ class LightRagPipeline:
             "query": query,
             "answer": answer,
             "content": answer,
-            "sources": [],
+            "sources": sources,
             "provider": storage.PROVIDER,
             "mode": mode,
         }

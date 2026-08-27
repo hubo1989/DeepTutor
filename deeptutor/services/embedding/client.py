@@ -9,6 +9,9 @@ import logging
 import math
 from typing import Any, Dict, List, Optional
 
+from deeptutor.services.config.embedding_endpoint import (
+    redact_embedding_endpoint_for_display,
+)
 from deeptutor.services.config.provider_runtime import (
     EMBEDDING_PROVIDERS,
     embedding_endpoint_validation_error,
@@ -99,14 +102,42 @@ def _resolve_adapter_class(binding: str) -> type[BaseEmbeddingAdapter]:
 class EmbeddingClient:
     """Unified embedding client for RAG and retrieval services."""
 
+    # 全局发帖节流：KB reindex 时 LlamaIndex 用线程池并发调 embedding，
+    # 每个线程经 _run_in_new_loop 跑独立 event loop——asyncio.Lock 绑定
+    # 创建时的 loop，跨 loop 既不互斥还会挂死。必须用线程级锁。
+    _spacing_lock: Any = None
+    _last_request_monotonic: float = 0.0
+    _thread_guard: Any = None
+
+    @classmethod
+    def _global_spacing_lock(cls):
+        import threading
+
+        if cls._spacing_lock is None:
+            cls._thread_guard = threading.Lock()
+            with cls._thread_guard:
+                if cls._spacing_lock is None:
+                    from threading import Lock as _TLock
+
+                    cls._spacing_lock = _TLock()
+        return cls._spacing_lock
+
+    @staticmethod
+    def _hold_spacing_lock():
+        """Blocking acquire — cross-thread, loop-agnostic."""
+        lock = EmbeddingClient._global_spacing_lock()
+        lock.acquire()
+        return lock
+
     def __init__(self, config: Optional[EmbeddingConfig] = None):
         self.config = config or get_embedding_config()
         self.logger = logging.getLogger(__name__)
         endpoint = self.config.effective_url or self.config.base_url
         problem = embedding_endpoint_validation_error(self.config.binding, endpoint)
         if problem:
+            displayed_endpoint = redact_embedding_endpoint_for_display(endpoint)
             raise ValueError(
-                f"{problem} Current Settings endpoint is {endpoint!r}. "
+                f"{problem} Current Settings endpoint is {displayed_endpoint!r}. "
                 "DeepTutor sends embedding requests to the Settings URL exactly; "
                 "update the visible Endpoint URL instead of relying on hidden path appending."
             )
@@ -269,9 +300,16 @@ class EmbeddingClient:
         progress_callback=None,
         *,
         request_id: str | None = None,
+        input_type: str | None = None,
     ) -> List[List[float]]:
+        """Embed text batches, optionally identifying their retrieval role."""
         if not texts:
             return []
+
+        # Only adapters that opted in receive the role. Forwarding it to every
+        # backend would change the request Jina has always sent (no `task`) and
+        # silently invalidate the indexes built from it.
+        role = input_type if getattr(self.adapter, "SUPPORTS_INPUT_TYPE", False) else None
 
         import asyncio
 
@@ -298,6 +336,7 @@ class EmbeddingClient:
                 texts=batch,
                 model=self.config.model,
                 dimensions=self.config.dim or None,
+                input_type=role,
             )
             estimated_tokens = _estimate_text_tokens(batch)
             lease = self._reserve_quota(estimated_tokens)
@@ -312,7 +351,24 @@ class EmbeddingClient:
                     lease.release()
                 raise
             try:
-                response = await self.adapter.embed(request)
+                # 全局发帖节流：线程级锁串行化"等待间隔+发帖"，跨线程/跨
+                # event loop 互斥（asyncio 锁在新 loop 模型下失效的教训）。
+                # asyncio.sleep 换成阻塞等待发帖侧可接受：DT 的 embedding
+                # 并发都在后台线程里，阻塞不伤 API 主线程。
+                import time as _time
+                from time import monotonic as _mono
+
+                _lock = EmbeddingClient._hold_spacing_lock()
+                try:
+                    delay = self.config.batch_delay
+                    if delay > 0:
+                        elapsed = _mono() - EmbeddingClient._last_request_monotonic
+                        if elapsed < delay:
+                            _time.sleep(delay - elapsed)
+                    EmbeddingClient._last_request_monotonic = _mono()
+                    response = await self.adapter.embed(request)
+                finally:
+                    _lock.release()
             except BaseException as exc:
                 await self._release_leases(lease, commercial_lease)
                 if not isinstance(exc, Exception):
@@ -495,12 +551,6 @@ class EmbeddingClient:
         with concurrent.futures.ThreadPoolExecutor() as executor:
             future = executor.submit(asyncio.run, self.embed(texts, request_id=request_id))
             return future.result()
-
-    def get_embedding_func(self):
-        async def embedding_wrapper(texts: List[str]) -> List[List[float]]:
-            return await self.embed(texts)
-
-        return embedding_wrapper
 
 
 _SCOPED_CLIENT: ContextVar[tuple[int, EmbeddingClient] | None] = ContextVar(

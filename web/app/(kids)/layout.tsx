@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useEffect, useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { kidsCssVars, kidsTheme } from "@/features/kids/theme/kidsTheme";
 import { KidProfileProvider, useKidProfile } from "@/features/kids/hooks/useKidProfile";
 import { KidsStoreProvider } from "@/features/kids/store/kidsStore";
@@ -11,6 +12,7 @@ import { KidsStoreProvider } from "@/features/kids/store/kidsStore";
 
 function KidsShell({ children }: { children: React.ReactNode }) {
   const { loading } = useKidProfile();
+  const { t } = useTranslation();
   const [showReminder, setShowReminder] = useState(false);
   const [sessionStart] = useState(() => Date.now());
 
@@ -41,7 +43,7 @@ function KidsShell({ children }: { children: React.ReactNode }) {
             className="inline-block animate-spin rounded-full h-12 w-12 border-4 border-t-transparent mb-4"
             style={{ borderColor: `${kidsTheme.colors.primary} transparent transparent transparent` }}
           />
-          <p style={{ color: "var(--muted-foreground)" }}>Loading...</p>
+          <p style={{ color: "var(--muted-foreground)" }}>{t("kids.loading")}</p>
         </div>
       </div>
     );
@@ -67,7 +69,7 @@ function KidsShell({ children }: { children: React.ReactNode }) {
             borderRadius: "0 0 1rem 1rem",
           }}
         >
-          5 minutes left — keep going!
+          {t("kids.fiveMinLeft")}
         </div>
       )}
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -10,6 +11,27 @@ import pytest
 from deeptutor.partners.bus.events import OutboundMessage
 from deeptutor.partners.channels.manager import ChannelManager
 from deeptutor.partners.config.schema import ChannelsConfig
+
+
+def test_empty_allow_list_skips_only_misconfigured_channel(monkeypatch):
+    class _Channel:
+        display_name = "Test"
+
+        def __init__(self, config, _bus):
+            self.config = SimpleNamespace(allow_from=config["allow_from"])
+
+    monkeypatch.setattr(
+        "deeptutor.partners.channels.registry.discover_all",
+        lambda: {"invalid": _Channel, "valid": _Channel},
+    )
+    config = ChannelsConfig(
+        invalid={"enabled": True, "allow_from": []},
+        valid={"enabled": True, "allow_from": ["user-1"]},
+    )
+
+    manager = ChannelManager(config, _MultiShotBus([]))  # type: ignore[arg-type]
+
+    assert list(manager.channels) == ["valid"]
 
 
 class _OneShotBus:
@@ -32,6 +54,86 @@ class _DummyChannel:
         # from the per-channel config.
         self.send_progress = True
         self.send_tool_hints = True
+
+
+def test_channel_media_is_scoped_to_owning_partner(partners_root):
+    from deeptutor.partners.bus.queue import MessageBus
+    from deeptutor.partners.channels.base import BaseChannel
+
+    class _MediaChannel(BaseChannel):
+        name = "telegram"
+
+        async def start(self):
+            pass
+
+        async def stop(self):
+            pass
+
+        async def send(self, msg):
+            pass
+
+    channel = _MediaChannel({}, MessageBus())
+    channel.partner_id = "ada"
+
+    assert channel.media_dir() == partners_root / "ada" / "media" / "telegram"
+
+
+def test_channel_state_is_scoped_to_owning_partner(partners_root):
+    from deeptutor.partners.bus.queue import MessageBus
+    from deeptutor.partners.channels.base import BaseChannel
+
+    class _StatefulChannel(BaseChannel):
+        name = "telegram"
+
+        async def start(self):
+            pass
+
+        async def stop(self):
+            pass
+
+        async def send(self, msg):
+            pass
+
+    channel = _StatefulChannel({}, MessageBus())
+    channel.partner_id = "ada"
+
+    assert channel.state_dir() == partners_root / "ada" / "channels" / "telegram"
+
+
+def test_partner_id_is_available_while_the_channel_is_constructed(partners_root, monkeypatch):
+    """Channels that resolve paths in ``__init__`` must not see an empty owner."""
+    from deeptutor.partners.bus.queue import MessageBus
+    from deeptutor.partners.channels.base import BaseChannel
+
+    class _EagerChannel(BaseChannel):
+        name = "telegram"
+        display_name = "Eager"
+
+        def __init__(self, config, bus):
+            super().__init__(config, bus)
+            self.resolved_at_init = self.state_dir()
+
+        async def start(self):
+            pass
+
+        async def stop(self):
+            pass
+
+        async def send(self, msg):
+            pass
+
+    monkeypatch.setattr(
+        "deeptutor.partners.channels.registry.discover_all",
+        lambda: {"telegram": _EagerChannel},
+    )
+    manager = ChannelManager(
+        ChannelsConfig(telegram={"enabled": True}),
+        MessageBus(),
+        partner_id="ada",
+    )
+
+    channel = manager.channels["telegram"]
+    assert channel.resolved_at_init == partners_root / "ada" / "channels" / "telegram"
 
 
 async def _dispatch_one(

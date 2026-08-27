@@ -8,10 +8,15 @@ provider gating, Azure detection, SSL bypass, or per-model token caps.
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 from collections.abc import Callable
-from dataclasses import dataclass
+import contextlib
+from dataclasses import dataclass, replace
+import hashlib
+import inspect
 import json
 import math
+import threading
 from types import SimpleNamespace
 from typing import Any, Literal
 
@@ -19,11 +24,13 @@ import httpx
 from openai import AsyncAzureOpenAI, AsyncOpenAI
 
 from deeptutor.services.config import load_system_settings
+from deeptutor.services.keypool import KeyPool, primary_api_key
 from deeptutor.services.llm import get_token_limit_kwargs, supports_tools
 from deeptutor.services.llm.exceptions import (
     LLMProviderError,
     LLMRateLimitError,
 )
+from deeptutor.services.llm.openai_http_client import sanitize_invalid_ssl_env
 from deeptutor.services.llm.reasoning_params import (
     build_openai_compatible_reasoning_kwargs,
 )
@@ -42,7 +49,10 @@ _NATIVE_TOOL_BLOCKED_BINDINGS: frozenset[str] = frozenset(
 # backend needs an adapter branch, or tool schemas would be attached to a plain
 # AsyncOpenAI client pointed at a non-OpenAI wire format. github_copilot is
 # adapter-routed but deliberately excluded from this set.
-_NATIVE_TOOL_BACKENDS: frozenset[str] = frozenset({"anthropic", "openai_codex"})
+_NATIVE_TOOL_BACKENDS: frozenset[str] = frozenset({"anthropic", "openai_codex", "codebuddy"})
+_AGENTIC_CLIENT_POOL_MAXSIZE = 2
+_agentic_client_pool: "OrderedDict[tuple[Any, ...], Any]" = OrderedDict()
+_agentic_client_pool_lock = threading.RLock()
 
 
 @dataclass(frozen=True)
@@ -51,7 +61,7 @@ class LLMClientConfig:
 
     binding: str
     model: str | None
-    api_key: str | None
+    api_key: str | list[str] | None
     base_url: str | None
     api_version: str | None = None
     extra_headers: dict[str, str] | None = None
@@ -59,8 +69,47 @@ class LLMClientConfig:
     source: Literal["platform", "byok"] = "platform"
 
 
-def build_openai_client(config: LLMClientConfig) -> Any:
-    """Construct an ``AsyncOpenAI`` / ``AsyncAzureOpenAI`` client."""
+def _client_cache_key(
+    config: LLMClientConfig,
+    loop: asyncio.AbstractEventLoop,
+    disable_ssl_verify: bool,
+) -> tuple[Any, ...]:
+    serialized_key = json.dumps(config.api_key or "", ensure_ascii=False, separators=(",", ":"))
+    secret = hashlib.sha256(serialized_key.encode("utf-8")).hexdigest()[:16]
+    headers = json.dumps(config.extra_headers or {}, sort_keys=True, separators=(",", ":"))
+    return (
+        loop,
+        config.binding,
+        config.model or "",
+        secret,
+        config.base_url or "",
+        config.api_version or "",
+        headers,
+        disable_ssl_verify,
+    )
+
+
+def _build_openai_client(
+    config: LLMClientConfig,
+    *,
+    disable_ssl_verify: bool,
+    sdk_max_retries: int | None = None,
+) -> Any:
+    # A stale SSL_CERT_FILE (common with cloned conda envs) makes httpx's
+    # create_ssl_context raise FileNotFoundError mid-__init__, aborting client
+    # construction. Drop broken CA paths first so TLS uses its default CA config.
+    sanitize_invalid_ssl_env()
+    if isinstance(config.api_key, list):
+        keys = [str(key).strip() for key in config.api_key if str(key or "").strip()]
+        clients = {
+            key: _build_openai_client(
+                replace(config, api_key=key),
+                disable_ssl_verify=disable_ssl_verify,
+                sdk_max_retries=0,
+            )
+            for key in keys
+        }
+        return _KeyRotatingClient(KeyPool(keys), clients)
     default_headers = config.extra_headers or None
     spec = find_by_name(config.binding)
     if spec:
@@ -74,15 +123,17 @@ def build_openai_client(config: LLMClientConfig) -> Any:
             )
 
     http_client = None
-    if load_system_settings()["disable_ssl_verify"]:
+    if disable_ssl_verify:
         http_client = httpx.AsyncClient(verify=False)  # nosec B501
     if config.binding == "azure_openai" or (config.binding == "openai" and config.api_version):
+        retry_kwargs = {"max_retries": sdk_max_retries} if sdk_max_retries is not None else {}
         client = AsyncAzureOpenAI(
             api_key=config.api_key or "sk-no-key-required",
             azure_endpoint=config.base_url,
             api_version=config.api_version,
             http_client=http_client,
             default_headers=default_headers,
+            **retry_kwargs,
         )
         return _wrap_token_quota(
             client,
@@ -90,12 +141,14 @@ def build_openai_client(config: LLMClientConfig) -> Any:
             provider=config.binding,
             model=config.model,
         )
+    retry_kwargs = {"max_retries": sdk_max_retries} if sdk_max_retries is not None else {}
     return _wrap_token_quota(
         AsyncOpenAI(
             api_key=config.api_key or "sk-no-key-required",
             base_url=config.base_url or None,
             http_client=http_client,
             default_headers=default_headers,
+            **retry_kwargs,
         ),
         source=config.source,
         provider=config.binding,
@@ -176,7 +229,7 @@ def _wrap_token_quota(
     from deeptutor.multi_user.token_quota import current_user_quota_policy
 
     # BYOK calls still need the request-rate/token safety gate; only the
-    # platform path may skip wrapping when no user quota is configured.  The
+    # platform path may skip metering when no user quota is configured.  The
     # source is carried by LLMClientConfig so this remains correct when the
     # request ContextVar does not survive a thread/async boundary.
     normalized_source: Literal["platform", "byok"] = "byok" if source == "byok" else "platform"
@@ -185,7 +238,17 @@ def _wrap_token_quota(
         and current_user_quota_policy() is None
         and not commercial_usage_required(source=normalized_source)
     ):
-        return client
+        # No metering is configured, but callers still attach internal kwargs
+        # (``_commercial_request_id``); wrap so they are stripped rather than
+        # leaked to the provider's ``create()``. ``meter=False`` makes the
+        # wrapper a pure passthrough with no reservation overhead.
+        return _TokenQuotaClient(
+            client,
+            source=normalized_source,
+            provider=provider,
+            model=model,
+            meter=False,
+        )
     return _TokenQuotaClient(
         client,
         source=normalized_source,
@@ -202,6 +265,7 @@ class _TokenQuotaClient:
         source: Literal["platform", "byok"] = "platform",
         provider: str | None = None,
         model: str | None = None,
+        meter: bool = True,
     ) -> None:
         self._client = client
         self.chat = SimpleNamespace(
@@ -210,6 +274,7 @@ class _TokenQuotaClient:
                 source=source,
                 provider=provider,
                 model=model,
+                meter=meter,
             ),
         )
 
@@ -225,11 +290,17 @@ class _TokenQuotaCompletions:
         source: Literal["platform", "byok"] = "platform",
         provider: str | None = None,
         model: str | None = None,
+        meter: bool = True,
     ) -> None:
         self._completions = completions
         self._source = source
         self._provider = provider
         self._model = model
+        # When False the wrapper still strips DeepTutor-internal kwargs (e.g.
+        # ``_commercial_request_id``) so they never reach the provider, but it
+        # skips every quota/commercial reservation. Used for the platform path
+        # when no quota policy and no commercial metering are configured.
+        self._meter = meter
 
     async def create(self, **kwargs: Any) -> Any:
         # DeepTutor-only accounting metadata must never reach the provider.
@@ -237,6 +308,10 @@ class _TokenQuotaCompletions:
         # reuse this value so PostgreSQL can return the durable reservation
         # instead of booking a duplicate.
         commercial_request_id = kwargs.pop("_commercial_request_id", None)
+        if not self._meter:
+            # No quota/commercial metering is configured — forward untouched
+            # apart from stripping the internal metadata already popped above.
+            return await self._completions.create(**kwargs)
         requested, prompt_estimate, output_estimate = _request_token_estimate(kwargs)
         commercial_requested = _request_commercial_token_bound(kwargs, output_estimate)
         if self._source == "byok":
@@ -518,11 +593,117 @@ class _TokenQuotaStream:
                 await result
 
 
+class _KeyRotatingCompletions:
+    def __init__(self, key_pool: KeyPool, clients: dict[str, Any]) -> None:
+        self._key_pool = key_pool
+        self._clients = clients
+
+    async def create(self, **kwargs: Any) -> Any:
+        for attempt in range(2):
+            api_key = self._key_pool.next()
+            try:
+                return await self._clients[api_key].chat.completions.create(**kwargs)
+            except Exception as exc:
+                status = getattr(exc, "status_code", None) or getattr(
+                    getattr(exc, "response", None), "status_code", None
+                )
+                if status != 429:
+                    raise
+                self._key_pool.mark_429(api_key)
+                if attempt:
+                    raise
+        raise RuntimeError("LLM key rotation exhausted")
+
+
+class _KeyRotatingClient:
+    def __init__(self, key_pool: KeyPool, clients: dict[str, Any]) -> None:
+        self._clients = clients
+        self.chat = SimpleNamespace(completions=_KeyRotatingCompletions(key_pool, clients))
+
+    async def close(self) -> None:
+        await asyncio.gather(*(_close_client(client) for client in self._clients.values()))
+
+
+async def _close_client(client: Any) -> None:
+    close = getattr(client, "aclose", None) or getattr(client, "close", None)
+    if not callable(close):
+        return
+    result = close()
+    if inspect.isawaitable(result):
+        await result
+
+
+def _schedule_client_close(client: Any, loop: asyncio.AbstractEventLoop) -> None:
+    async def _close() -> None:
+        with contextlib.suppress(Exception):
+            await _close_client(client)
+
+    loop.create_task(_close())
+
+
+def build_openai_client(config: LLMClientConfig) -> Any:
+    """Return a bounded, event-loop-local OpenAI-compatible client.
+
+    The chat, research and question pipelines build this handle per turn.  The
+    handle itself owns an HTTP connection pool, so reusing it is both faster
+    and prevents a new allocator/socket high-water mark on every turn.
+    """
+    disable_ssl_verify = bool(load_system_settings()["disable_ssl_verify"])
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return _build_openai_client(config, disable_ssl_verify=disable_ssl_verify)
+
+    key = _client_cache_key(config, loop, disable_ssl_verify)
+    with _agentic_client_pool_lock:
+        cached = _agentic_client_pool.get(key)
+        if cached is not None:
+            _agentic_client_pool.move_to_end(key)
+            return cached
+        client = _build_openai_client(config, disable_ssl_verify=disable_ssl_verify)
+        _agentic_client_pool[key] = client
+        _agentic_client_pool.move_to_end(key)
+        while len(_agentic_client_pool) > _AGENTIC_CLIENT_POOL_MAXSIZE:
+            _, evicted = _agentic_client_pool.popitem(last=False)
+            _schedule_client_close(evicted, loop)
+        return client
+
+
+async def close_agentic_client_pool() -> None:
+    with _agentic_client_pool_lock:
+        clients = list(_agentic_client_pool.values())
+        _agentic_client_pool.clear()
+    if clients:
+        await asyncio.gather(*(_close_client(client) for client in clients), return_exceptions=True)
+
+
+def reset_agentic_client_pool() -> None:
+    with _agentic_client_pool_lock:
+        clients = list(_agentic_client_pool.values())
+        _agentic_client_pool.clear()
+    if not clients:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        for client in clients:
+            with contextlib.suppress(Exception):
+                asyncio.run(_close_client(client))
+        return
+    for client in clients:
+        _schedule_client_close(client, loop)
+
+
+def agentic_client_pool_size() -> int:
+    with _agentic_client_pool_lock:
+        return len(_agentic_client_pool)
+
+
 def _build_anthropic_adapter(config: LLMClientConfig, spec: Any) -> Any:
     from deeptutor.services.llm.provider_core import AnthropicProvider
 
     anthropic_provider = AnthropicProvider(
-        api_key=config.api_key,
+        api_key=primary_api_key(config.api_key),
         api_base=config.base_url or spec.default_api_base or None,
         default_model=config.model or "claude-sonnet-4-20250514",
         extra_headers=config.extra_headers,
@@ -550,14 +731,52 @@ def _build_copilot_adapter(config: LLMClientConfig, spec: Any) -> Any:
     return _ProviderOpenAIAdapter(copilot_provider)
 
 
+def _build_codebuddy_adapter(config: LLMClientConfig, spec: Any) -> Any:
+    from deeptutor.services.llm.provider_core.codebuddy_http_provider import (
+        build_codebuddy_provider,
+    )
+
+    codebuddy_provider = build_codebuddy_provider(
+        api_key=primary_api_key(config.api_key),
+        default_model=config.model or "codebuddy/hy3",
+    )
+    return _ProviderOpenAIAdapter(codebuddy_provider)
+
+
+def _build_direct_openai_adapter(config: LLMClientConfig, spec: Any) -> Any:
+    from deeptutor.services.llm.provider_core import OpenAICompatProvider
+
+    provider = OpenAICompatProvider(
+        api_key=config.api_key,
+        api_base=config.base_url or spec.default_api_base or None,
+        default_model=config.model or "gpt-5",
+        extra_headers=config.extra_headers,
+        spec=spec,
+        provider_name=config.binding,
+    )
+    return _ProviderOpenAIAdapter(provider)
+
+
 _NATIVE_ADAPTER_BUILDERS: dict[str, Callable[[LLMClientConfig, Any], Any]] = {
     "anthropic": _build_anthropic_adapter,
     "openai_codex": _build_codex_adapter,
     "github_copilot": _build_copilot_adapter,
+    "codebuddy": _build_codebuddy_adapter,
 }
 
 
 def _build_native_provider_adapter(config: LLMClientConfig, spec: Any) -> Any | None:
+    endpoint = (config.base_url or spec.default_api_base or "").lower()
+    model = (config.model or "").lower()
+    if (
+        spec.name == "openai"
+        and not config.api_version
+        and "api.openai.com" in endpoint
+        and any(token in model for token in ("gpt-5", "o1", "o3", "o4"))
+    ):
+        # Reuse the services provider: it already converts messages, tools,
+        # streaming events and token limits for the Responses API.
+        return _build_direct_openai_adapter(config, spec)
     builder = _NATIVE_ADAPTER_BUILDERS.get(spec.backend)
     return builder(config, spec) if builder else None
 
@@ -568,6 +787,11 @@ class _ProviderOpenAIAdapter:
     def __init__(self, provider: Any):
         self._provider = provider
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create_completion))
+
+    async def close(self) -> None:
+        close = getattr(self._provider, "aclose", None)
+        if callable(close):
+            await close()
 
     async def _create_completion(self, **kwargs: Any) -> Any:
         stream = bool(kwargs.pop("stream", False))
@@ -615,7 +839,9 @@ class _ProviderOpenAIAdapter:
                             for index, tool_call in enumerate(response.tool_calls or [])
                         ],
                     ),
-                    finish_reason=response.finish_reason or "stop",
+                    finish_reason=(
+                        "tool_calls" if response.tool_calls else response.finish_reason or "stop"
+                    ),
                 )
             ],
             usage=response.usage or None,
@@ -696,7 +922,9 @@ class _ProviderOpenAIStream:
                 await self._queue.put(_openai_stream_chunk(tool_call=tool_call, index=index))
             await self._queue.put(
                 _openai_stream_chunk(
-                    finish_reason=response.finish_reason or "stop",
+                    finish_reason=(
+                        "tool_calls" if response.tool_calls else response.finish_reason or "stop"
+                    ),
                     usage=response.usage or None,
                 )
             )

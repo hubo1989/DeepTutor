@@ -2,8 +2,9 @@ from contextlib import asynccontextmanager
 import logging
 import sys
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from deeptutor.logging import configure_logging
 from deeptutor.services.config import (
@@ -153,6 +154,13 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Failed to start cron service: {e}")
 
+    try:
+        from deeptutor.services.github_source.sync_service import get_sync_service
+
+        await get_sync_service().start()
+    except Exception as e:
+        logger.warning(f"Failed to start GitHub source sync: {e}")
+
     # Ping PocketBase if configured — logs a warning (not an error) if unreachable
     try:
         from deeptutor.services.pocketbase_client import ping_pocketbase
@@ -191,6 +199,13 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Failed to stop cron service: {e}")
 
+    try:
+        from deeptutor.services.github_source.sync_service import get_sync_service
+
+        await get_sync_service().stop()
+    except Exception as e:
+        logger.warning(f"Failed to stop GitHub source sync: {e}")
+
     # Stop partners
     try:
         from deeptutor.services.partners import get_partner_manager
@@ -210,6 +225,24 @@ async def lifespan(app: FastAPI):
         logger.info("MCP connections closed")
     except Exception as e:
         logger.warning(f"Failed to close MCP connections: {e}")
+
+    # Close pooled LLM SDK clients so their keep-alive sockets and transports
+    # are released deterministically instead of waiting for interpreter GC.
+    try:
+        from deeptutor.services.llm.provider_factory import close_runtime_provider_pool
+
+        await close_runtime_provider_pool()
+        logger.info("LLM provider pool closed")
+    except Exception as e:
+        logger.warning(f"Failed to close LLM provider pool: {e}")
+
+    try:
+        from deeptutor.core.agentic.client import close_agentic_client_pool
+
+        await close_agentic_client_pool()
+        logger.info("Agentic LLM client pool closed")
+    except Exception as e:
+        logger.warning(f"Failed to close agentic LLM client pool: {e}")
 
     # Stop EventBus
     try:
@@ -239,6 +272,38 @@ app = FastAPI(
     # See: https://github.com/HKUDS/DeepTutor/issues/112
     redirect_slashes=False,
 )
+
+
+@app.middleware("http")
+async def json_error_boundary(request: Request, call_next):
+    """Catch-all so 500s always return JSON, never Starlette's plain-text body.
+
+    Registered as a middleware rather than an ``@app.exception_handler``: a
+    handler for ``Exception`` is installed on Starlette's outermost
+    ``ServerErrorMiddleware``, so its response skips every middleware added
+    here — the 500 would carry no CORS headers (a cross-origin caller sees an
+    opaque CORS failure instead of this body) and would never reach the access
+    log below. Registered *before* ``CORSMiddleware``, this boundary sits
+    inside it, so the response travels back out through the normal stack.
+    """
+    try:
+        return await call_next(request)
+    except Exception as exc:
+        logger.error(
+            "Unhandled exception on %s %s: %s",
+            request.method,
+            request.url.path,
+            exc,
+            exc_info=True,
+        )
+        return JSONResponse(
+            status_code=500,
+            content={
+                "detail": f"{type(exc).__name__}: {exc}",
+                "type": type(exc).__name__,
+            },
+        )
+
 
 # Access logging is funneled through this one middleware. uvicorn's own
 # per-request access log is disabled on every launch path (run_server.py via
@@ -310,6 +375,7 @@ from deeptutor.api.routers import (
     auth,
     book,
     byok,
+    capabilities,
     capabilities_settings,
     chat,
     co_writer,
@@ -317,6 +383,7 @@ from deeptutor.api.routers import (
     imports,
     kids,
     knowledge,
+    marginnote4,
     mastery_path,
     mcp_settings,
     memory,
@@ -329,6 +396,7 @@ from deeptutor.api.routers import (
     question,
     question_notebook,
     quiz_judge,
+    reading,
     sessions,
     settings,
     skills,
@@ -392,9 +460,16 @@ app.include_router(
     notebook.router, prefix="/api/v1/notebook", tags=["notebook"], dependencies=_auth
 )
 app.include_router(book.router, prefix="/api/v1/book", tags=["book"], dependencies=_auth)
+app.include_router(reading.router, prefix="/api/v1/reading", tags=["reading"], dependencies=_auth)
 app.include_router(memory.router, prefix="/api/v1/memory", tags=["memory"], dependencies=_auth)
 app.include_router(
     capabilities_settings.router,
+    prefix="/api/v1/capabilities",
+    tags=["capabilities"],
+    dependencies=_auth,
+)
+app.include_router(
+    capabilities.router,
     prefix="/api/v1/capabilities",
     tags=["capabilities"],
     dependencies=_auth,
@@ -407,6 +482,15 @@ app.include_router(
     prefix="/api/v1/question-notebook",
     tags=["question-notebook"],
     dependencies=_auth,
+)
+# Public UI-settings read (auth pages bootstrap the interface language
+# before a session exists, so GET /api/v1/settings/ui must not be gated
+# by _auth). Mounted first so the path resolves here, not on the gated
+# settings router below.
+app.include_router(
+    settings.public_router,
+    prefix="/api/v1/settings",
+    tags=["settings"],
 )
 app.include_router(
     settings.router, prefix="/api/v1/settings", tags=["settings"], dependencies=_auth
@@ -453,8 +537,13 @@ app.include_router(plugins_api.router, prefix="/api/v1/plugins", tags=["plugins"
 app.include_router(
     agent_config.router, prefix="/api/v1/agent-config", tags=["agent-config"], dependencies=_auth
 )
+# Partners are per-user resources now: anyone may build their own, and an admin
+# may assign theirs to others. Only ``_auth`` here — every route in the router
+# declares whether it needs *use* or *manage* rights on the partner it names
+# (see ``multi_user.partner_access``), which a blanket admin gate could not
+# express.
 app.include_router(
-    partners.router, prefix="/api/v1/partners", tags=["partners"], dependencies=_admin
+    partners.router, prefix="/api/v1/partners", tags=["partners"], dependencies=_auth
 )
 app.include_router(
     attachments.router,
@@ -467,6 +556,14 @@ app.include_router(
     prefix="/api/outputs",
     tags=["outputs"],
     dependencies=_auth,
+)
+
+# MarginNote 4 device bridge — pairing/management routes carry _auth in-router;
+# sync/heartbeat use device-token auth (the Add-on has no session).
+app.include_router(
+    marginnote4.router,
+    prefix="/api/v1/marginnote4",
+    tags=["marginnote4"],
 )
 
 # Unified WebSocket endpoint — auth is checked inside the handler (WebSockets

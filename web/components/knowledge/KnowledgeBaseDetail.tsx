@@ -6,11 +6,13 @@ import {
   ArrowLeft,
   Database,
   FileText,
+  Github,
   Layers,
   Loader2,
   Lock,
   RefreshCw,
   Settings as SettingsIcon,
+  Smartphone,
   Star,
   Upload,
 } from "lucide-react";
@@ -18,7 +20,11 @@ import type { KnowledgeUploadPolicy } from "@/lib/knowledge-api";
 import {
   formatKnowledgeTimestamp,
   isConnectedKb,
+  isMarginNoteKb,
+  kbDetailSections,
+  providerUsesEmbeddingMetadata,
   resolveKbStatus,
+  type KbDetailSection,
   type KnowledgeBase,
 } from "@/lib/knowledge-helpers";
 import type { TaskState } from "@/hooks/useKnowledgeProgress";
@@ -28,8 +34,8 @@ import KbFilesTab from "./KbFilesTab";
 import KbDocumentsSection from "./KbDocumentsSection";
 import KbIndexVersionsSection from "./KbIndexVersionsSection";
 import KbSettingsSection from "./KbSettingsSection";
-
-type DetailSection = "files" | "add" | "versions" | "settings";
+import KbGitHubSourcesSection from "./KbGitHubSourcesSection";
+import KbMarginNoteDevicesSection from "./KbMarginNoteDevicesSection";
 
 interface KnowledgeBaseDetailProps {
   kb: KnowledgeBase | null;
@@ -37,7 +43,11 @@ interface KnowledgeBaseDetailProps {
   task?: TaskState;
   history: HistoryEntry[];
   onCreate: () => void;
-  onUpload: (kbName: string, files: File[]) => Promise<void>;
+  onUpload: (
+    kbName: string,
+    files: File[],
+    destSubdir?: string,
+  ) => Promise<void>;
   onReindex: (kbName: string) => Promise<void>;
   onRetry: (kbName: string) => Promise<void>;
   onSetDefault: (kbName: string) => Promise<void>;
@@ -46,19 +56,20 @@ interface KnowledgeBaseDetailProps {
   onBack?: () => void;
 }
 
-const SECTIONS: {
-  key: DetailSection;
-  label: string;
-  Icon: typeof FileText;
-}[] = [
-  { key: "files", label: "Files", Icon: FileText },
-  { key: "add", label: "Add documents", Icon: Upload },
-  { key: "versions", label: "Index versions", Icon: Layers },
-  { key: "settings", label: "Settings", Icon: SettingsIcon },
-];
+const SECTION_CHROME: Record<
+  KbDetailSection,
+  { label: string; Icon: typeof FileText }
+> = {
+  files: { label: "Files", Icon: FileText },
+  add: { label: "Add documents", Icon: Upload },
+  github: { label: "GitHub", Icon: Github },
+  versions: { label: "Index versions", Icon: Layers },
+  devices: { label: "Devices", Icon: Smartphone },
+  settings: { label: "Settings", Icon: SettingsIcon },
+};
 
 /** Sections that fill the detail body edge-to-edge (no max-w wrapper). */
-const FULL_BLEED_SECTIONS = new Set<DetailSection>(["files"]);
+const FULL_BLEED_SECTIONS = new Set<KbDetailSection>(["files"]);
 
 export default function KnowledgeBaseDetail({
   kb,
@@ -75,7 +86,7 @@ export default function KnowledgeBaseDetail({
   onBack,
 }: KnowledgeBaseDetailProps) {
   const { t } = useTranslation();
-  const [section, setSection] = useState<DetailSection>("files");
+  const [section, setSection] = useState<KbDetailSection>("files");
   const [retrySubmitting, setRetrySubmitting] = useState(false);
 
   // Connected KBs (obsidian / linked / subagent / lightrag_server / ima) are
@@ -121,7 +132,14 @@ export default function KnowledgeBaseDetail({
   }
 
   const meta = kb.metadata || {};
-  const provider = kb.statistics?.rag_provider || "llamaindex";
+  const isMarginNote = isMarginNoteKb(kb);
+  // A MarginNote library records no engine and no embedding: defaulting to
+  // "llamaindex · Default embedding" here described a pipeline it never runs.
+  const provider = isMarginNote
+    ? t("MarginNote 4")
+    : kb.statistics?.rag_provider || "llamaindex";
+  const pageIndexProvider =
+    isMarginNote || !providerUsesEmbeddingMetadata(provider);
   const embeddingLabel = meta.embedding_model
     ? typeof meta.embedding_dim === "number"
       ? `${meta.embedding_model} · ${meta.embedding_dim}${t("d")}`
@@ -135,7 +153,9 @@ export default function KnowledgeBaseDetail({
     (task?.kind === "reindex" || task?.kind === "retry") &&
     task.executing === true;
   const status = resolveKbStatus(kb);
-  const canRetry = status === "error" && !kb.read_only && !connected;
+  // Nothing to re-run for a KB whose content arrives from outside (a
+  // connected source or the MarginNote add-on), not from a local index.
+  const canRetry = status === "error" && !kb.read_only && !connected && !isMarginNote;
 
   const handleRetry = async () => {
     if (!canRetry || retrySubmitting || isReindexingLocally) return;
@@ -147,11 +167,11 @@ export default function KnowledgeBaseDetail({
     }
   };
 
-  // Synchronous view of the active section: a connected KB clamps "add" /
-  // "versions" to "files" immediately, so the body never renders a hidden tab
-  // in the render that precedes the useEffect below resetting `section`.
-  const activeSection: DetailSection =
-    connected && (section === "add" || section === "versions") ? "files" : section;
+  const sections = kbDetailSections(kb);
+  // Switching to a KB without the selected section (a MarginNote library has
+  // no Files tab; a connected KB has no Add/Versions tabs) falls back to its
+  // first, instead of rendering nothing.
+  const activeSection = sections.includes(section) ? section : sections[0];
   const fullBleed = FULL_BLEED_SECTIONS.has(activeSection);
 
   return (
@@ -202,7 +222,9 @@ export default function KnowledgeBaseDetail({
               />
             </div>
             <p className="mt-1 text-[12px] text-[var(--muted-foreground)]">
-              {provider} · {embeddingLabel} · {t("Updated")} {updatedLabel}
+              {provider}
+              {!pageIndexProvider ? ` · ${embeddingLabel}` : ""} ·{" "}
+              {t("Updated")} {updatedLabel}
               {lastIndexedLabel
                 ? ` · ${t("Last indexed")} ${lastIndexedLabel}`
                 : ""}
@@ -231,35 +253,27 @@ export default function KnowledgeBaseDetail({
         </div>
 
         {/* Section nav */}
-        {/* Connected KBs have no local index, so "Add documents" and
-            "Index versions" don't apply — only Files and Settings are shown. */}
-        {(() => {
-          const visibleSections = connected
-            ? SECTIONS.filter((s) => s.key === "files" || s.key === "settings")
-            : SECTIONS;
-          return (
-            <nav className="-mb-3 mt-3 flex gap-1 overflow-x-auto">
-              {visibleSections.map(({ key, label, Icon }) => {
-                const active = activeSection === key;
-                return (
-                  <button
-                    key={key}
-                    type="button"
-                    onClick={() => setSection(key)}
-                    className={`inline-flex shrink-0 items-center gap-1.5 rounded-t-md px-3 py-2 text-[12.5px] font-medium transition-colors ${
-                      active
-                        ? "border-b-2 border-[var(--primary)] text-[var(--foreground)]"
-                        : "border-b-2 border-transparent text-[var(--muted-foreground)] hover:text-[var(--foreground)]"
-                    }`}
-                  >
-                    <Icon size={13} />
-                    {t(label)}
-                  </button>
-                );
-              })}
-            </nav>
-          );
-        })()}
+        <nav className="-mb-3 mt-3 flex gap-1 overflow-x-auto">
+          {sections.map((key) => {
+            const { label, Icon } = SECTION_CHROME[key];
+            const active = activeSection === key;
+            return (
+              <button
+                key={key}
+                type="button"
+                onClick={() => setSection(key)}
+                className={`inline-flex shrink-0 items-center gap-1.5 rounded-t-md px-3 py-2 text-[12.5px] font-medium transition-colors ${
+                  active
+                    ? "border-b-2 border-[var(--primary)] text-[var(--foreground)]"
+                    : "border-b-2 border-transparent text-[var(--muted-foreground)] hover:text-[var(--foreground)]"
+                }`}
+              >
+                <Icon size={13} />
+                {t(label)}
+              </button>
+            );
+          })}
+        </nav>
       </div>
 
       {/* Body */}
@@ -277,8 +291,10 @@ export default function KnowledgeBaseDetail({
                   history={history}
                   onClearHistory={() => onClearHistory(kb.name)}
                   onRetry={handleRetry}
-                  onUpload={(files) =>
-                    kb.read_only ? Promise.resolve() : onUpload(kb.name, files)
+                  onUpload={(files, destSubdir) =>
+                    kb.read_only
+                      ? Promise.resolve()
+                      : onUpload(kb.name, files, destSubdir)
                   }
                 />
               )}
@@ -294,6 +310,12 @@ export default function KnowledgeBaseDetail({
                         : onReindex(kb.name)
                   }
                 />
+              )}
+              {activeSection === "github" && (
+                <KbGitHubSourcesSection kbName={kb.name} />
+              )}
+              {activeSection === "devices" && (
+                <KbMarginNoteDevicesSection key={kb.name} kb={kb} />
               )}
               {activeSection === "settings" && (
                 <KbSettingsSection

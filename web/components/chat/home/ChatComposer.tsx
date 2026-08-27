@@ -89,7 +89,7 @@ interface CapabilityDef {
   allowedTools: string[];
   // Loop-engine capabilities (solve / mastery) run on the chat agent loop and
   // are collapsed into the "More" flyout instead of listed directly.
-  loopEngine?: boolean;
+  secondary?: boolean;
 }
 
 /** One row in the capability picker — shared by the built-in list and the
@@ -196,6 +196,7 @@ export default memo(function ChatComposer({
   llmSelection,
   llmOptionsLoading,
   llmOptionsError,
+  onRefreshLLMOptions,
   contextBudget = null,
   selectedNotebookRecords,
   selectedBookReferences,
@@ -207,6 +208,7 @@ export default memo(function ChatComposer({
   selectedMemoryFiles,
   selectedKnowledgeBases,
   isStreaming,
+  awaitingUserReply = false,
   isVisualizeMode,
   capabilityNeedsConfig,
   capabilityConfigConfirmed,
@@ -276,6 +278,7 @@ export default memo(function ChatComposer({
   llmSelection: LLMSelection | null;
   llmOptionsLoading: boolean;
   llmOptionsError: boolean;
+  onRefreshLLMOptions?: () => void;
   /**
    * Context-window breakdown measured on the last turn that reported one.
    * Omitted by surfaces that don't track it (quiz follow-up) and null until
@@ -296,6 +299,8 @@ export default memo(function ChatComposer({
   selectedMemoryFiles: SpaceMemoryFile[];
   selectedKnowledgeBases: string[];
   isStreaming: boolean;
+  /** The live turn is paused on an ask_user card and needs an answer. */
+  awaitingUserReply?: boolean;
   isVisualizeMode: boolean;
   /**
    * True when the active capability (e.g. Quiz / Visualize / Research)
@@ -509,13 +514,18 @@ export default memo(function ChatComposer({
   // (via `onRequestConfigConfirm`) instead of silently doing nothing.
   const isConfigBlocked = capabilityNeedsConfig && !capabilityConfigConfirmed;
   const hasIntent = hasContent || hasReferences;
-  const canSend = hasIntent && !isStreaming && !isConfigBlocked;
+  // A turn paused on a question is technically still streaming, but the only
+  // thing that can move it forward is the user's answer. Locking the composer
+  // there made the interactive card the ONLY way to answer — and left the
+  // learner with no way out at all if the card failed to render.
+  const streamingBlocksSend = isStreaming && !awaitingUserReply;
+  const canSend = hasIntent && !streamingBlocksSend && !isConfigBlocked;
 
   // `blocked` only exists once there is intent: without it the button stays
   // `idle` so an empty composer doesn't present a live send affordance. That
   // makes intent — not `canSend` — the thing that decides interactivity, so
   // the `blocked` state can stay clickable and surface the config card.
-  const sendState: SendState = isStreaming
+  const sendState: SendState = streamingBlocksSend
     ? "streaming"
     : !hasIntent
       ? "idle"
@@ -635,17 +645,22 @@ export default memo(function ChatComposer({
     doSend(content);
   }, [canSend, doSend, isConfigBlocked, onRequestConfigConfirm]);
 
-  // One button, so one handler: mid-turn the same control cancels.
+  // One button, so one handler: mid-turn the same control cancels — except
+  // while the turn is waiting on the user, where sending IS how it continues.
   const handleSendButtonClick = useCallback(() => {
-    if (isStreaming) {
+    if (streamingBlocksSend) {
       onCancelStreaming();
       return;
     }
     handleManualSend();
-  }, [handleManualSend, isStreaming, onCancelStreaming]);
+  }, [handleManualSend, streamingBlocksSend, onCancelStreaming]);
 
   const sendLabel =
-    sendState === "streaming" ? t("Stop generating") : t("Send");
+    sendState === "streaming"
+      ? t("Stop generating")
+      : awaitingUserReply
+        ? t("Send answer")
+        : t("Send");
   const sendTitle =
     sendState === "blocked"
       ? t("Confirm settings on the right to send.")
@@ -886,7 +901,7 @@ export default memo(function ChatComposer({
                     className="dt-popup-up absolute bottom-full left-0 z-50 mb-1.5 w-[260px] overflow-visible rounded-xl border border-[var(--border)] bg-[var(--popover)] py-1 shadow-lg backdrop-blur-md"
                   >
                     {capabilities
-                      .filter((cap) => !cap.loopEngine)
+                      .filter((cap) => !cap.secondary)
                       .map((cap) => (
                         <CapMenuItem
                           key={cap.value}
@@ -897,7 +912,7 @@ export default memo(function ChatComposer({
                       ))}
                     {(() => {
                       const loopCaps = capabilities.filter(
-                        (cap) => cap.loopEngine,
+                        (cap) => cap.secondary,
                       );
                       if (loopCaps.length === 0) return null;
                       const loopSelected = loopCaps.some(
@@ -1070,6 +1085,7 @@ export default memo(function ChatComposer({
                   loading={llmOptionsLoading}
                   error={llmOptionsError}
                   onChange={onSelectLLM}
+                  onRefresh={onRefreshLLMOptions}
                 />
                 {contextBudget ? (
                   <ContextBudgetChip budget={contextBudget} />

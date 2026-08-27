@@ -39,11 +39,15 @@ export default function RestReminder({
   const [showPopup, setShowPopup] = useState<boolean>(false);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // Reset timer when duration changes
-  useEffect(() => {
+  // Reset the timer when the duration changes. Adjusting state during render
+  // (compared against the previous value) is the sanctioned React pattern;
+  // doing it from an effect body would cascade renders.
+  const [prevDuration, setPrevDuration] = useState(durationMinutes);
+  if (prevDuration !== durationMinutes) {
+    setPrevDuration(durationMinutes);
     setSecondsLeft(durationMinutes * 60);
     setShowPopup(false);
-  }, [durationMinutes]);
+  }
 
   // Countdown timer
   useEffect(() => {
