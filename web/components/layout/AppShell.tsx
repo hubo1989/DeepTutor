@@ -177,13 +177,6 @@ export default function AppShell({ sidebar, children }: AppShellProps) {
             </button>
             <Link href="/" className="flex items-center gap-1.5">
              <Image
-               src="/logo.png"
-               alt="LearnLeader"
-               width={20}
-               height={20}
-               className="h-5 w-5"
-             />
-             <Image
                src="/banner.png"
                alt="LearnLeader"
                width={897}

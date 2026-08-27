@@ -31,9 +31,15 @@ export function I18nProvider({
     const nextLang = normalizeLanguage(language);
     void ensureLanguage(nextLang).then(() => {
       if (cancelled) return;
-      if (i18n.language !== nextLang) {
-        i18n.changeLanguage(nextLang);
-      }
+      // Always (re-)emit changeLanguage, even when i18n.language already equals
+      // nextLang. The initial initI18n() call sets `lng` (e.g. "zh") before the
+      // matching resource bundle is loaded, so the first render falls back to
+      // English copy. When ensureLanguage later imports the bundle we MUST fire
+      // languageChanged so react-i18next subscribers (e.g. SkillsSection)
+      // re-render with the now-available translations; skipping the call when
+      // i18n.language === nextLang leaves those components stuck on the
+      // pre-bundle fallback copy.
+      i18n.changeLanguage(nextLang);
       // Keep <html lang="..."> in sync for accessibility & Intl defaults.
       document.documentElement.lang = nextLang;
     });
