@@ -463,6 +463,22 @@ Everything under `data/user/settings/` is plain JSON/YAML. The **Settings** page
 | `main.yaml` | Runtime behavior defaults and path injection |
 | `agents.yaml` | Capability/tool temperature and token settings |
 
+Web Search references are filtered by default: only public `http`/`https` URLs
+without embedded credentials or unusual ports are surfaced. Deployments can add
+an education-focused domain policy under `tools.web_search.source_filtering` in
+`main.yaml`:
+
+```yaml
+tools:
+  web_search:
+    source_filtering:
+      blocked_domains: [spam.example]
+      trusted_domains: [edu.cn, arxiv.org]
+```
+
+When `trusted_domains` is non-empty, references are limited to those domains
+and their subdomains; `blocked_domains` always takes precedence.
+
 Project-root `.env` is **not** read as an application config file. For a minimal model setup, open **Settings → Models**, add an LLM profile (Base URL / API key / model name), and save. Add an embedding profile only if you plan to use Knowledge Base / RAG features.
 
 OpenAI-compatible LLM profiles also expose an **API protocol** setting. Keep

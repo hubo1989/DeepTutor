@@ -33,6 +33,7 @@ from .providers import (
     get_providers_info,
     list_providers,
 )
+from .source_filter import filter_web_search_response, settings_from_config
 from .types import Citation, SearchResult, WebSearchResponse
 
 _logger = logging.getLogger(__name__)
@@ -192,6 +193,8 @@ def web_search(
     if response is None:
         raise Exception("web search failed: " + "; ".join(failures))
 
+    response = filter_web_search_response(response, **settings_from_config(config))
+
     # Auto-consolidate for providers that don't generate their own answers.
     if not supports_answer:
         if consolidation_custom_template is None:
@@ -236,6 +239,7 @@ def get_current_config() -> dict[str, Any]:
         "supported_providers": sorted(SUPPORTED_SEARCH_PROVIDERS),
         "deprecated_providers": sorted(DEPRECATED_SEARCH_PROVIDERS),
         "consolidation_template": config.get("consolidation_template") or None,
+        "source_filtering": settings_from_config(config),
         "template_providers": list(PROVIDER_TEMPLATES.keys()),
     }
 
@@ -254,6 +258,7 @@ __all__ = [
     "Citation",
     "SearchResult",
     "AnswerConsolidator",
+    "filter_web_search_response",
     "PROVIDER_TEMPLATES",
     "BaseSearchProvider",
     "SearchProvider",
