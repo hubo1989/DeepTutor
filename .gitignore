@@ -318,3 +318,6 @@ celerybeat.pid
 *.wav
 *.ogg
 !demo/*.mp4
+
+# local video-agent tooling artifacts
+.video_agent/
