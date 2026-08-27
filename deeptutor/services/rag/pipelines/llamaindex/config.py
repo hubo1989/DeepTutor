@@ -4,10 +4,24 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
+import sys
 
 VECTOR_PROFILE = "vector"
 HYBRID_PROFILE = "hybrid"
 SUPPORTED_RETRIEVAL_PROFILES = {VECTOR_PROFILE, HYBRID_PROFILE}
+
+
+def should_show_progress() -> bool:
+    """Whether to emit LlamaIndex ``tqdm`` progress bars.
+
+    tqdm writes carriage-return progress lines to ``sys.stdout``. When
+    DeepTutor runs as a server that stream is a pipe whose read end (the
+    launcher's relay thread) can close mid-indexing, and the next tqdm write
+    then raises :class:`BrokenPipeError`, killing document indexing. DeepTutor
+    reports indexing progress through its own ``ProgressTracker``, so the tqdm
+    output is only wanted in an interactive CLI/REPL session.
+    """
+    return bool(getattr(sys.stdout, "isatty", lambda: False)())
 
 
 @dataclass(frozen=True)
@@ -95,6 +109,17 @@ def chunk_geometry() -> tuple[int, int]:
         return 512, 50
 
 
+def image_description_limits() -> tuple[int, float]:
+    """Return the configured vision-call concurrency and per-image timeout."""
+    try:
+        settings = _load_runtime_settings()
+        concurrency = int(settings.get("image_description_concurrency", 4) or 4)
+        timeout_seconds = float(settings.get("image_description_timeout_seconds", 60) or 60)
+        return min(16, max(1, concurrency)), min(600.0, max(5.0, timeout_seconds))
+    except Exception:
+        return 4, 60.0
+
+
 __all__ = [
     "HYBRID_PROFILE",
     "RetrievalConfig",
@@ -102,6 +127,7 @@ __all__ = [
     "VECTOR_PROFILE",
     "chunk_geometry",
     "default_top_k",
+    "image_description_limits",
     "normalize_retrieval_profile",
     "retrieval_config_from_env",
     "retrieval_config_from_settings",

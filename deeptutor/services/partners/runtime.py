@@ -32,11 +32,19 @@ import uuid
 
 from deeptutor.core.context import Attachment, UnifiedContext
 from deeptutor.core.stream import StreamEvent, StreamEventType
-from deeptutor.multi_user.paths import user_context
+from deeptutor.multi_user.paths import get_current_path_service, user_context
 from deeptutor.partners.bus.events import InboundMessage, OutboundMessage
 from deeptutor.partners.bus.queue import MessageBus
 from deeptutor.partners.helpers import detect_image_mime
 from deeptutor.services.partners.commands import PartnerCommandHandler
+from deeptutor.services.partners.interaction import (
+    actor_for_account,
+    build_partner_turn_context,
+    partner_turn_context,
+    personal_actor_id,
+    session_store_for,
+)
+from deeptutor.services.partners.links import linked_user_id
 from deeptutor.services.partners.scope import partner_user
 from deeptutor.services.partners.sessions import PartnerSessionStore
 from deeptutor.services.partners.workspace import ensure_partner_workspace, read_soul
@@ -77,13 +85,11 @@ class PartnerRunner:
         partner_id: str,
         config: Any,
         bus: MessageBus,
-        store: PartnerSessionStore,
         save_config: Callable[[str, Any], None] | None = None,
     ) -> None:
         self.partner_id = partner_id
         self.config = config
         self.bus = bus
-        self.store = store
         self.save_config = save_config
         self._session_locks: dict[str, asyncio.Lock] = {}
         self._tasks: set[asyncio.Task] = set()
@@ -127,11 +133,33 @@ class PartnerRunner:
 
     # ── one turn ──────────────────────────────────────────────────
 
-    def _lock_for(self, session_key: str) -> asyncio.Lock:
-        lock = self._session_locks.get(session_key)
+    def _identify(self, msg: InboundMessage) -> None:
+        """Attach the sender's DeepTutor identity to a channel message, if any.
+
+        In-app turns arrive with an actor already set. A channel message
+        carries only a sender id, which counts as an identity once that account
+        has been linked (``/link``). Group traffic deliberately stays
+        un-attributed: a group thread is a shared conversation, and splitting it
+        per speaker would leave the partner answering each person out of a
+        history nobody else in the room can see.
+        """
+        if msg.actor is not None or (msg.metadata or {}).get("is_group"):
+            return
+        user_id = linked_user_id(self.partner_id, msg.channel, msg.sender_id)
+        if user_id:
+            msg.actor = actor_for_account(user_id)
+
+    def _store_for(self, msg: InboundMessage) -> PartnerSessionStore:
+        """Where this message's turn is persisted — the sender's own thread pool
+        when the message carries an identity, the partner's shared one otherwise."""
+        return session_store_for(self.partner_id, msg.actor)
+
+    def _lock_for(self, session_key: str, *, actor_id: str | None) -> asyncio.Lock:
+        lock_key = f"{actor_id or 'legacy'}:{session_key}"
+        lock = self._session_locks.get(lock_key)
         if lock is None:
             lock = asyncio.Lock()
-            self._session_locks[session_key] = lock
+            self._session_locks[lock_key] = lock
         return lock
 
     async def process_message(
@@ -147,21 +175,26 @@ class PartnerRunner:
         should attach to the final outbound message (e.g. ``_streamed``
         when the reply was already delivered live via stream deltas).
         """
+        self._identify(msg)
         session_key = msg.session_key
-        async with self._lock_for(session_key):
+        store = self._store_for(msg)
+        async with self._lock_for(session_key, actor_id=personal_actor_id(msg.actor)):
             command = PartnerCommandHandler(
                 partner_id=self.partner_id,
                 config=self.config,
-                store=self.store,
+                store=store,
                 save_config=self.save_config,
             ).dispatch(msg)
             if command is not None:
                 return command.content
 
             final, turn_events = await self._run_turn(
-                msg, on_event=on_event, delivery_meta=delivery_meta
+                msg,
+                store=store,
+                on_event=on_event,
+                delivery_meta=delivery_meta,
             )
-            self.store.append(
+            store.append(
                 session_key,
                 "user",
                 msg.content,
@@ -170,7 +203,7 @@ class PartnerRunner:
                 attachments=list((msg.metadata or {}).get("_attachment_records") or []),
             )
             if final:
-                self.store.append(
+                store.append(
                     session_key,
                     "assistant",
                     final,
@@ -183,6 +216,7 @@ class PartnerRunner:
         self,
         msg: InboundMessage,
         *,
+        store: PartnerSessionStore,
         on_event: EventCallback | None = None,
         delivery_meta: dict[str, Any] | None = None,
     ) -> tuple[str, list[dict[str, Any]]]:
@@ -191,7 +225,11 @@ class PartnerRunner:
         backup = getattr(self.config, "backup_llm_selection", None) or None
 
         final_text, errors, events = await self._execute_turn(
-            msg, selection=primary, on_event=on_event, delivery_meta=delivery_meta
+            msg,
+            store=store,
+            selection=primary,
+            on_event=on_event,
+            delivery_meta=delivery_meta,
         )
         if not final_text and errors and backup and backup != primary:
             logger.warning(
@@ -202,7 +240,11 @@ class PartnerRunner:
             if delivery_meta is not None:
                 delivery_meta.pop("_streamed", None)
             final_text, errors, events = await self._execute_turn(
-                msg, selection=backup, on_event=on_event, delivery_meta=delivery_meta
+                msg,
+                store=store,
+                selection=backup,
+                on_event=on_event,
+                delivery_meta=delivery_meta,
             )
 
         if not final_text and errors:
@@ -213,6 +255,7 @@ class PartnerRunner:
         self,
         msg: InboundMessage,
         *,
+        store: PartnerSessionStore,
         selection: dict[str, str] | None,
         on_event: EventCallback | None = None,
         delivery_meta: dict[str, Any] | None = None,
@@ -267,7 +310,7 @@ class PartnerRunner:
         # rides the same async context into the orchestrator task.
         llm_token = None
         try:
-            context = self._build_context(msg)
+            context = self._build_context(msg, store=store)
             turn_id = str(context.metadata.get("turn_id") or "")
             send_progress = self._channel_delivery_flag(msg.channel, "send_progress", default=True)
             send_tool_hints = self._channel_delivery_flag(
@@ -279,70 +322,78 @@ class PartnerRunner:
             wants_stream = is_im and send_progress and bool(msg.metadata.get("_wants_stream"))
 
             _config, llm_token = activate_llm_selection(selection)
-            # Everything — rag / skills / notebooks AND memory — resolves to the
-            # partner's own synthetic workspace. The partner-only memory tools
-            # (partner_read / partner_memorize / partner_search, force-mounted by
-            # the pipeline) own the split-memory model: partner_read folds in the
-            # owner's shared L3 on top of the partner's own, partner_memorize
-            # writes only the partner's own. Chat's read_memory / write_memory
-            # are suppressed on partner turns, so no admin memory override is
-            # needed here (and the partner can never write the owner's memory).
+            # RAG / skills / notebooks resolve to the Partner's shared synthetic
+            # workspace. Partner-only memory tools additionally read the turn
+            # context below: assigned users get a private relationship-memory
+            # directory and their own L3 as read-only shared context; admin and
+            # IM turns retain the legacy Partner/admin paths. Product-chat
+            # read_memory / write_memory remain suppressed on Partner turns.
             with user_context(partner_user(self.partner_id, name=self.config.name)):
-                orchestrator = ChatOrchestrator()
-                async for event in orchestrator.handle(context):
-                    if on_event is not None:
-                        await on_event(event)
-                    meta = event.metadata or {}
+                turn_context = build_partner_turn_context(
+                    self.partner_id,
+                    msg.actor,
+                    store,
+                    legacy_own_memory=get_current_path_service(),
+                )
+                with partner_turn_context(turn_context):
+                    orchestrator = ChatOrchestrator()
+                    event_stream = orchestrator.handle(context)
+                    async for event in event_stream:
+                        if on_event is not None:
+                            await on_event(event)
+                        meta = event.metadata or {}
 
-                    # Capture the trace for rehydration — mirror product chat's
-                    # persisted ``assistant_events`` (everything but done/session).
-                    if event.type not in (StreamEventType.DONE, StreamEventType.SESSION):
-                        turn_events.append(event.to_dict())
+                        # Capture the trace for rehydration — mirror product chat's
+                        # persisted ``assistant_events`` (everything but done/session).
+                        if event.type not in (StreamEventType.DONE, StreamEventType.SESSION):
+                            turn_events.append(event.to_dict())
 
-                    if event.type == StreamEventType.CONTENT:
-                        call_id = str(meta.get("call_id") or "")
-                        round_buffers.setdefault(call_id, []).append(event.content or "")
-                        if meta.get("call_kind") == "llm_final_response":
-                            terminator_text += event.content or ""
-                        if wants_stream and event.content:
-                            streamed_rounds[call_id] = (
-                                streamed_rounds.get(call_id, "") + event.content
-                            )
-                            await self._publish_stream_delta(msg, turn_id, call_id, event.content)
-
-                    elif event.type == StreamEventType.TOOL_CALL:
-                        if is_im and send_tool_hints and event.content:
-                            hint = _format_tool_hint(event.content, meta.get("args"))
-                            await self._publish_hint(msg, hint, tool_hint=True)
-
-                    elif event.type == StreamEventType.PROGRESS:
-                        if (
-                            meta.get("trace_kind") == "call_status"
-                            and meta.get("call_state") == "complete"
-                            and meta.get("call_role") == "narration"
-                        ):
+                        if event.type == StreamEventType.CONTENT:
                             call_id = str(meta.get("call_id") or "")
-                            raw_text = "".join(round_buffers.pop(call_id, []))
-                            text = raw_text.strip()
-                            if meta.get("answer_visible") is True:
-                                if raw_text:
-                                    answer_visible_parts.append(raw_text)
+                            round_buffers.setdefault(call_id, []).append(event.content or "")
+                            if meta.get("call_kind") == "llm_final_response":
+                                terminator_text += event.content or ""
+                            if wants_stream and event.content:
+                                streamed_rounds[call_id] = (
+                                    streamed_rounds.get(call_id, "") + event.content
+                                )
+                                await self._publish_stream_delta(
+                                    msg, turn_id, call_id, event.content
+                                )
+
+                        elif event.type == StreamEventType.TOOL_CALL:
+                            if is_im and send_tool_hints and event.content:
+                                hint = _format_tool_hint(event.content, meta.get("args"))
+                                await self._publish_hint(msg, hint, tool_hint=True)
+
+                        elif event.type == StreamEventType.PROGRESS:
+                            if (
+                                meta.get("trace_kind") == "call_status"
+                                and meta.get("call_state") == "complete"
+                                and meta.get("call_role") == "narration"
+                            ):
+                                call_id = str(meta.get("call_id") or "")
+                                raw_text = "".join(round_buffers.pop(call_id, []))
+                                text = raw_text.strip()
+                                if meta.get("answer_visible") is True:
+                                    if raw_text:
+                                        answer_visible_parts.append(raw_text)
+                                    if call_id in streamed_rounds:
+                                        ended_rounds.add(call_id)
+                                        await self._publish_stream_end(msg, turn_id, call_id)
+                                    continue
                                 if call_id in streamed_rounds:
+                                    # Already streamed live — freeze the segment.
                                     ended_rounds.add(call_id)
                                     await self._publish_stream_end(msg, turn_id, call_id)
-                                continue
-                            if call_id in streamed_rounds:
-                                # Already streamed live — freeze the segment.
-                                ended_rounds.add(call_id)
-                                await self._publish_stream_end(msg, turn_id, call_id)
-                            elif is_im and send_progress and text:
-                                await self._publish_hint(msg, text, tool_hint=False)
+                                elif is_im and send_progress and text:
+                                    await self._publish_hint(msg, text, tool_hint=False)
 
-                    elif event.type == StreamEventType.RESULT and event.source == "chat":
-                        final_text = str(meta.get("response") or "")
+                        elif event.type == StreamEventType.RESULT and event.source == "chat":
+                            final_text = str(meta.get("response") or "")
 
-                    elif event.type == StreamEventType.ERROR and event.content:
-                        errors.append(event.content)
+                        elif event.type == StreamEventType.ERROR and event.content:
+                            errors.append(event.content)
         except Exception as exc:
             logger.exception("Partner %s turn crashed", self.partner_id)
             errors.append(f"{type(exc).__name__}: {exc}")
@@ -388,13 +439,19 @@ class PartnerRunner:
 
     # ── context assembly ──────────────────────────────────────────
 
-    def _build_context(self, msg: InboundMessage) -> UnifiedContext:
+    def _build_context(
+        self,
+        msg: InboundMessage,
+        *,
+        store: PartnerSessionStore,
+    ) -> UnifiedContext:
         session_key = msg.session_key
         turn_id = f"partner-{self.partner_id}-{uuid.uuid4().hex[:12]}"
-        history = self.store.conversation_history(session_key)
+        history = store.conversation_history(session_key)
         attachments, attachment_records = self._attachments_from_media(msg.media)
         source_manifest, source_index = self._source_manifest_from_records(
             session_key,
+            store=store,
             fresh_records=attachment_records,
         )
         msg.metadata["_attachment_records"] = attachment_records
@@ -465,14 +522,23 @@ class PartnerRunner:
 
         ``None`` in config means "everything the user could toggle on in
         chat" — partners default to fully equipped; an explicit list (or
-        ``[]``) is the owner's selection.
+        ``[]``) is the owner's selection. The result is intersected with the
+        admin's global chat toggles (``admin_enabled_optional_tools``) so a
+        tool the admin disabled in Settings → Chat → Tools can never run
+        inside a partner turn, even if the partner config saved it (or saved
+        ``None`` before the admin turned the tool off).
         """
-        configured = getattr(self.config, "enabled_tools", None)
-        if configured is None:
-            from deeptutor.agents._shared.tool_composition import default_optional_tools
+        from deeptutor.agents._shared.tool_composition import (
+            admin_enabled_optional_tools,
+            default_optional_tools,
+        )
 
-            return default_optional_tools()
-        return [str(name) for name in configured]
+        configured = getattr(self.config, "enabled_tools", None)
+        candidates = (
+            default_optional_tools() if configured is None else [str(name) for name in configured]
+        )
+        globally_enabled = set(admin_enabled_optional_tools())
+        return [name for name in candidates if name in globally_enabled]
 
     def _resolved_builtin_tools(self) -> list[str] | None:
         """The partner's allowed built-in (auto-mounted) tools.
@@ -633,6 +699,7 @@ class PartnerRunner:
         self,
         session_key: str,
         *,
+        store: PartnerSessionStore,
         fresh_records: list[dict[str, Any]],
     ) -> tuple[str, dict[str, str]]:
         try:
@@ -647,7 +714,7 @@ class PartnerRunner:
 
         inv = SourceInventory()
         turn_ordinal = 1
-        historical_messages = self.store.messages(session_key, limit=200)
+        historical_messages = store.messages(session_key, limit=200)
         for message in historical_messages:
             if message.get("role") == "user":
                 turn_ordinal += 1

@@ -366,6 +366,42 @@ init_user_directories(Path('/app'))
 # owns it. Cheap on no-op; the only first-start cost is one stat per file.
 chown -R deeptutor:deeptutor /app/data 2>/dev/null || true
 
+# Optional dependencies (#762). A container is disposable, so anything
+# `docker exec … pip install`ed into a running one is gone at the next
+# `compose down`. Declare them on the deployment instead and every container
+# started from it has them:
+#
+#   environment:
+#     DEEPTUTOR_EXTRAS: "math-animator,partners"
+#     DEEPTUTOR_APT_PACKAGES: "ffmpeg"
+#
+# Both steps are idempotent — a warm container only pays a check — and neither
+# is allowed to be fatal: a missing wheel leaves that one feature unavailable,
+# exactly as it was before, rather than taking the whole deployment down.
+# The pip cache lives on the data volume so a rebuild reuses the downloads it
+# already paid for instead of fetching them again.
+export PIP_CACHE_DIR="${PIP_CACHE_DIR:-/app/data/.cache/pip}"
+mkdir -p "$PIP_CACHE_DIR" 2>/dev/null || true
+
+if [ -n "${DEEPTUTOR_APT_PACKAGES:-}" ]; then
+    echo "🔧 Ensuring system packages: ${DEEPTUTOR_APT_PACKAGES}"
+    apt_missing=""
+    for pkg in $(echo "${DEEPTUTOR_APT_PACKAGES}" | tr ',' ' '); do
+        dpkg -s "$pkg" >/dev/null 2>&1 || apt_missing="$apt_missing $pkg"
+    done
+    if [ -z "$apt_missing" ]; then
+        echo "   ✅ System packages already present"
+    elif ! (apt-get update -qq && apt-get install -y --no-install-recommends $apt_missing); then
+        echo "   ⚠️ apt-get failed; these packages stay unavailable:$apt_missing"
+    fi
+fi
+
+if [ -n "${DEEPTUTOR_EXTRAS:-}" ]; then
+    echo "🔧 Ensuring Python extras: ${DEEPTUTOR_EXTRAS}"
+    python /app/scripts/install_extras.py "${DEEPTUTOR_EXTRAS}" || true
+    chown -R deeptutor:deeptutor "$PIP_CACHE_DIR" 2>/dev/null || true
+fi
+
 echo "⚙️  Loading runtime JSON settings..."
 eval "$(python - <<'PY'
 import shlex
@@ -443,16 +479,24 @@ ENTRYPOINT ["/app/entrypoint.sh"]
 # ============================================
 FROM production AS development
 
-# Re-add full node_modules for development hot-reload
-# (Production uses standalone output which doesn't include full node_modules)
-COPY --from=frontend-builder /app/web/node_modules ./web/node_modules
-COPY --from=frontend-builder /app/web/package.json ./web/package.json
-COPY --from=frontend-builder /app/web/next.config.js ./web/next.config.js
+# `next dev` compiles from source, so the development image needs the whole
+# web tree. This used to cherry-pick node_modules, package.json and
+# next.config.js on top of the production stage — but that stage's ./web is
+# `.next/standalone/`, a compiled server bundle carrying no sources, no
+# tsconfig and no scripts/. So the supervisor program below launched
+# `node scripts/dev.mjs` against a path that never existed, the dev frontend
+# went FATAL, and the image looked broken (#906). Taking the builder's tree
+# wholesale also stops the list from drifting each time web/ grows a
+# top-level entry. `--chown` during the copy avoids re-layering node_modules.
+COPY --chown=deeptutor:deeptutor --from=frontend-builder /app/web ./web
 
 # `next dev` runs as the unprivileged deeptutor user (via `user=deeptutor` in
 # the supervisord config) and must create/write its build cache under
 # /app/web/.next, so give that user ownership of the web dir and the cache.
-RUN mkdir -p /app/web/.next \
+# The production build copied in above is not reusable by `next dev`, so it
+# starts from an empty cache rather than a half-valid one.
+RUN rm -rf /app/web/.next \
+    && mkdir -p /app/web/.next \
     && chown deeptutor:deeptutor /app/web /app/web/.next
 
 # Install development tools

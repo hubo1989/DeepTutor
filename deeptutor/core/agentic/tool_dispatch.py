@@ -46,8 +46,19 @@ logger = logging.getLogger(__name__)
 
 MAX_PARALLEL_TOOL_CALLS = 8
 
+# Tools that pause the turn to show the user something. They run *after* the
+# rest of their round and re-bind their arguments against whatever those calls
+# committed: a model that poses a question and shows it in one round would
+# otherwise have its card bound before the question existed, so the card could
+# not carry the persisted version of it.
+PAUSE_LAST_TOOLS = frozenset({"ask_user"})
+
 
 KwargAugmenter = Callable[[str, dict[str, Any], UnifiedContext], dict[str, Any]]
+# Tool names whose whole job is to change what the *rest* of the round operates
+# on (a mastery path, a workspace, …). Supplied per turn by the caller, since
+# which tools rebind is a capability's knowledge, not the dispatcher's.
+RebindingTools = frozenset[str]
 RetrieveMetaFactory = Callable[[dict[str, Any], str, dict[str, Any]], dict[str, Any] | None]
 UnknownErrorMessageFactory = Callable[[str], str]
 
@@ -85,6 +96,7 @@ async def dispatch_tool_calls(
     iteration_index: int,
     registry: ToolLookup | None = None,
     kwarg_augmenter: KwargAugmenter | None = None,
+    rebinding_tools: RebindingTools = frozenset(),
     retrieve_meta_factory: RetrieveMetaFactory | None = None,
     tool_call_label: str = "Tool call",
     retrieve_label: str = "Retrieve",
@@ -107,7 +119,7 @@ async def dispatch_tool_calls(
             )
         tool_calls = tool_calls[:MAX_PARALLEL_TOOL_CALLS]
 
-    prepared = _prepare_tool_args(tool_calls, context, kwarg_augmenter)
+    prepared, raw_args = _prepare_tool_args(tool_calls, context, kwarg_augmenter)
     # Collapse duplicates within this parallel batch. Models occasionally
     # emit repeated tool_calls in one assistant message. For most tools,
     # "duplicate" means same tool + same JSON-normalised args. For
@@ -194,7 +206,60 @@ async def dispatch_tool_calls(
             retrieve_label=retrieve_label,
         )
 
-    results = await asyncio.gather(*[_run_one(i) for i in range(len(prepared))])
+    def _rebind(indices: list[int]) -> None:
+        """Re-bind server-owned args from the model's originals.
+
+        As idempotent as the first bind, so a call can be re-bound at any
+        stage boundary; a duplicate short-circuits before it executes and has
+        nothing to re-bind.
+        """
+        if kwarg_augmenter is None:
+            return
+        for index in indices:
+            if duplicate_of.get(index) is not None:
+                continue
+            call_id, name, _stale = prepared[index]
+            prepared[index] = (call_id, name, kwarg_augmenter(name, raw_args[index], context))
+
+    # Three ordered stages around one concurrent middle. Every call in a round
+    # has its args bound before any of them runs, so a tool that *changes what
+    # the round operates on* has to run before the calls it affects — and those
+    # calls have to be re-bound afterwards, or they would still be pointed at
+    # the state the round started with.
+    #
+    #   1. rebinding tools (serial: two of them in one round are a handoff,
+    #      not a race), then everything else re-binds against the new target;
+    #   2. everything else, concurrently;
+    #   3. pausing tools, re-bound once more — their whole job is to show the
+    #      user the state of the round, which does not exist until it has run.
+    #      A pause costs no parallelism worth keeping: the turn is about to
+    #      stop and wait anyway.
+    rebinding = [index for index, (_, name, _) in enumerate(prepared) if name in rebinding_tools]
+    pausing = [
+        index
+        for index, (_, name, _) in enumerate(prepared)
+        if name in PAUSE_LAST_TOOLS and index not in set(rebinding)
+    ]
+    ordinary = [
+        index
+        for index in range(len(prepared))
+        if index not in set(rebinding) and index not in set(pausing)
+    ]
+    by_index: dict[int, dict[str, Any]] = {}
+    if rebinding:
+        for index in rebinding:
+            by_index[index] = await _run_one(index)
+        _rebind(ordinary)
+    if ordinary:
+        by_index.update(
+            zip(ordinary, await asyncio.gather(*[_run_one(i) for i in ordinary]), strict=True)
+        )
+    if pausing:
+        _rebind(pausing)
+        by_index.update(
+            zip(pausing, await asyncio.gather(*[_run_one(i) for i in pausing]), strict=True)
+        )
+    results = [by_index[index] for index in range(len(prepared))]
 
     return await _collect_outcome(
         prepared=prepared,
@@ -347,8 +412,14 @@ def _prepare_tool_args(
     tool_calls: list[dict[str, Any]],
     context: UnifiedContext,
     kwarg_augmenter: KwargAugmenter | None,
-) -> list[tuple[str, str, dict[str, Any]]]:
+) -> tuple[list[tuple[str, str, dict[str, Any]]], list[dict[str, Any]]]:
+    """Bind each call's execution args, keeping the model's originals.
+
+    The originals are what a deferred re-bind starts from, so re-binding is
+    exactly as idempotent as the first bind (see :data:`PAUSE_LAST_TOOLS`).
+    """
     prepared: list[tuple[str, str, dict[str, Any]]] = []
+    raw_args: list[dict[str, Any]] = []
     for tc in tool_calls:
         tool_name = str(tc.get("name") or "").strip()
         tool_call_id = str(tc.get("id") or "").strip()
@@ -365,7 +436,8 @@ def _prepare_tool_args(
             else dict(tool_args)
         )
         prepared.append((tool_call_id, tool_name, exec_args))
-    return prepared
+        raw_args.append(dict(tool_args))
+    return prepared, raw_args
 
 
 def _build_per_tool_trace_meta(

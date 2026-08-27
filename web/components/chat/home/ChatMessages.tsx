@@ -60,11 +60,14 @@ import {
   AskUserOptions,
   extractAskUserPayload,
   extractMessageSegments,
+  leadingTraceEvents,
 } from "./AskUserOptions";
+import { SetupCredentialCard } from "./SetupCredentialCard";
+import { extractSetupCredential } from "@/lib/setup-signals";
 import ContextReferenceTree, {
   type ContextTreeItem,
 } from "./ContextReferenceTree";
-import { AssistantActivity } from "./TracePanels";
+import { AssistantActivity, NestedTraceFlow } from "./TracePanels";
 import { agentGlyph } from "@/components/agents/agent-icons";
 import { useConnectedAgentKinds } from "@/hooks/useConnectedAgentKinds";
 
@@ -377,6 +380,13 @@ const AssistantMessage = memo(function AssistantMessage({
     [msg.events],
   );
 
+  // Set by ``request_credential`` when a configuration step needs a secret the
+  // assistant must not handle itself.
+  const setupCredential = useMemo(
+    () => extractSetupCredential(msg.events),
+    [msg.events],
+  );
+
   // Interleaved segments for the default chat surface — text emitted
   // before the ask_user call renders above the card; text emitted by
   // the resumed iteration renders below it. Only walked when this
@@ -395,6 +405,16 @@ const AssistantMessage = memo(function AssistantMessage({
   const hasInlineAskUser =
     useInlineAskUserSegments &&
     messageSegments.some((seg) => seg.kind === "ask_user");
+  // The activity block is pinned to the top of the message, so it can only
+  // show the rounds that ran BEFORE the first card. What the resumed rounds
+  // reason about renders below the card they answer, in stream order.
+  const headerTraceEvents = useMemo(
+    () =>
+      hasInlineAskUser
+        ? leadingTraceEvents(events, messageSegments)
+        : undefined,
+    [hasInlineAskUser, messageSegments, events],
+  );
 
   const researchInProgress =
     outlineStatus === "researching" || outlineStatus === "done";
@@ -409,6 +429,7 @@ const AssistantMessage = memo(function AssistantMessage({
           still working, collapsed once it settles into the final answer. */}
       <AssistantActivity
         events={events}
+        traceEvents={headerTraceEvents}
         isStreaming={isStreaming}
         content={msg.content}
         className="mb-3"
@@ -494,6 +515,14 @@ const AssistantMessage = memo(function AssistantMessage({
               content={seg.text}
               isStreaming={isStreaming}
             />
+          ) : seg.kind === "trace" ? (
+            // What DeepTutor worked out after the user answered — shown
+            // where they are looking, not back up in the header block.
+            <NestedTraceFlow
+              key={seg.key}
+              events={seg.events}
+              isStreaming={isStreaming}
+            />
           ) : (
             <AskUserOptions
               key={seg.key}
@@ -521,6 +550,10 @@ const AssistantMessage = memo(function AssistantMessage({
           }}
         />
       ) : null}
+      {/* Credential hand-off sits below whichever body branch rendered: it
+          supplements the answer ("here's where to paste the key") rather than
+          replacing it, and applies to every branch. */}
+      {setupCredential ? <SetupCredentialCard data={setupCredential} /> : null}
     </>
   );
 });
@@ -878,6 +911,7 @@ const UserMessage = memo(function UserMessage({
   editDisabled,
   siblingInfo,
   onSwitchBranch,
+  availableKbNames,
 }: {
   msg: ChatMessageItem;
   index: number;
@@ -887,6 +921,8 @@ const UserMessage = memo(function UserMessage({
   editDisabled?: boolean;
   siblingInfo?: SiblingInfo;
   onSwitchBranch?: (parentMessageId: number | null, childId: number) => void;
+  /** Names of KBs confirmed to exist. Omitted when the KB list is unavailable. */
+  availableKbNames?: Set<string>;
 }) {
   const { t } = useTranslation();
   const [editing, setEditing] = useState(false);
@@ -943,25 +979,30 @@ const UserMessage = memo(function UserMessage({
         onClick: onPreviewAttachment ? () => onPreviewAttachment(a) : undefined,
       };
     }),
-    ...(snap?.knowledgeBases ?? []).map((name): ContextTreeItem => {
-      const agentKind = agentKinds[name];
-      if (agentKind) {
+    ...(snap?.knowledgeBases ?? [])
+      .filter(
+        (name) =>
+          !availableKbNames || availableKbNames.has(name) || agentKinds[name],
+      )
+      .map((name): ContextTreeItem => {
+        const agentKind = agentKinds[name];
+        if (agentKind) {
+          return {
+            key: `agent-${name}`,
+            // Brand SVG marks share the lucide call signature (size/strokeWidth/
+            // className); cast bridges the structural-variance gap.
+            icon: (agentGlyph(agentKind) ?? Bot) as unknown as LucideIcon,
+            kind: t("Agent"),
+            label: name,
+          };
+        }
         return {
-          key: `agent-${name}`,
-          // Brand SVG marks share the lucide call signature (size/strokeWidth/
-          // className); cast bridges the structural-variance gap.
-          icon: (agentGlyph(agentKind) ?? Bot) as unknown as LucideIcon,
-          kind: t("Agent"),
+          key: `kb-${name}`,
+          icon: Database,
+          kind: t("Knowledge"),
           label: name,
         };
-      }
-      return {
-        key: `kb-${name}`,
-        icon: Database,
-        kind: t("Knowledge"),
-        label: name,
-      };
-    }),
+      }),
     ...(snap?.bookReferences ?? []).map(
       (ref): ContextTreeItem => ({
         key: `book-${ref.book_id}`,
@@ -1152,6 +1193,7 @@ export const ChatMessageList = memo(function ChatMessageList({
   selectedBranches,
   onEditMessage,
   onSwitchBranch,
+  availableKbNames,
   onSubmitUserReply,
 }: {
   messages: ChatMessageItem[];
@@ -1188,6 +1230,8 @@ export const ChatMessageList = memo(function ChatMessageList({
           answers?: Array<{ questionId: string; text: string }>;
         },
   ) => void;
+  /** Names of KBs confirmed to exist. Omitted when the KB list is unavailable. */
+  availableKbNames?: Set<string>;
 }) {
   const { t } = useTranslation();
   // Visible path: when no branching has happened the result is identical
@@ -1368,6 +1412,7 @@ export const ChatMessageList = memo(function ChatMessageList({
               editDisabled={isStreaming}
               siblingInfo={sib}
               onSwitchBranch={onSwitchBranch}
+              availableKbNames={availableKbNames}
             />
           );
         }

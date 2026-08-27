@@ -11,7 +11,7 @@ import asyncio
 from collections import OrderedDict
 from collections.abc import Callable
 import contextlib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import inspect
 import json
@@ -24,11 +24,13 @@ import httpx
 from openai import AsyncAzureOpenAI, AsyncOpenAI
 
 from deeptutor.services.config import load_system_settings
+from deeptutor.services.keypool import KeyPool, primary_api_key
 from deeptutor.services.llm import get_token_limit_kwargs, supports_tools
 from deeptutor.services.llm.exceptions import (
     LLMProviderError,
     LLMRateLimitError,
 )
+from deeptutor.services.llm.openai_http_client import sanitize_invalid_ssl_env
 from deeptutor.services.llm.reasoning_params import (
     build_openai_compatible_reasoning_kwargs,
 )
@@ -47,7 +49,7 @@ _NATIVE_TOOL_BLOCKED_BINDINGS: frozenset[str] = frozenset(
 # backend needs an adapter branch, or tool schemas would be attached to a plain
 # AsyncOpenAI client pointed at a non-OpenAI wire format. github_copilot is
 # adapter-routed but deliberately excluded from this set.
-_NATIVE_TOOL_BACKENDS: frozenset[str] = frozenset({"anthropic", "openai_codex"})
+_NATIVE_TOOL_BACKENDS: frozenset[str] = frozenset({"anthropic", "openai_codex", "codebuddy"})
 _AGENTIC_CLIENT_POOL_MAXSIZE = 2
 _agentic_client_pool: "OrderedDict[tuple[Any, ...], Any]" = OrderedDict()
 _agentic_client_pool_lock = threading.RLock()
@@ -59,7 +61,7 @@ class LLMClientConfig:
 
     binding: str
     model: str | None
-    api_key: str | None
+    api_key: str | list[str] | None
     base_url: str | None
     api_version: str | None = None
     extra_headers: dict[str, str] | None = None
@@ -72,7 +74,8 @@ def _client_cache_key(
     loop: asyncio.AbstractEventLoop,
     disable_ssl_verify: bool,
 ) -> tuple[Any, ...]:
-    secret = hashlib.sha256((config.api_key or "").encode("utf-8")).hexdigest()[:16]
+    serialized_key = json.dumps(config.api_key or "", ensure_ascii=False, separators=(",", ":"))
+    secret = hashlib.sha256(serialized_key.encode("utf-8")).hexdigest()[:16]
     headers = json.dumps(config.extra_headers or {}, sort_keys=True, separators=(",", ":"))
     return (
         loop,
@@ -86,7 +89,27 @@ def _client_cache_key(
     )
 
 
-def _build_openai_client(config: LLMClientConfig, *, disable_ssl_verify: bool) -> Any:
+def _build_openai_client(
+    config: LLMClientConfig,
+    *,
+    disable_ssl_verify: bool,
+    sdk_max_retries: int | None = None,
+) -> Any:
+    # A stale SSL_CERT_FILE (common with cloned conda envs) makes httpx's
+    # create_ssl_context raise FileNotFoundError mid-__init__, aborting client
+    # construction. Drop broken CA paths first so TLS uses its default CA config.
+    sanitize_invalid_ssl_env()
+    if isinstance(config.api_key, list):
+        keys = [str(key).strip() for key in config.api_key if str(key or "").strip()]
+        clients = {
+            key: _build_openai_client(
+                replace(config, api_key=key),
+                disable_ssl_verify=disable_ssl_verify,
+                sdk_max_retries=0,
+            )
+            for key in keys
+        }
+        return _KeyRotatingClient(KeyPool(keys), clients)
     default_headers = config.extra_headers or None
     spec = find_by_name(config.binding)
     if spec:
@@ -103,12 +126,14 @@ def _build_openai_client(config: LLMClientConfig, *, disable_ssl_verify: bool) -
     if disable_ssl_verify:
         http_client = httpx.AsyncClient(verify=False)  # nosec B501
     if config.binding == "azure_openai" or (config.binding == "openai" and config.api_version):
+        retry_kwargs = {"max_retries": sdk_max_retries} if sdk_max_retries is not None else {}
         client = AsyncAzureOpenAI(
             api_key=config.api_key or "sk-no-key-required",
             azure_endpoint=config.base_url,
             api_version=config.api_version,
             http_client=http_client,
             default_headers=default_headers,
+            **retry_kwargs,
         )
         return _wrap_token_quota(
             client,
@@ -116,12 +141,14 @@ def _build_openai_client(config: LLMClientConfig, *, disable_ssl_verify: bool) -
             provider=config.binding,
             model=config.model,
         )
+    retry_kwargs = {"max_retries": sdk_max_retries} if sdk_max_retries is not None else {}
     return _wrap_token_quota(
         AsyncOpenAI(
             api_key=config.api_key or "sk-no-key-required",
             base_url=config.base_url or None,
             http_client=http_client,
             default_headers=default_headers,
+            **retry_kwargs,
         ),
         source=config.source,
         provider=config.binding,
@@ -566,6 +593,37 @@ class _TokenQuotaStream:
                 await result
 
 
+class _KeyRotatingCompletions:
+    def __init__(self, key_pool: KeyPool, clients: dict[str, Any]) -> None:
+        self._key_pool = key_pool
+        self._clients = clients
+
+    async def create(self, **kwargs: Any) -> Any:
+        for attempt in range(2):
+            api_key = self._key_pool.next()
+            try:
+                return await self._clients[api_key].chat.completions.create(**kwargs)
+            except Exception as exc:
+                status = getattr(exc, "status_code", None) or getattr(
+                    getattr(exc, "response", None), "status_code", None
+                )
+                if status != 429:
+                    raise
+                self._key_pool.mark_429(api_key)
+                if attempt:
+                    raise
+        raise RuntimeError("LLM key rotation exhausted")
+
+
+class _KeyRotatingClient:
+    def __init__(self, key_pool: KeyPool, clients: dict[str, Any]) -> None:
+        self._clients = clients
+        self.chat = SimpleNamespace(completions=_KeyRotatingCompletions(key_pool, clients))
+
+    async def close(self) -> None:
+        await asyncio.gather(*(_close_client(client) for client in self._clients.values()))
+
+
 async def _close_client(client: Any) -> None:
     close = getattr(client, "aclose", None) or getattr(client, "close", None)
     if not callable(close):
@@ -645,7 +703,7 @@ def _build_anthropic_adapter(config: LLMClientConfig, spec: Any) -> Any:
     from deeptutor.services.llm.provider_core import AnthropicProvider
 
     anthropic_provider = AnthropicProvider(
-        api_key=config.api_key,
+        api_key=primary_api_key(config.api_key),
         api_base=config.base_url or spec.default_api_base or None,
         default_model=config.model or "claude-sonnet-4-20250514",
         extra_headers=config.extra_headers,
@@ -673,14 +731,52 @@ def _build_copilot_adapter(config: LLMClientConfig, spec: Any) -> Any:
     return _ProviderOpenAIAdapter(copilot_provider)
 
 
+def _build_codebuddy_adapter(config: LLMClientConfig, spec: Any) -> Any:
+    from deeptutor.services.llm.provider_core.codebuddy_http_provider import (
+        build_codebuddy_provider,
+    )
+
+    codebuddy_provider = build_codebuddy_provider(
+        api_key=primary_api_key(config.api_key),
+        default_model=config.model or "codebuddy/hy3",
+    )
+    return _ProviderOpenAIAdapter(codebuddy_provider)
+
+
+def _build_direct_openai_adapter(config: LLMClientConfig, spec: Any) -> Any:
+    from deeptutor.services.llm.provider_core import OpenAICompatProvider
+
+    provider = OpenAICompatProvider(
+        api_key=config.api_key,
+        api_base=config.base_url or spec.default_api_base or None,
+        default_model=config.model or "gpt-5",
+        extra_headers=config.extra_headers,
+        spec=spec,
+        provider_name=config.binding,
+    )
+    return _ProviderOpenAIAdapter(provider)
+
+
 _NATIVE_ADAPTER_BUILDERS: dict[str, Callable[[LLMClientConfig, Any], Any]] = {
     "anthropic": _build_anthropic_adapter,
     "openai_codex": _build_codex_adapter,
     "github_copilot": _build_copilot_adapter,
+    "codebuddy": _build_codebuddy_adapter,
 }
 
 
 def _build_native_provider_adapter(config: LLMClientConfig, spec: Any) -> Any | None:
+    endpoint = (config.base_url or spec.default_api_base or "").lower()
+    model = (config.model or "").lower()
+    if (
+        spec.name == "openai"
+        and not config.api_version
+        and "api.openai.com" in endpoint
+        and any(token in model for token in ("gpt-5", "o1", "o3", "o4"))
+    ):
+        # Reuse the services provider: it already converts messages, tools,
+        # streaming events and token limits for the Responses API.
+        return _build_direct_openai_adapter(config, spec)
     builder = _NATIVE_ADAPTER_BUILDERS.get(spec.backend)
     return builder(config, spec) if builder else None
 
@@ -743,7 +839,9 @@ class _ProviderOpenAIAdapter:
                             for index, tool_call in enumerate(response.tool_calls or [])
                         ],
                     ),
-                    finish_reason=response.finish_reason or "stop",
+                    finish_reason=(
+                        "tool_calls" if response.tool_calls else response.finish_reason or "stop"
+                    ),
                 )
             ],
             usage=response.usage or None,
@@ -824,7 +922,9 @@ class _ProviderOpenAIStream:
                 await self._queue.put(_openai_stream_chunk(tool_call=tool_call, index=index))
             await self._queue.put(
                 _openai_stream_chunk(
-                    finish_reason=response.finish_reason or "stop",
+                    finish_reason=(
+                        "tool_calls" if response.tool_calls else response.finish_reason or "stop"
+                    ),
                     usage=response.usage or None,
                 )
             )

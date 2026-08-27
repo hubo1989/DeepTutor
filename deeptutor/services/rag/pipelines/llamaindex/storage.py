@@ -94,7 +94,7 @@ def create_index(
     documents: list[Any],
     storage_dir: Path,
     *,
-    show_progress: bool = True,
+    show_progress: bool | None = None,
     prepare_staging: Callable[[Path], None] | None = None,
 ) -> int:
     staging = create_staging_directory(storage_dir)
@@ -129,7 +129,7 @@ def insert_documents(
         index = vector_store.load_index(staging)
         _validate_persisted_embeddings(index, staging)
         if hasattr(index, "insert_nodes"):
-            count = ingestion.insert_documents_into_index(index, documents, show_progress=True)
+            count = ingestion.insert_documents_into_index(index, documents)
         else:
             # Some tests use a tiny fake index that only implements insert().
             for document in documents:

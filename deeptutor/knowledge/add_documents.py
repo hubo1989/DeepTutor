@@ -8,11 +8,12 @@ import asyncio
 from dataclasses import dataclass
 from datetime import datetime
 import hashlib
+import itertools
 import json
 import logging
 from pathlib import Path
 import shutil
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 from deeptutor.commercial.storage_limits import (
     atomic_write_text_with_storage_limits,
@@ -33,6 +34,9 @@ from deeptutor.services.rag.service import RAGService
 logger = logging.getLogger(__name__)
 
 DEFAULT_BASE_DIR = "./data/knowledge_bases"
+
+if TYPE_CHECKING:
+    from deeptutor.knowledge.manager import KnowledgeBaseManager
 
 
 @dataclass(frozen=True)
@@ -221,12 +225,44 @@ class DocumentAdder:
                 return {}
         return {}
 
-    def add_documents(self, source_files: List[str], allow_duplicates: bool = False) -> List[Path]:
-        """Validate and stage files into raw/ before indexing."""
+    @staticmethod
+    def _non_colliding(dest_path: Path) -> Path:
+        """A free sibling name for a *different* document that wants a taken one.
+
+        Two files can legitimately share a name and hold different content — a
+        docs tree with a README.md per folder is the ordinary case, and batched
+        syncs of sibling folders stage them against different roots, so they
+        land on the same name even with structure preserved. Dropping the later
+        one loses a document the user asked to index, silently.
+        """
+        if not dest_path.exists():
+            return dest_path
+        for index in itertools.count(2):
+            candidate = dest_path.with_name(f"{dest_path.stem} ({index}){dest_path.suffix}")
+            if not candidate.exists():
+                return candidate
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    def add_documents(
+        self,
+        source_files: List[str],
+        allow_duplicates: bool = False,
+        source_root: str | Path | None = None,
+    ) -> List[Path]:
+        """Validate and stage files into raw/ before indexing.
+
+        ``source_root``, when given, is the root a caller is syncing from
+        (e.g. a linked folder). Any source file found under it is staged at
+        the same path *relative to that root*, instead of being flattened to
+        its bare filename: without this, every externally-sourced subfolder
+        collapses into raw/'s top level and same-named files in different
+        subfolders collide.
+        """
         logger.info(f"Validating documents for '{self.kb_name}'...")
 
         ingested_hashes = self.get_ingested_hashes()
         files_to_process: list[Path] = []
+        resolved_source_root = Path(source_root).resolve() if source_root else None
         staging = create_staging_directory(self.raw_dir)
         staged_sizes: list[int] = []
 
@@ -242,15 +278,21 @@ class DocumentAdder:
                     logger.info(f"Skipped (content already indexed): {source_path.name}")
                     continue
 
+                resolved_source = source_path.resolve()
+
                 # Files already saved under raw/ (e.g. by the upload route,
                 # possibly inside a folder) are indexed in place — never
                 # flattened to the basename.
-                if source_path.resolve().is_relative_to(self.raw_dir.resolve()):
+                if resolved_source.is_relative_to(self.raw_dir.resolve()):
                     files_to_process.append(source_path)
                     continue
 
-                dest_path = self.raw_dir / source_path.name
-                staged_path = staging / source_path.name
+                if resolved_source_root and resolved_source.is_relative_to(resolved_source_root):
+                    dest_path = self.raw_dir / resolved_source.relative_to(resolved_source_root)
+                else:
+                    dest_path = self.raw_dir / source_path.name
+
+                staged_path = staging / dest_path.relative_to(self.raw_dir)
                 collision_path = staged_path if staged_path.exists() else dest_path
                 if collision_path.exists():
                     dest_hash = self._get_file_hash(collision_path)
@@ -258,10 +300,12 @@ class DocumentAdder:
                         logger.info(f"Recovering staged file: {source_path.name}")
                         files_to_process.append(dest_path)
                         continue
-                    if not allow_duplicates:
-                        logger.info(f"Skipped (filename collision): {source_path.name}")
-                        continue
+                    # Same name, different document: keep both rather than
+                    # silently dropping this one.
+                    dest_path = self._non_colliding(dest_path)
+                    staged_path = staging / dest_path.relative_to(self.raw_dir)
 
+                staged_path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source_path, staged_path)
                 staged_sizes.append(staged_path.stat().st_size)
                 enforce_staging_scratch_limit(
@@ -272,7 +316,7 @@ class DocumentAdder:
                         if path.is_file()
                     ),
                 )
-                logger.info(f"Staged to raw: {source_path.name}")
+                logger.info(f"Staged to raw: {dest_path.relative_to(self.raw_dir).as_posix()}")
                 files_to_process.append(dest_path)
 
             if staged_sizes:
@@ -306,8 +350,9 @@ class DocumentAdder:
 
                     self.progress_tracker.update(
                         ProgressStage.PROCESSING_FILE,
-                        f"Indexing {doc_file.name}",
-                        current=idx,
+                        message_key="Indexing {{name}}",
+                        message_params={"name": doc_file.name},
+                        current=len(processed_files),
                         total=total_files,
                     )
 
@@ -320,6 +365,14 @@ class DocumentAdder:
                     # requests once per indexed file (#777).
                     await asyncio.to_thread(self._record_successful_hash, doc_file)
                     logger.info(f"Processed: {doc_file.name}")
+                    if self.progress_tracker is not None:
+                        self.progress_tracker.update(
+                            ProgressStage.PROCESSING_FILE,
+                            message_key="Indexed {{name}}",
+                            message_params={"name": doc_file.name},
+                            current=len(processed_files),
+                            total=total_files,
+                        )
                 else:
                     error = "Provider returned failure without details."
                     failures.append(DocumentIndexFailure(doc_file, error))
@@ -370,6 +423,72 @@ class DocumentAdder:
         _write_metadata(self.metadata_file, metadata)
 
 
+async def _bootstrap_index_from_files(
+    kb_name: str,
+    source_files: list[str],
+    base_dir: str,
+    manager: "KnowledgeBaseManager",
+) -> int:
+    """Create a fresh index for an empty KB from the given source files.
+
+    Called when :class:`DocumentAdder` rejects an add because the KB has no
+    existing index (it was created empty, e.g. via the no-files fast path or
+    a web/GitHub source sync before any documents were indexed). Uses
+    :meth:`RAGService.initialize` to build the index in one batch, then
+    records file hashes so subsequent incremental adds can detect duplicates.
+    """
+    rag_service = RAGService(kb_base_dir=base_dir)
+    kb_dir = Path(base_dir) / kb_name
+    raw_dir = kb_dir / "raw"
+    metadata_file = kb_dir / "metadata.json"
+
+    success = await rag_service.initialize(kb_name=kb_name, file_paths=source_files)
+    if not success:
+        raise RuntimeError(
+            f"Failed to initialize index for KB '{kb_name}' from {len(source_files)} file(s)"
+        )
+
+    # Record hashes so future syncs detect unchanged files.
+    metadata = _read_metadata(metadata_file)
+    hashes = metadata.setdefault("file_hashes", {})
+    for fpath_str in source_files:
+        fpath = Path(fpath_str)
+        sha = hashlib.sha256()
+        with open(fpath, "rb") as fh:
+            for block in iter(lambda: fh.read(65536), b""):
+                sha.update(block)
+        hashes[_raw_hash_key(fpath, raw_dir)] = sha.hexdigest()
+    metadata["rag_provider"] = rag_service._resolve_provider(kb_name)
+    metadata["needs_reindex"] = False
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    metadata["last_updated"] = ts
+    metadata["last_indexed_at"] = ts
+    metadata["last_indexed_count"] = len(source_files)
+    metadata["last_indexed_action"] = "create"
+    _write_metadata(metadata_file, metadata)
+
+    indexed = len(source_files)
+    manager.update_kb_status(
+        name=kb_name,
+        status="ready",
+        progress={
+            "stage": "completed",
+            "message": f"Initialized index with {indexed} file(s).",
+            "percent": 100,
+            "current": indexed,
+            "total": max(indexed, 1),
+            "file_name": "",
+            "error": None,
+            "timestamp": datetime.now().isoformat(),
+            "indexed_count": indexed,
+            "index_changed": True,
+            "index_action": "create",
+        },
+    )
+    logger.info("Bootstrapped index for empty KB '%s' with %d file(s)", kb_name, indexed)
+    return indexed
+
+
 async def add_documents(
     kb_name: str,
     source_files: list[str],
@@ -398,12 +517,25 @@ async def add_documents(
             },
         )
 
-        adder = DocumentAdder(
-            kb_name=kb_name,
-            base_dir=base_dir,
-            api_key=api_key,
-            base_url=base_url,
-        )
+        try:
+            adder = DocumentAdder(
+                kb_name=kb_name,
+                base_dir=base_dir,
+                api_key=api_key,
+                base_url=base_url,
+            )
+        except ValueError as exc:
+            if "not initialized" not in str(exc).lower() or not source_files:
+                raise
+            # Empty KB (created without initial documents): bootstrap the
+            # index from these files instead of erroring.
+            return await _bootstrap_index_from_files(
+                kb_name=kb_name,
+                source_files=source_files,
+                base_dir=base_dir,
+                manager=manager,
+            )
+
         new_files = adder.add_documents(source_files, allow_duplicates=allow_duplicates)
         if not new_files:
             manager.update_kb_status(

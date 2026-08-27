@@ -65,6 +65,11 @@ services:
       - DEEPTUTOR_SMTP_USE_TLS=${DEEPTUTOR_SMTP_USE_TLS:-true}
       - DEEPTUTOR_SMTP_USE_SSL=${DEEPTUTOR_SMTP_USE_SSL:-false}
       - DEEPTUTOR_SMTP_TIMEOUT_SECONDS=${DEEPTUTOR_SMTP_TIMEOUT_SECONDS:-10}
+      # Optional dependencies, re-applied on every start (#762). Uncomment to
+      # install extras into the image at boot; preview with
+      # `python scripts/install_extras.py --dry-run "<name>"`.
+      # - DEEPTUTOR_EXTRAS=math-animator,partners
+      # - DEEPTUTOR_APT_PACKAGES=ffmpeg
 
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:${DEEPTUTOR_DOCKER_BACKEND_PORT:-8001}/"]

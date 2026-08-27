@@ -19,11 +19,11 @@ from __future__ import annotations
 
 import logging
 import mimetypes
-from urllib.parse import quote
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 
+from deeptutor.api.utils.http_headers import content_disposition
 from deeptutor.services.storage import (
     LocalDiskAttachmentStore,
     get_attachment_store,
@@ -45,19 +45,7 @@ _ACTIVE_CONTENT_SUFFIXES = {
 _RESTRICTIVE_CSP = "sandbox; default-src 'none'"
 
 
-def _content_disposition(filename: str, *, disposition: str = "inline") -> str:
-    """Build a Content-Disposition header that survives non-ASCII filenames.
-
-    HTTP/1.1 headers are latin-1, so dropping a Chinese / accented filename
-    straight into ``filename="..."`` blows up with UnicodeEncodeError. RFC
-    6266 / RFC 5987 cover this: emit ``filename*=UTF-8''<percent-encoded>``
-    plus an ASCII fallback on ``filename=`` for legacy clients.
-    """
-    ascii_fallback = filename.encode("ascii", errors="replace").decode("ascii")
-    # Quotes / backslashes break the simple-quoted-string form; collapse them.
-    ascii_fallback = ascii_fallback.replace('"', "_").replace("\\", "_")
-    encoded = quote(filename, safe="")
-    return f"{disposition}; filename=\"{ascii_fallback}\"; filename*=UTF-8''{encoded}"
+_content_disposition = content_disposition
 
 
 @router.get("/{session_id}/{attachment_id}/{filename:path}")
