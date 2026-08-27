@@ -292,8 +292,8 @@ deeptutor start --dev
 
 One container for the full Web app. Images on GitHub Container Registry:
 
-- `ghcr.io/hubo1989/deeptutor:latest` — stable release
-- `ghcr.io/hubo1989/deeptutor:pre` — pre-release, when available
+- `ghcr.io/hubo1989/learnleader:latest` — stable release
+- `ghcr.io/hubo1989/learnleader:pre` — pre-release, when available
 
 > See [CONTAINERIZATION.md](./CONTAINERIZATION.md) for podman/rootless/read-only-rootfs deployments and the full per-installation guide.
 
@@ -301,7 +301,7 @@ One container for the full Web app. Images on GitHub Container Registry:
 docker run --rm --name deeptutor \
   -p 127.0.0.1:3782:3782 \
   -v deeptutor-data:/app/data \
-  ghcr.io/hubo1989/deeptutor:latest
+  ghcr.io/hubo1989/learnleader:latest
 ```
 
 > **Only `3782` needs to be published.** The browser talks exclusively to the frontend origin; the Next.js middleware (`web/proxy.ts`) forwards `/api/*` and `/ws/*` to the FastAPI backend **inside the container**. Publishing `8001` (`-p 127.0.0.1:8001:8001`) is optional — handy only for hitting the API directly with curl or scripts.
@@ -347,7 +347,7 @@ docker run --rm --name deeptutor \
   -p 127.0.0.1:3782:3782 -p 127.0.0.1:8001:8001 \
   --add-host=host.docker.internal:host-gateway \
   -v deeptutor-data:/app/data \
-  ghcr.io/hubo1989/deeptutor:latest
+  ghcr.io/hubo1989/learnleader:latest
 ```
 
 Then in **Settings → Models**, point the provider Base URL at `host.docker.internal`:
