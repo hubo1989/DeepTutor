@@ -436,6 +436,23 @@ def test_context_messages_carry_ask_user_events(store: SQLiteSessionStore) -> No
     assert [e["type"] for e in messages[1]["events"]] == ["tool_result", "progress"]
 
 
+def test_context_messages_carry_private_metadata(store: SQLiteSessionStore) -> None:
+    session = asyncio.run(store.create_session())
+    state = {"reasoning_content": "private reasoning"}
+    asyncio.run(
+        store.add_message(
+            session["id"],
+            "assistant",
+            "A direct answer",
+            metadata={"provider_response_state": state},
+        )
+    )
+
+    messages = asyncio.run(store.get_messages_for_context(session["id"]))
+
+    assert messages[0]["metadata"]["provider_response_state"] == state
+
+
 def test_branch_context_messages_carry_ask_user_events(store: SQLiteSessionStore) -> None:
     session = asyncio.run(store.create_session())
     _add_ask_user_turn(store, session["id"])
@@ -444,3 +461,21 @@ def test_branch_context_messages_carry_ask_user_events(store: SQLiteSessionStore
     messages = asyncio.run(store.get_messages_for_context(session["id"], leaf_message_id=leaf))
 
     assert [e["type"] for e in messages[1]["events"]] == ["tool_result", "progress"]
+
+
+def test_branch_context_messages_carry_private_metadata(store: SQLiteSessionStore) -> None:
+    session = asyncio.run(store.create_session())
+    asyncio.run(store.add_message(session["id"], "user", "Question"))
+    state = {"reasoning_content": "branch reasoning"}
+    leaf = asyncio.run(
+        store.add_message(
+            session["id"],
+            "assistant",
+            "A branched answer",
+            metadata={"provider_response_state": state},
+        )
+    )
+
+    messages = asyncio.run(store.get_messages_for_context(session["id"], leaf_message_id=leaf))
+
+    assert messages[-1]["metadata"]["provider_response_state"] == state

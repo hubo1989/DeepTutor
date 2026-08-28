@@ -97,6 +97,17 @@ async def list_sessions(
 MAX_EVENT_PAYLOAD = 1024 * 1024
 _TRUNCATION_NOTICE = "\n\n[... content truncated]"
 _TRUNCATABLE_EVENT_TYPES = ("tool_result", "observation")
+_PRIVATE_MESSAGE_METADATA_KEYS = frozenset({"provider_response_state"})
+
+
+def _redact_private_message_metadata(messages: list[dict[str, Any]]) -> None:
+    """Remove provider-only state before session details cross the API."""
+    for message in messages:
+        metadata = message.get("metadata")
+        if not isinstance(metadata, dict):
+            continue
+        for key in _PRIVATE_MESSAGE_METADATA_KEYS:
+            metadata.pop(key, None)
 
 
 def _truncate_oversized_events(
@@ -138,6 +149,7 @@ async def get_session(session_id: str):
     session = await store.get_session_with_messages(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
+    _redact_private_message_metadata(session.get("messages", []))
     _truncate_oversized_events(session.get("messages", []))
     return session
 

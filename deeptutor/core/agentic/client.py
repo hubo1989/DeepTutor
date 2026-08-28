@@ -948,12 +948,16 @@ class _ProviderOpenAIStream:
                 await self._queue.put(_openai_stream_chunk(content=response.content))
             for index, tool_call in enumerate(response.tool_calls or []):
                 await self._queue.put(_openai_stream_chunk(tool_call=tool_call, index=index))
+            provider_fields = dict(response.provider_specific_fields or {})
+            if response.reasoning_content:
+                provider_fields["reasoning_content"] = response.reasoning_content
             await self._queue.put(
                 _openai_stream_chunk(
                     finish_reason=(
                         "tool_calls" if response.tool_calls else response.finish_reason or "stop"
                     ),
                     usage=response.usage or None,
+                    provider_specific_fields=provider_fields,
                 )
             )
         except Exception as exc:
@@ -986,6 +990,7 @@ def _openai_stream_chunk(
     index: int = 0,
     finish_reason: str | None = None,
     usage: dict[str, int] | None = None,
+    provider_specific_fields: dict[str, Any] | None = None,
 ) -> Any:
     tool_calls = None
     if tool_call is not None:
@@ -995,6 +1000,7 @@ def _openai_stream_chunk(
             SimpleNamespace(
                 delta=SimpleNamespace(content=content, tool_calls=tool_calls),
                 finish_reason=finish_reason,
+                provider_specific_fields=provider_specific_fields,
             )
         ],
         usage=usage,

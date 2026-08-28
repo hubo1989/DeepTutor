@@ -5,6 +5,7 @@ Build bounded conversation history for unified chat sessions.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from typing import Any, Awaitable, Callable
 
 from deeptutor.agents.base_agent import BaseAgent
@@ -49,7 +50,7 @@ def trim_incomplete_tail(text: str) -> str:
     return text.rstrip()
 
 
-def expand_message_context(message: dict[str, Any]) -> list[dict[str, str]]:
+def expand_message_context(message: dict[str, Any]) -> list[dict[str, Any]]:
     """Expand one stored row into its true assistant/user chronology."""
     role = str(message.get("role", "user"))
     content = str(message.get("content", "") or "")
@@ -101,6 +102,18 @@ def build_history_text(history: list[dict[str, Any]]) -> str:
         else:
             lines.append(f"User: {content}")
     return "\n\n".join(lines)
+
+
+def _provider_response_state_tokens(message: dict[str, Any]) -> int:
+    metadata = message.get("metadata")
+    state = metadata.get("provider_response_state") if isinstance(metadata, dict) else None
+    if not isinstance(state, dict):
+        return 0
+    try:
+        serialized = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        serialized = str(state)
+    return count_tokens(serialized)
 
 
 @dataclass
@@ -168,9 +181,22 @@ class ContextBuilder:
         if cleaned_summary:
             history.append({"role": "system", "content": cleaned_summary})
         for item in messages:
+            expanded_start = len(history)
             for expanded in expand_message_context(item):
                 if expanded["role"] in {"user", "assistant"}:
                     history.append(expanded)
+            if item.get("role") != "assistant":
+                continue
+            metadata = item.get("metadata")
+            provider_state = (
+                metadata.get("provider_response_state") if isinstance(metadata, dict) else None
+            )
+            if not isinstance(provider_state, dict):
+                continue
+            for expanded in reversed(history[expanded_start:]):
+                if expanded.get("role") == "assistant" and expanded.get("content"):
+                    expanded["_provider_response_state"] = provider_state
+                    break
         return history
 
     async def _append_event(
@@ -192,7 +218,9 @@ class ContextBuilder:
         total = 0
         for item in reversed(messages):
             content = str(item.get("content", "") or "")
-            tokens = count_tokens(content)
+            clarification = extract_ask_user_clarifications(item)
+            tokens = count_tokens(f"{content}\n{clarification}" if clarification else content)
+            tokens += _provider_response_state_tokens(item)
             if selected and total + tokens > recent_budget:
                 break
             selected.insert(0, item)

@@ -443,6 +443,7 @@ class PocketBaseSessionStore:
                 "role": m["role"],
                 "content": m["content"] or "",
                 "events": filter_ask_user_events(m.get("events")),
+                "metadata": m.get("metadata") or {},
             }
             for m in messages
             if m["role"] in ("user", "assistant", "system")

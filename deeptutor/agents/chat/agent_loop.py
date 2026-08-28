@@ -161,6 +161,8 @@ class AgentLoopState:
 class LLMCallResult:
     text: str
     visible_text: str = ""
+    response_output_items: list[dict[str, Any]] = field(default_factory=list)
+    reasoning_content: str = ""
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     finish_reason: str = ""
     # Reasoning-model output routed to the ``reasoning_content`` channel
@@ -182,6 +184,27 @@ class LoopOutcome:
 
     final_text: str = ""
     completed: bool = False
+    provider_response_state: dict[str, Any] | None = None
+
+
+def _provider_response_state(
+    response_output_items: list[dict[str, Any]],
+    reasoning_content: str,
+) -> dict[str, Any] | None:
+    state: dict[str, Any] = {}
+    if response_output_items:
+        state["responses_output_items"] = response_output_items
+    if reasoning_content:
+        state["reasoning_content"] = reasoning_content
+    return state or None
+
+
+def _assistant_round_message(result: LLMCallResult) -> dict[str, Any]:
+    message: dict[str, Any] = {"role": "assistant", "content": result.text}
+    state = _provider_response_state(result.response_output_items, result.reasoning_content)
+    if state is not None:
+        message["_provider_response_state"] = state
+    return message
 
 
 class AgentLoop:
@@ -240,6 +263,8 @@ class AgentLoop:
                 state=state,
                 checkpoint_boundary=len(messages),
             )
+        if outcome.provider_response_state is not None:
+            self.context.metadata["_provider_response_state"] = outcome.provider_response_state
 
         if state.sources:
             await self.stream.sources(
@@ -365,7 +390,7 @@ class AgentLoop:
                     if result.visible_text:
                         continued_answer_parts.append(result.visible_text)
                     if result.text:
-                        messages.append({"role": "assistant", "content": result.text})
+                        messages.append(_assistant_round_message(result))
                     self._append_loop_instruction(
                         messages,
                         self.pipeline._t(
@@ -404,7 +429,7 @@ class AgentLoop:
                         metadata={"trace_kind": "warning"},
                     )
                     if result.text:
-                        messages.append({"role": "assistant", "content": result.text})
+                        messages.append(_assistant_round_message(result))
                     self._append_loop_instruction(
                         messages,
                         self._empty_finish_nudge(reasoning_only),
@@ -415,9 +440,20 @@ class AgentLoop:
                     final_text,
                     visible_text=result.visible_text,
                     continued_answer_parts=continued_answer_parts,
+                    provider_response_state=_provider_response_state(
+                        result.response_output_items,
+                        result.reasoning_content,
+                    ),
                 )
 
-            messages.append(assistant_message_with_tool_calls(result.text, result.tool_calls))
+            assistant = assistant_message_with_tool_calls(result.text, result.tool_calls)
+            provider_state = _provider_response_state(
+                result.response_output_items,
+                result.reasoning_content,
+            )
+            if provider_state is not None:
+                assistant["_provider_response_state"] = provider_state
+            messages.append(assistant)
             dispatch = await self.pipeline._dispatch_tool_calls(
                 tool_calls=result.tool_calls,
                 context=self.context,
@@ -572,7 +608,7 @@ class AgentLoop:
         # degrading to the generic "could not produce a useful response".
         if not self._clean(result.text) and self._is_reasoning_only(result):
             if result.text:
-                messages.append({"role": "assistant", "content": result.text})
+                messages.append(_assistant_round_message(result))
             messages.append({"role": "user", "content": self._empty_finish_nudge(True)})
             try:
                 result = await self._call_llm(
@@ -593,6 +629,10 @@ class AgentLoop:
             result.text,
             visible_text=result.visible_text,
             continued_answer_parts=continued_answer_parts,
+            provider_response_state=_provider_response_state(
+                result.response_output_items,
+                result.reasoning_content,
+            ),
         )
 
     @staticmethod
@@ -640,6 +680,7 @@ class AgentLoop:
         *,
         visible_text: str | None = None,
         continued_answer_parts: list[str] | None = None,
+        provider_response_state: dict[str, Any] | None = None,
     ) -> LoopOutcome:
         cleaned_text = self._clean(raw_text)
         if continued_answer_parts:
@@ -660,7 +701,11 @@ class AgentLoop:
                 ),
             )
             await self.pipeline._emit_protocol_fallback_final_response(self.stream, final_text)
-        return LoopOutcome(final_text=final_text, completed=True)
+        return LoopOutcome(
+            final_text=final_text,
+            completed=True,
+            provider_response_state=provider_response_state,
+        )
 
     # ---- LLM call ----------------------------------------------------------
 
@@ -737,6 +782,7 @@ class AgentLoop:
             usage_seen: Any = None
             text_parts: list[str] = []
             reasoning_parts: list[str] = []
+            response_output_items: list[dict[str, Any]] = []
             tool_acc = ToolCallAccumulator()
             output_chars = 0
             finish_reason = ""
@@ -777,6 +823,16 @@ class AgentLoop:
                     choice = choices[0]
                     if getattr(choice, "finish_reason", None):
                         finish_reason = str(choice.finish_reason)
+                    provider_fields = getattr(choice, "provider_specific_fields", None)
+                    if isinstance(provider_fields, dict):
+                        native_items = provider_fields.get("native_output_items")
+                        if isinstance(native_items, list) and any(
+                            isinstance(item, dict) and item.get("type") == "reasoning"
+                            for item in native_items
+                        ):
+                            response_output_items = [
+                                dict(item) for item in native_items if isinstance(item, dict)
+                            ]
                     delta = getattr(choice, "delta", None)
                     if delta is None:
                         continue
@@ -787,8 +843,8 @@ class AgentLoop:
                         None,
                     )
                     if reasoning_text:
-                        output_chars += len(reasoning_text)
                         reasoning_parts.append(reasoning_text)
+                        output_chars += len(reasoning_text)
                         output_emitted = True
                         await self.stream.thinking(
                             reasoning_text, source="chat", stage=stage, metadata=chunk_meta
@@ -933,6 +989,8 @@ class AgentLoop:
         return LLMCallResult(
             text=text,
             visible_text="".join(visible_text_parts),
+            response_output_items=response_output_items,
+            reasoning_content="".join(reasoning_parts),
             tool_calls=tool_calls,
             finish_reason=finish_reason,
             reasoning_text="".join(reasoning_parts),

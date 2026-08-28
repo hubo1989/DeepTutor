@@ -39,8 +39,11 @@ def _llm_chunk(
     usage: Any = None,
     finish_reason: str | None = None,
     reasoning_content: str | None = None,
+    provider_specific_fields: dict[str, Any] | None = None,
 ) -> SimpleNamespace:
     delta_fields: dict[str, Any] = {"content": content}
+    if reasoning_content is not None:
+        delta_fields["reasoning_content"] = reasoning_content
     if tool_calls is not None:
         delta_fields["tool_calls"] = [
             SimpleNamespace(
@@ -65,6 +68,7 @@ def _llm_chunk(
             SimpleNamespace(
                 delta=SimpleNamespace(**delta_fields),
                 finish_reason=finish_reason,
+                provider_specific_fields=provider_specific_fields,
             )
         ],
         usage=usage,
@@ -494,6 +498,37 @@ async def test_finish_first_round_no_tools(monkeypatch: pytest.MonkeyPatch) -> N
 
 
 @pytest.mark.asyncio
+async def test_finish_round_persists_provider_response_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _Registry()
+    native_items = [{"type": "reasoning", "id": "rs_1", "summary": []}]
+    client = _ScriptedChatClient(
+        [
+            [
+                _llm_chunk(
+                    content="A direct answer.",
+                    reasoning_content="private reasoning",
+                    provider_specific_fields={"native_output_items": native_items},
+                )
+            ]
+        ]
+    )
+    pipeline = AgenticChatPipeline(language="en")
+    pipeline.registry = registry
+    monkeypatch.setattr(pipeline, "_compose_enabled_tools", lambda _context: [])
+    monkeypatch.setattr(pipeline, "_build_openai_client", lambda: client)
+    context = UnifiedContext(session_id="s1", user_message="Hello")
+
+    await _run(pipeline, context)
+
+    assert context.metadata["_provider_response_state"] == {
+        "responses_output_items": native_items,
+        "reasoning_content": "private reasoning",
+    }
+
+
+@pytest.mark.asyncio
 async def test_tool_round_then_finish(monkeypatch: pytest.MonkeyPatch) -> None:
     """A tool round (narration text + a tool call) is followed by a tool-less
     finish round whose text is the answer — two LLM calls, no respond pass."""
@@ -502,7 +537,7 @@ async def test_tool_round_then_finish(monkeypatch: pytest.MonkeyPatch) -> None:
         [
             # Round 1: preamble (narration) text + a tool call.
             [
-                _llm_chunk(content="Searching."),
+                _llm_chunk(content="Searching.", reasoning_content="round one private reasoning"),
                 _llm_chunk(
                     tool_calls=[
                         {
@@ -515,7 +550,7 @@ async def test_tool_round_then_finish(monkeypatch: pytest.MonkeyPatch) -> None:
             ],
             # Round 2: the model sees the tool result in-protocol and finishes
             # by replying without tool calls.
-            [_llm_chunk(content="Found what was needed.")],
+            [_llm_chunk(content="Found what was needed.", reasoning_content="final reasoning")],
         ]
     )
     pipeline = AgenticChatPipeline(language="en")
@@ -542,6 +577,9 @@ async def test_tool_round_then_finish(monkeypatch: pytest.MonkeyPatch) -> None:
     assistant_tc = [m for m in second_round if m.get("role") == "assistant" and m.get("tool_calls")]
     assert assistant_tc and assistant_tc[0]["tool_calls"][0]["function"]["name"] == "web_search"
     assert assistant_tc[0]["content"] == "Searching."
+    assert assistant_tc[0]["_provider_response_state"] == {
+        "reasoning_content": "round one private reasoning"
+    }
     tool_msgs = [m for m in second_round if m.get("role") == "tool"]
     assert tool_msgs and "tool answer" in tool_msgs[0]["content"]
     result = _result(events)

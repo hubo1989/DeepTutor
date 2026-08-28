@@ -52,6 +52,9 @@ class LLMResponse:
     usage: dict[str, int] = field(default_factory=dict)
     reasoning_content: str | None = None
     thinking_blocks: list[dict[str, Any]] | None = None
+    # Provider-private payload (e.g. native Responses-API output items) that
+    # callers may replay on a later turn. Empty unless a provider sets it.
+    provider_specific_fields: dict[str, Any] = field(default_factory=dict)
 
     @property
     def has_tool_calls(self) -> bool:

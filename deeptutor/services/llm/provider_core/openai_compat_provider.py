@@ -50,9 +50,13 @@ _ALLOWED_MSG_KEYS = frozenset(
         "name",
         "reasoning_content",
         "extra_content",
+        "_provider_response_state",
+        "_responses_output_items",
     }
 )
 _ALNUM = string.ascii_letters + string.digits
+
+_INTERNAL_RESPONSE_STATE_KEYS = frozenset({"_provider_response_state", "_responses_output_items"})
 
 _DEFAULT_OPENROUTER_HEADERS = {
     "HTTP-Referer": "https://github.com/HKUDS/DeepTutor",
@@ -86,6 +90,16 @@ def _coerce_dict(value: Any) -> dict[str, Any] | None:
         if isinstance(dumped, dict) and dumped:
             return dumped
     return None
+
+
+def _provider_state_output_items(message: dict[str, Any]) -> list[dict[str, Any]]:
+    state = message.get("_provider_response_state")
+    items = state.get("responses_output_items") if isinstance(state, dict) else None
+    if not isinstance(items, list):
+        items = message.get("_responses_output_items")
+    if not isinstance(items, list):
+        return []
+    return [dict(item) for item in items if isinstance(item, dict)]
 
 
 def _uses_openrouter(spec: "ProviderSpec | None", api_base: str | None) -> bool:
@@ -269,8 +283,42 @@ class OpenAICompatProvider(LLMProvider):
             return tool_call_id
         return hashlib.sha256(tool_call_id.encode()).hexdigest()[:9]
 
-    def _sanitize_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        sanitized = LLMProvider._sanitize_request_messages(messages, _ALLOWED_MSG_KEYS)
+    def _sanitize_messages(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        responses_api: bool = False,
+        model: str | None = None,
+    ) -> list[dict[str, Any]]:
+        prepared: list[dict[str, Any]] = []
+        for message in messages:
+            if not isinstance(message, dict):
+                prepared.append(message)
+                continue
+            clean = {
+                key: value
+                for key, value in message.items()
+                if key not in _INTERNAL_RESPONSE_STATE_KEYS
+            }
+            if responses_api:
+                output_items = _provider_state_output_items(message)
+                if output_items:
+                    clean["_provider_response_state"] = {"responses_output_items": output_items}
+            else:
+                state = message.get("_provider_response_state")
+                reasoning_content = (
+                    state.get("reasoning_content") if isinstance(state, dict) else None
+                )
+                if (
+                    isinstance(reasoning_content, str)
+                    and reasoning_content
+                    and model
+                    and "deepseek" in model.lower()
+                ):
+                    clean["reasoning_content"] = reasoning_content
+            prepared.append(clean)
+
+        sanitized = LLMProvider._sanitize_request_messages(prepared, _ALLOWED_MSG_KEYS)
         id_map: dict[str, str] = {}
 
         def map_id(value: Any) -> Any:
@@ -329,7 +377,9 @@ class OpenAICompatProvider(LLMProvider):
 
         kwargs: dict[str, Any] = {
             "model": model_name,
-            "messages": self._sanitize_messages(self._sanitize_empty_content(messages)),
+            "messages": self._sanitize_messages(
+                self._sanitize_empty_content(messages), model=model_name
+            ),
         }
 
         if self._supports_temperature(model_name, reasoning_effort):
@@ -553,7 +603,9 @@ class OpenAICompatProvider(LLMProvider):
             model_name = model_name.split("/")[-1]
 
         instructions, input_items = convert_messages(
-            self._sanitize_messages(self._sanitize_empty_content(messages))
+            self._sanitize_messages(
+                self._sanitize_empty_content(messages), responses_api=True, model=model_name
+            )
         )
         body: dict[str, Any] = {
             "model": model_name,
