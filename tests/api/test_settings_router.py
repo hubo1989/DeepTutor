@@ -1230,10 +1230,20 @@ def test_codex_provider_choice_is_advertised_as_oauth() -> None:
         "label": "OpenAI Codex",
         "base_url": "https://chatgpt.com/backend-api",
         "auth_mode": "oauth",
+        "supports_wire_api_selection": False,
     }
     # API-key providers keep the same shape, so the frontend never special-cases
     # a missing field.
     assert llm["openai"]["auth_mode"] == "api_key"
+
+
+def test_provider_choices_advertise_wire_api_support_from_backend_metadata() -> None:
+    llm = {item["value"]: item for item in settings_router._provider_choices()["llm"]}
+
+    assert llm["custom"]["supports_wire_api_selection"] is True
+    assert llm["openai"]["supports_wire_api_selection"] is True
+    assert llm["azure_openai"]["supports_wire_api_selection"] is False
+    assert llm["custom_anthropic"]["supports_wire_api_selection"] is False
 
 
 @pytest.mark.asyncio

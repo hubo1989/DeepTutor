@@ -110,6 +110,7 @@ class ContextExplorer:
             extra_headers=self.extra_headers or None,
             reasoning_effort=self.reasoning_effort,
             source=getattr(cfg, "source", "platform"),
+            wire_api=getattr(cfg, "wire_api", None) or "auto",
         )
 
     async def investigate(

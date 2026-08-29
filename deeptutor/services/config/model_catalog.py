@@ -11,6 +11,7 @@ from typing import Any
 from uuid import uuid4
 
 from deeptutor.services.path_service import get_path_service
+from deeptutor.services.provider_registry import wire_api_for_provider
 
 from .embedding_endpoint import normalize_embedding_endpoint_for_display
 
@@ -238,6 +239,15 @@ class ModelCatalogService:
                 else:
                     profile.setdefault("binding", "openai")
                     profile.setdefault("extra_headers", {})
+                    if service_name == "llm":
+                        before_wire_api = profile.get("wire_api")
+                        after_wire_api = wire_api_for_provider(
+                            before_wire_api,
+                            profile.get("binding"),
+                        )
+                        profile["wire_api"] = after_wire_api
+                        if before_wire_api != after_wire_api:
+                            changed = True
                     if service_name == "embedding":
                         models = profile.setdefault("models", [])
                         active_model_id = service.get("active_model_id")

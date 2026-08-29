@@ -36,7 +36,7 @@ from deeptutor.services.llm.reasoning_params import (
     build_openai_compatible_reasoning_kwargs,
 )
 from deeptutor.services.llm.usage_frame import token_counts
-from deeptutor.services.provider_registry import model_overrides_for
+from deeptutor.services.provider_registry import model_overrides_for, normalize_wire_api
 
 if TYPE_CHECKING:
     from deeptutor.services.provider_registry import ProviderSpec
@@ -126,6 +126,7 @@ class OpenAICompatProvider(LLMProvider):
         extra_headers: dict[str, str] | None = None,
         spec: Any = None,
         provider_name: str | None = None,
+        wire_api: str = "auto",
     ):
         keys = api_key if isinstance(api_key, list) else [api_key]
         keys = [str(key).strip() for key in keys if str(key or "").strip()]
@@ -136,6 +137,7 @@ class OpenAICompatProvider(LLMProvider):
         self.extra_headers = extra_headers or {}
         self._spec = spec
         self._provider_name = provider_name
+        self._wire_api = normalize_wire_api(wire_api)
 
         if primary_key and spec and spec.env_key:
             self._setup_env(primary_key, api_base)
@@ -366,6 +368,11 @@ class OpenAICompatProvider(LLMProvider):
         model: str | None,
         reasoning_effort: str | None,
     ) -> bool:
+        if self._wire_api == "responses":
+            return True
+        if self._wire_api == "chat_completions":
+            return False
+
         spec = self._spec
         if spec and spec.name not in {"openai", "github_copilot"}:
             return False
@@ -820,6 +827,8 @@ class OpenAICompatProvider(LLMProvider):
                 except Exception as responses_error:
                     if self._spec and self._spec.name == "github_copilot":
                         raise
+                    if self._wire_api == "responses":
+                        raise
                     if not self._should_fallback_from_responses_error(responses_error):
                         raise
                     self._record_responses_failure(model, reasoning_effort)
@@ -940,6 +949,8 @@ class OpenAICompatProvider(LLMProvider):
                     )
                 except Exception as responses_error:
                     if self._spec and self._spec.name == "github_copilot":
+                        raise
+                    if self._wire_api == "responses":
                         raise
                     if not self._should_fallback_from_responses_error(responses_error):
                         raise

@@ -322,9 +322,9 @@ export function ServiceConfigEditor({ service }: { service: ServiceName }) {
   return (
     <div data-tour={`tour-${service}`} className="space-y-5">
       {activeProfile ? (
-        <div className="grid grid-cols-[200px_minmax(0,1fr)] items-start gap-5">
+        <div className="grid items-start gap-5 sm:grid-cols-[200px_minmax(0,1fr)]">
           {/* ── Profile list (sticky so it stays put while the editor scrolls) ── */}
-          <aside className="sticky top-4 self-start rounded-xl border border-[var(--border)]/60 bg-[var(--card)]/40 p-2">
+          <aside className="self-start rounded-xl border border-[var(--border)]/60 bg-[var(--card)]/40 p-2 sm:sticky sm:top-4">
             <div className="px-2 pb-2 pt-1 text-[11px] font-medium uppercase tracking-wide text-[var(--muted-foreground)]/70">
               {t("Profiles")}
             </div>
@@ -1203,6 +1203,9 @@ function ProfileFields({
     profile,
   );
   const isCodeBuddyAuth = service === "llm" && providerValue === "codebuddy";
+  const supportsWireApiSelection =
+    service === "llm" && providerOption?.supports_wire_api_selection === true;
+  const wireApi = profile.wire_api || "auto";
 
   const fields =
     isCodexOAuth || isCodeBuddyAuth
@@ -1392,6 +1395,44 @@ function ProfileFields({
               )}
             </button>
           </div>
+        </div>
+      )}
+      {supportsWireApiSelection && (
+        <div className="sm:col-span-2">
+          <div className="mb-1.5 text-[12px] text-[var(--muted-foreground)]">
+            {t("API protocol")}
+          </div>
+          <div className="relative">
+            <select
+              className={selectClass}
+              value={wireApi}
+              onChange={(event) =>
+                updateProfileField(service, "wire_api", event.target.value)
+              }
+            >
+              <option className={selectOptionClass} value="auto">
+                {t("Auto (recommended)")}
+              </option>
+              <option className={selectOptionClass} value="responses">
+                {t("Responses API")}
+              </option>
+              <option className={selectOptionClass} value="chat_completions">
+                {t("Chat Completions")}
+              </option>
+            </select>
+            <ChevronDown className="pointer-events-none absolute right-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[var(--muted-foreground)]" />
+          </div>
+          <p className="mt-1.5 text-[11px] leading-relaxed text-[var(--muted-foreground)]">
+            {wireApi === "responses"
+              ? t(
+                  "Require the Responses API. Endpoint errors are returned without falling back.",
+                )
+              : wireApi === "chat_completions"
+                ? t("Require the Chat Completions API.")
+                : t(
+                    "Automatically select the protocol and fall back when supported.",
+                  )}
+          </p>
         </div>
       )}
       {!isCodexOAuth && !isCodeBuddyAuth && (

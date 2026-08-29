@@ -472,6 +472,7 @@ def _provider_choices() -> dict[str, list[dict[str, Any]]]:
                 ),
                 "base_url": s.default_api_base,
                 "auth_mode": s.auth_mode,
+                "supports_wire_api_selection": s.supports_wire_api_selection,
             }
             for s in PROVIDERS
         ],

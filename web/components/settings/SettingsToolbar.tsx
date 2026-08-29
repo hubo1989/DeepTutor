@@ -37,7 +37,7 @@ export function SettingsToolbar() {
   }
 
   return (
-    <div className="flex items-center justify-between gap-3 px-1 py-2">
+    <div className="flex flex-col items-stretch gap-2 px-1 py-2 sm:flex-row sm:items-center sm:justify-between sm:gap-3">
       <p
         className={`min-w-0 truncate text-[12px] ${
           toast
@@ -62,7 +62,7 @@ export function SettingsToolbar() {
           t("All changes saved")
         )}
       </p>
-      <div className="flex items-center gap-2">
+      <div className="flex shrink-0 items-center justify-end gap-2">
         <button
           onClick={startTour}
           className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--border)]/50 px-3 py-1.5 text-[12px] font-medium text-[var(--muted-foreground)] transition-colors hover:border-[var(--border)] hover:text-[var(--foreground)]"

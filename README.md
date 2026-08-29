@@ -465,6 +465,15 @@ Everything under `data/user/settings/` is plain JSON/YAML. The **Settings** page
 
 Project-root `.env` is **not** read as an application config file. For a minimal model setup, open **Settings → Models**, add an LLM profile (Base URL / API key / model name), and save. Add an embedding profile only if you plan to use Knowledge Base / RAG features.
 
+OpenAI-compatible LLM profiles also expose an **API protocol** setting. Keep
+`Auto` for normal provider detection and compatible fallback, choose
+`Responses API` for endpoints that only implement `/responses`, or choose
+`Chat Completions` for endpoints that require `/chat/completions`. Forced
+Responses mode is fail-closed: endpoint errors are returned instead of being
+silently retried through Chat Completions. The equivalent profile field in
+`model_catalog.json` is `wire_api` (`auto`, `responses`, or
+`chat_completions`).
+
 </details>
 
 ## 📖 Explore DeepTutor

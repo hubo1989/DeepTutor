@@ -421,6 +421,7 @@ class ResearchPipeline:
             extra_headers=self.extra_headers or None,
             reasoning_effort=self.reasoning_effort,
             source=getattr(self.llm_config, "source", "platform"),
+            wire_api=getattr(self.llm_config, "wire_api", None) or "auto",
         )
 
         self.registry = get_tool_registry()

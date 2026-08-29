@@ -33,7 +33,7 @@ export default function SettingsMain({
 
   return (
     <div className="flex h-full min-w-0 flex-col overflow-hidden bg-[var(--background)]">
-      <div className="mx-auto w-full max-w-5xl px-10 pt-5">
+      <div className="mx-auto w-full max-w-5xl px-5 pt-5 sm:px-10">
         <SettingsBreadcrumb />
         {showToolbar && (
           <div className="mt-2">
@@ -48,7 +48,7 @@ export default function SettingsMain({
           scrolls. ``min-h-0`` is required for the flex child to constrain to
           remaining space — without it, ``overflow-y-auto`` would never clip. */}
       <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden [scrollbar-gutter:stable]">
-        <div className="mx-auto w-full max-w-5xl px-10 pb-16">
+        <div className="mx-auto w-full max-w-5xl px-5 pb-16 sm:px-10">
           <div className="mt-4">{children}</div>
         </div>
       </div>

@@ -34,7 +34,11 @@ from deeptutor.services.llm.openai_http_client import sanitize_invalid_ssl_env
 from deeptutor.services.llm.reasoning_params import (
     build_openai_compatible_reasoning_kwargs,
 )
-from deeptutor.services.provider_registry import find_by_name
+from deeptutor.services.provider_registry import (
+    find_by_name,
+    model_overrides_for,
+    wire_api_for_provider,
+)
 
 # Providers that don't reliably support OpenAI function-calling. The loop
 # still runs without tool schemas — the model just produces prose.
@@ -67,6 +71,14 @@ class LLMClientConfig:
     extra_headers: dict[str, str] | None = None
     reasoning_effort: str | None = None
     source: Literal["platform", "byok"] = "platform"
+    wire_api: str = "auto"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "wire_api",
+            wire_api_for_provider(self.wire_api, self.binding),
+        )
 
 
 def _client_cache_key(
@@ -85,6 +97,7 @@ def _client_cache_key(
         config.base_url or "",
         config.api_version or "",
         headers,
+        config.wire_api,
         disable_ssl_verify,
     )
 
@@ -112,7 +125,21 @@ def _build_openai_client(
         return _KeyRotatingClient(KeyPool(keys), clients)
     default_headers = config.extra_headers or None
     spec = find_by_name(config.binding)
-    if spec:
+    wire_api = wire_api_for_provider(config.wire_api, spec)
+    if wire_api == "responses":
+        from deeptutor.services.llm.provider_core import OpenAICompatProvider
+
+        responses_provider = OpenAICompatProvider(
+            api_key=config.api_key,
+            api_base=config.base_url or (spec.default_api_base if spec else None),
+            default_model=config.model or "gpt-4o-mini",
+            extra_headers=config.extra_headers,
+            spec=spec,
+            provider_name=config.binding,
+            wire_api="responses",
+        )
+        return _ProviderOpenAIAdapter(responses_provider)
+    if spec and wire_api != "chat_completions":
         native_adapter = _build_native_provider_adapter(config, spec)
         if native_adapter is not None:
             return _wrap_token_quota(
@@ -753,6 +780,7 @@ def _build_direct_openai_adapter(config: LLMClientConfig, spec: Any) -> Any:
         extra_headers=config.extra_headers,
         spec=spec,
         provider_name=config.binding,
+        wire_api=config.wire_api,
     )
     return _ProviderOpenAIAdapter(provider)
 
