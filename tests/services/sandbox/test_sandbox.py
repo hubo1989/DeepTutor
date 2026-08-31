@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import shlex
+import sys
 from pathlib import Path
 
 import pytest
@@ -179,6 +182,45 @@ async def test_restricted_subprocess_timeout() -> None:
     result = await backend.exec(ExecRequest(command="sleep 5", limits=ResourceLimits(timeout_s=1)))
     assert result.timed_out
     assert result.exit_code == 124
+
+
+@pytest.mark.asyncio
+async def test_restricted_subprocess_caps_output_while_draining_streams() -> None:
+    backend = RestrictedSubprocessBackend()
+    result = await backend.exec(
+        ExecRequest(
+            command="python3 -c \"print('x' * 50_000, end='')\"",
+            limits=ResourceLimits(timeout_s=10, max_output_chars=1_000),
+        )
+    )
+
+    assert result.ok
+    assert result.stdout.startswith("x")
+    assert result.stdout.endswith("x")
+    assert "bytes truncated" in result.stdout
+    assert len(result.stdout) < 1_500
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+async def test_restricted_subprocess_timeout_kills_descendants(tmp_path) -> None:
+    pid_file = tmp_path / "background.pid"
+    command = f"sleep 30 & echo $! > {shlex.quote(str(pid_file))}; sleep 30"
+    backend = RestrictedSubprocessBackend()
+
+    result = await backend.exec(ExecRequest(command=command, limits=ResourceLimits(timeout_s=1)))
+
+    assert result.timed_out
+    assert result.exit_code == 124
+    child_pid = int(pid_file.read_text().strip())
+    for _ in range(40):
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            break
+        await asyncio.sleep(0.05)
+    else:
+        pytest.fail("sandbox timeout left a descendant process running")
 
 
 @pytest.mark.asyncio
