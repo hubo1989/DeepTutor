@@ -15,6 +15,7 @@ from deeptutor.services.config import (
     SUPPORTED_SEARCH_PROVIDERS,
     ResolvedSearchConfig,
     load_config_with_main,
+    load_system_settings,
     resolve_search_runtime_config,
     search_fallback_candidates,
     search_missing_credential,
@@ -46,6 +47,17 @@ def _get_web_search_config() -> dict[str, Any]:
     except Exception as exc:
         _logger.debug(f"Could not load config: {exc}")
     return {}
+
+
+def _get_source_filter_settings() -> dict[str, Any]:
+    """Resolve the post-provider reference policy from runtime system JSON."""
+    try:
+        system = load_system_settings()
+    except Exception as exc:
+        _logger.warning("Could not load web-search source policy: %s", exc)
+        system = {}
+    raw = system.get("web_search_source_filtering", {})
+    return settings_from_config({"source_filtering": raw})
 
 
 def _save_results(result: dict[str, Any], output_dir: str, provider: str) -> str:
@@ -86,14 +98,21 @@ def _assert_provider_supported(provider_name: str) -> None:
         )
 
 
-def _disabled_result(query: str, provider: str) -> dict[str, Any]:
+def _disabled_result(
+    query: str,
+    provider: str,
+    *,
+    error_code: str,
+    answer: str,
+) -> dict[str, Any]:
     return {
         "timestamp": datetime.now().isoformat(),
         "query": query,
-        "answer": "Web search is disabled.",
+        "answer": answer,
         "citations": [],
         "search_results": [],
         "provider": provider,
+        "error_code": error_code,
     }
 
 
@@ -127,13 +146,27 @@ def web_search(
     config = _get_web_search_config()
     if not config.get("enabled", True):
         _logger.warning("Web search is disabled in config")
-        return _disabled_result(query, "disabled")
+        return _disabled_result(
+            query,
+            "disabled",
+            error_code="web_search_disabled",
+            answer="Web search is disabled by system configuration.",
+        )
 
     resolved = resolve_search_runtime_config()
     provider_name = (provider or resolved.provider).strip().lower()
     _assert_provider_supported(provider_name)
     if provider_name == "none":
-        return _disabled_result(query, "none")
+        return _disabled_result(
+            query,
+            "none",
+            error_code="search_provider_not_configured",
+            answer=(
+                "Web search is enabled but no search provider is configured. "
+                "Open Settings > Search and choose a provider; DuckDuckGo works "
+                "without an API key."
+            ),
+        )
 
     api_key, base_url = _credentials_for(provider_name, resolved)
     base_url = provider_kwargs.get("base_url") or base_url
@@ -193,7 +226,12 @@ def web_search(
     if response is None:
         raise Exception("web search failed: " + "; ".join(failures))
 
-    response = filter_web_search_response(response, **settings_from_config(config))
+    response = filter_web_search_response(response, **_get_source_filter_settings())
+    if response.metadata.get("source_filter", {}).get("answer_invalidated"):
+        # A provider-authored answer may have relied on a rejected source. Run
+        # the ordinary safe-results consolidator instead of returning prose
+        # whose citations no longer support it.
+        supports_answer = False
 
     # Auto-consolidate for providers that don't generate their own answers.
     if not supports_answer:
@@ -225,6 +263,10 @@ def get_current_config() -> dict[str, Any]:
     """Get effective web search configuration for UI/CLI display."""
     config = _get_web_search_config()
     resolved = resolve_search_runtime_config()
+    source_filtering = dict(_get_source_filter_settings())
+    # Never surface the bearer token to Settings / CLI — only whether Moderation
+    # is wired (key present + use_moderation).
+    source_filtering["moderation_configured"] = bool(source_filtering.pop("moderation_api_key", ""))
     return {
         "enabled": config.get("enabled", True),
         "provider": resolved.provider,
@@ -239,7 +281,7 @@ def get_current_config() -> dict[str, Any]:
         "supported_providers": sorted(SUPPORTED_SEARCH_PROVIDERS),
         "deprecated_providers": sorted(DEPRECATED_SEARCH_PROVIDERS),
         "consolidation_template": config.get("consolidation_template") or None,
-        "source_filtering": settings_from_config(config),
+        "source_filtering": source_filtering,
         "template_providers": list(PROVIDER_TEMPLATES.keys()),
     }
 

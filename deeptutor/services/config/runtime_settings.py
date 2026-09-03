@@ -39,6 +39,21 @@ DEFAULT_SYSTEM_SETTINGS: dict[str, Any] = {
     # mounts the admin workspace, so enabling this requires an explicit,
     # deployment-specific isolation review.
     "sandbox_allow_untrusted_users": False,
+    # Conservative chat -> deep_question routing. Explicit requests only, and
+    # callers can still pass config.auto_route=false for a single turn.
+    "capability_routing_enabled": False,
+    # Reference policy applied after every web-search provider. This belongs in
+    # runtime JSON so packaged installs and the settings service share one
+    # source of truth; project main.yaml is intentionally not an operator
+    # configuration surface.
+    "web_search_source_filtering": {
+        "enabled": True,
+        "blocked_domains": [],
+        "trusted_domains": [],
+        "content_filtering": True,
+        "use_educational_trusted_domains": False,
+        "use_moderation": False,
+    },
     # Chat attachment policy. Size caps gate what the composer accepts and
     # what the turn runtime / partner upload endpoints extract; the char
     # budgets bound how much extracted text is inlined into the LLM context
@@ -1085,6 +1100,8 @@ class RuntimeSettingsService:
         public_api_base = _string(settings.get("next_public_api_base_external")) or _string(
             settings.get("public_api_base")
         )
+        raw_source_filter = settings.get("web_search_source_filtering")
+        source_filter = raw_source_filter if isinstance(raw_source_filter, dict) else {}
         max_file_mb = _coerce_clamped_int(
             settings.get("chat_attachment_max_file_mb"),
             DEFAULT_SYSTEM_SETTINGS["chat_attachment_max_file_mb"],
@@ -1113,6 +1130,19 @@ class RuntimeSettingsService:
             "sandbox_allow_untrusted_users": _coerce_bool(
                 settings.get("sandbox_allow_untrusted_users"), False
             ),
+            "capability_routing_enabled": _coerce_bool(
+                settings.get("capability_routing_enabled"), False
+            ),
+            "web_search_source_filtering": {
+                "enabled": _coerce_bool(source_filter.get("enabled"), True),
+                "blocked_domains": _string_or_list(source_filter.get("blocked_domains")),
+                "trusted_domains": _string_or_list(source_filter.get("trusted_domains")),
+                "content_filtering": _coerce_bool(source_filter.get("content_filtering"), True),
+                "use_educational_trusted_domains": _coerce_bool(
+                    source_filter.get("use_educational_trusted_domains"), False
+                ),
+                "use_moderation": _coerce_bool(source_filter.get("use_moderation"), False),
+            },
             "chat_attachment_max_file_mb": max_file_mb,
             "chat_attachment_max_total_mb": max_total_mb,
             "chat_attachment_max_chars_per_doc": _coerce_clamped_int(
