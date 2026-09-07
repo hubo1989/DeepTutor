@@ -56,6 +56,7 @@ from deeptutor.core.agentic import (
     run_labeled_step,
 )
 from deeptutor.core.agentic.labels import find_inline_labels
+from deeptutor.core.agentic.messages import assistant_message
 from deeptutor.core.agentic.tool_dispatch import MAX_PARALLEL_TOOL_CALLS
 from deeptutor.core.agentic.usage import record_streamed_usage
 from deeptutor.core.context import Attachment, UnifiedContext
@@ -1474,7 +1475,13 @@ class QuestionPipeline:
                 step.text, allowed_labels=_PROTOCOL_EXPLORE.allowed
             ):
                 return step.text, True, calls
-            messages.append({"role": "assistant", "content": step.text[:500]})
+            messages.append(
+                assistant_message(
+                    step.text[:500],
+                    reasoning_content=step.reasoning_content or None,
+                    thinking_blocks=list(step.thinking_blocks) or None,
+                )
+            )
             messages.append({"role": "user", "content": self._t("protocol.force_finish_repair")})
         return self._t("protocol.fallback_final"), False, calls
 
