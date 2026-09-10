@@ -2324,6 +2324,7 @@
   "Delete this turn?": "删除此轮对话？",
   "Skills Auto": "Skills Auto",
   "Failed to load GeoGebra": "加载 GeoGebra 失败",
+  "GeoGebra rejected {{count}} command(s)": "GeoGebra 拒绝了 {{count}} 条命令",
   "Loading GeoGebra...": "正在加载 GeoGebra...",
   "HTML visualization": "HTML 可视化",
   "Failed to load visualization": "演示加载失败",
