@@ -288,7 +288,6 @@ class OpenAICompatProvider(LLMProvider):
         messages: list[dict[str, Any]],
         *,
         responses_api: bool = False,
-        model: str | None = None,
     ) -> list[dict[str, Any]]:
         prepared: list[dict[str, Any]] = []
         for message in messages:
@@ -305,17 +304,26 @@ class OpenAICompatProvider(LLMProvider):
                 if output_items:
                     clean["_provider_response_state"] = {"responses_output_items": output_items}
             else:
+                # Replay the round's own reasoning on the assistant turn that
+                # produced it. A thinking model's provider rejects a history
+                # that lost it ("the reasoning_content in the thinking mode
+                # must be passed back to the API"), and only a provider that
+                # SENT ``reasoning_content``/``reasoning`` can have put it in
+                # this state — so replaying it is symmetric, never additive.
+                #
+                # This used to be gated on ``"deepseek" in model``, which is
+                # not how a model announces the dialect: Volcengine Ark takes
+                # an endpoint id (``ep-…``) as the model name, and Doubao /
+                # GLM / Qwen / Kimi thinking models speak the same field under
+                # their own names. Every one of them lost its reasoning the
+                # moment a turn replayed history, while the *same* round
+                # inside one turn kept it (the loop sets the field directly).
                 state = message.get("_provider_response_state")
                 reasoning_content = (
                     state.get("reasoning_content") if isinstance(state, dict) else None
                 )
-                if (
-                    isinstance(reasoning_content, str)
-                    and reasoning_content
-                    and model
-                    and "deepseek" in model.lower()
-                ):
-                    clean["reasoning_content"] = reasoning_content
+                if isinstance(reasoning_content, str) and reasoning_content:
+                    clean.setdefault("reasoning_content", reasoning_content)
             prepared.append(clean)
 
         sanitized = LLMProvider._sanitize_request_messages(prepared, _ALLOWED_MSG_KEYS)
@@ -377,9 +385,7 @@ class OpenAICompatProvider(LLMProvider):
 
         kwargs: dict[str, Any] = {
             "model": model_name,
-            "messages": self._sanitize_messages(
-                self._sanitize_empty_content(messages), model=model_name
-            ),
+            "messages": self._sanitize_messages(self._sanitize_empty_content(messages)),
         }
 
         if self._supports_temperature(model_name, reasoning_effort):
@@ -603,9 +609,7 @@ class OpenAICompatProvider(LLMProvider):
             model_name = model_name.split("/")[-1]
 
         instructions, input_items = convert_messages(
-            self._sanitize_messages(
-                self._sanitize_empty_content(messages), responses_api=True, model=model_name
-            )
+            self._sanitize_messages(self._sanitize_empty_content(messages), responses_api=True)
         )
         body: dict[str, Any] = {
             "model": model_name,
