@@ -13,6 +13,12 @@ from deeptutor.services.llm.provider_core.openai_compat_provider import (
 from deeptutor.services.provider_registry import find_by_name
 
 
+def _unwrap_accounting(client: object) -> object:
+    """Reveal the routed client beneath the learnleader accounting wrapper."""
+    inner = getattr(client, "_client", None)
+    return inner if inner is not None else client
+
+
 def _catalog(*, wire_api: str = "responses", binding: str = "custom") -> dict:
     return {
         "version": 1,
@@ -100,7 +106,7 @@ def test_agentic_client_routes_forced_responses_through_adapter(monkeypatch) -> 
 def test_agentic_client_does_not_force_responses_for_azure(monkeypatch) -> None:
     class FakeAzureClient:
         def __init__(self, **_kwargs):
-            pass
+            self.chat = SimpleNamespace(completions=SimpleNamespace())
 
     class UnexpectedCompatProvider:
         def __init__(self, **_kwargs):
@@ -124,7 +130,9 @@ def test_agentic_client_does_not_force_responses_for_azure(monkeypatch) -> None:
         disable_ssl_verify=False,
     )
 
-    assert isinstance(client, FakeAzureClient)
+    # LearnLeader wraps generated clients in the platform/BYOK accounting layer;
+    # this test pins the routing decision, so unwrap before asserting.
+    assert isinstance(_unwrap_accounting(client), FakeAzureClient)
 
 
 def test_agentic_client_forced_chat_completions_beats_auto_responses(monkeypatch) -> None:
@@ -145,7 +153,7 @@ def test_agentic_client_forced_chat_completions_beats_auto_responses(monkeypatch
         disable_ssl_verify=False,
     )
 
-    assert isinstance(client, FakeChatCompletionsClient)
+    assert isinstance(_unwrap_accounting(client), FakeChatCompletionsClient)
 
 
 def test_wire_api_participates_in_both_client_cache_keys() -> None:
