@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 import pytest
 
@@ -33,7 +33,14 @@ def output_app(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> OutputAppFact
         monkeypatch.setattr(auth_router, "AUTH_ENABLED", auth_enabled)
         monkeypatch.setattr(auth_router, "decode_token", lambda token: tokens.get(token))
         app = FastAPI()
-        app.include_router(outputs.router, prefix="/api/outputs")
+        # Mirror api/main.py: the router reads the request-scoped current-user
+        # ContextVar installed by require_auth, so the dependency must be
+        # attached at mount time — a bare mount leaves every request 401.
+        app.include_router(
+            outputs.router,
+            prefix="/api/outputs",
+            dependencies=[Depends(auth_router.require_auth)],
+        )
         return TestClient(app), admin_root, users_root
 
     return make_app

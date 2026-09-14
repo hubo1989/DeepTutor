@@ -93,10 +93,11 @@ export function readStoredLanguage(): AppLanguage {
 
 /** Whether this browser has ever recorded a choice.
  *
- * ``readStoredLanguage`` cannot answer this: it normalizes a missing value to
- * "en", which is indistinguishable from an explicit English selection. The
- * bootstrap needs the difference — it may only consult the server-side
- * preference when the browser has no choice of its own to honour.
+ * ``readStoredLanguage`` cannot answer this: it falls back to the Chinese
+ * default for a missing value, which is indistinguishable from an explicit
+ * Chinese selection. The bootstrap needs the difference — it may only
+ * consult the server-side preference when the browser has no choice of its
+ * own to honour.
  */
 export function hasStoredLanguage(): boolean {
   if (typeof window === "undefined") return false;

@@ -25,12 +25,19 @@ function withLocalStorage(entries: Record<string, string>, run: () => void) {
   }
 }
 
-test("an absent choice is distinguishable from an explicit English one", () => {
-  // readStoredLanguage normalizes both to "en", so the bootstrap cannot use it
-  // to decide whether the server-side preference may be adopted.
+test("an absent choice falls back to Chinese and is distinguishable from an explicit one", () => {
+  // The interface defaults to Chinese, so an absent choice and an explicit
+  // "zh" both read as "zh" — the bootstrap uses hasStoredLanguage() to tell
+  // them apart when deciding whether the server-side preference may be
+  // adopted.
   withLocalStorage({}, () => {
     assert.equal(hasStoredLanguage(), false);
-    assert.equal(readStoredLanguage(), "en");
+    assert.equal(readStoredLanguage(), "zh");
+  });
+
+  withLocalStorage({ [LANGUAGE_STORAGE_KEY]: "zh" }, () => {
+    assert.equal(hasStoredLanguage(), true);
+    assert.equal(readStoredLanguage(), "zh");
   });
 
   withLocalStorage({ [LANGUAGE_STORAGE_KEY]: "en" }, () => {
@@ -58,7 +65,7 @@ test("server-side rendering reports no stored choice instead of throwing", () =>
   (globalThis as { window?: unknown }).window = undefined;
   try {
     assert.equal(hasStoredLanguage(), false);
-    assert.equal(readStoredLanguage(), "en");
+    assert.equal(readStoredLanguage(), "zh");
   } finally {
     (globalThis as { window?: unknown }).window = original;
   }

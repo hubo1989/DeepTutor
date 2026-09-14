@@ -13,6 +13,7 @@ Usage:
 
 If ICON_SRC is unset, falls back to the glyph-based generator (legacy).
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -30,10 +31,10 @@ _bundled = Path(__file__).parent / "branding-source" / "learnleader-icon.png"
 ICON_SRC = Path(_icon_src_env) if _icon_src_env else (_bundled if _bundled.exists() else None)
 
 # Brand palette: indigo -> violet gradient (friendly, modern EdTech).
-TOP = (99, 102, 241, 255)      # #6366F1 indigo-500
-BOTTOM = (124, 58, 237, 255)   # #7C3AED violet-600
+TOP = (99, 102, 241, 255)  # #6366F1 indigo-500
+BOTTOM = (124, 58, 237, 255)  # #7C3AED violet-600
 WHITE = (255, 255, 255, 255)
-INK = (30, 27, 75, 255)        # near-black indigo for the "black" variant
+INK = (30, 27, 75, 255)  # near-black indigo for the "black" variant
 
 
 def _font(path: str, size: int, index: int = 0) -> ImageFont.FreeTypeFont:
@@ -83,6 +84,7 @@ def _draw_glyph(img: Image.Image, glyph: str, size: int, color=WHITE, ratio: flo
 # ---------------------------------------------------------------------------
 # imagegen-source path (ICON_SRC env var)
 # ---------------------------------------------------------------------------
+
 
 def _load_imagegen_icon():
     """Load the AI-generated icon and make near-black corner pixels transparent."""
@@ -151,11 +153,14 @@ def _make_banner_from(src: Image.Image, path: Path):
     d = ImageDraw.Draw(canvas)
     cy = height / 2
     x = pad + icon_size + gap
-    d.text((x - cjk_bbox[0], cy - cjk_h / 2 - cjk_bbox[1] - 4),
-           "导学吧", font=cjk_font, fill=INK)
+    d.text((x - cjk_bbox[0], cy - cjk_h / 2 - cjk_bbox[1] - 4), "导学吧", font=cjk_font, fill=INK)
     x2 = x + cjk_w + 24
-    d.text((x2 - latin_bbox[0], cy - latin_h / 2 - latin_bbox[1] + 2),
-           "LearnLeader", font=latin_font, fill=TOP)
+    d.text(
+        (x2 - latin_bbox[0], cy - latin_h / 2 - latin_bbox[1] + 2),
+        "LearnLeader",
+        font=latin_font,
+        fill=TOP,
+    )
     canvas.save(path)
     print(f"  wrote {path} ({canvas.width}x{canvas.height})")
 
@@ -216,12 +221,20 @@ def make_banner(path: Path):
     cy = height / 2
     # 导学吧
     x = pad + icon_size + gap
-    d.text((x - cjk_bbox[0], cy - (cjk_bbox[3] - cjk_bbox[1]) / 2 - cjk_bbox[1] - 4),
-           "导学吧", font=cjk_font, fill=INK)
+    d.text(
+        (x - cjk_bbox[0], cy - (cjk_bbox[3] - cjk_bbox[1]) / 2 - cjk_bbox[1] - 4),
+        "导学吧",
+        font=cjk_font,
+        fill=INK,
+    )
     # LearnLeader (lighter indigo)
     x2 = x + cjk_w + 28
-    d.text((x2 - latin_bbox[0], cy - (latin_bbox[3] - latin_bbox[1]) / 2 - latin_bbox[1] + 2),
-           "LearnLeader", font=latin_font, fill=(99, 102, 241, 255))
+    d.text(
+        (x2 - latin_bbox[0], cy - (latin_bbox[3] - latin_bbox[1]) / 2 - latin_bbox[1] + 2),
+        "LearnLeader",
+        font=latin_font,
+        fill=(99, 102, 241, 255),
+    )
 
     canvas.save(path)
     print(f"  wrote {path} ({canvas.width}x{canvas.height})")
