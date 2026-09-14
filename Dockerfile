@@ -111,6 +111,8 @@ LABEL maintainer="DeepTutor Team" \
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONIOENCODING=utf-8 \
+    MALLOC_ARENA_MAX=2 \
+    MALLOC_TRIM_THRESHOLD_=131072 \
     NODE_ENV=production \
     DEEPTUTOR_IGNORE_PROCESS_ENV_OVERRIDES=1
 
@@ -279,8 +281,15 @@ echo "[Backend]  🚀 Starting FastAPI backend on ${BACKEND_HOST}:${BACKEND_PORT
 # --ws-max-size: chat attachments travel base64 inside one WS message; derive
 # the frame cap from the configured attachment policy (system.json) so uploads
 # the policy allows are not severed by uvicorn's 16MB default.
+#
+# --timeout-keep-alive: the frontend proxy (web/proxy.ts) forwards over Node's
+# http.globalAgent, which reaps idle sockets on a 5s timer — identical to
+# uvicorn's default, so both ends raced to close the same socket and the loser's
+# request died with ECONNRESET (a 500 in the UI). Stay well above the proxy's
+# reaper so the client is the only side retiring idle connections.
 WS_MAX_SIZE=$(python -c "from deeptutor.services.config import get_ws_max_size; print(get_ws_max_size())" 2>/dev/null || echo 16777216)
-exec python -m uvicorn deeptutor.api.main:app --host ${BACKEND_HOST} --port ${BACKEND_PORT} --no-access-log --ws-max-size ${WS_MAX_SIZE}
+KEEP_ALIVE=$(python -c "from deeptutor.services.config import HTTP_KEEP_ALIVE_TIMEOUT; print(HTTP_KEEP_ALIVE_TIMEOUT)" 2>/dev/null || echo 300)
+exec python -m uvicorn deeptutor.api.main:app --host ${BACKEND_HOST} --port ${BACKEND_PORT} --no-access-log --ws-max-size ${WS_MAX_SIZE} --timeout-keep-alive ${KEEP_ALIVE}
 EOF
 
 RUN sed -i 's/\r$//' /app/start-backend.sh && chmod +x /app/start-backend.sh
@@ -356,6 +365,42 @@ init_user_directories(Path('/app'))
 # Idempotent: re-chown /app/data so the unprivileged `deeptutor` user (UID 1000)
 # owns it. Cheap on no-op; the only first-start cost is one stat per file.
 chown -R deeptutor:deeptutor /app/data 2>/dev/null || true
+
+# Optional dependencies (#762). A container is disposable, so anything
+# `docker exec … pip install`ed into a running one is gone at the next
+# `compose down`. Declare them on the deployment instead and every container
+# started from it has them:
+#
+#   environment:
+#     DEEPTUTOR_EXTRAS: "math-animator,partners"
+#     DEEPTUTOR_APT_PACKAGES: "ffmpeg"
+#
+# Both steps are idempotent — a warm container only pays a check — and neither
+# is allowed to be fatal: a missing wheel leaves that one feature unavailable,
+# exactly as it was before, rather than taking the whole deployment down.
+# The pip cache lives on the data volume so a rebuild reuses the downloads it
+# already paid for instead of fetching them again.
+export PIP_CACHE_DIR="${PIP_CACHE_DIR:-/app/data/.cache/pip}"
+mkdir -p "$PIP_CACHE_DIR" 2>/dev/null || true
+
+if [ -n "${DEEPTUTOR_APT_PACKAGES:-}" ]; then
+    echo "🔧 Ensuring system packages: ${DEEPTUTOR_APT_PACKAGES}"
+    apt_missing=""
+    for pkg in $(echo "${DEEPTUTOR_APT_PACKAGES}" | tr ',' ' '); do
+        dpkg -s "$pkg" >/dev/null 2>&1 || apt_missing="$apt_missing $pkg"
+    done
+    if [ -z "$apt_missing" ]; then
+        echo "   ✅ System packages already present"
+    elif ! (apt-get update -qq && apt-get install -y --no-install-recommends $apt_missing); then
+        echo "   ⚠️ apt-get failed; these packages stay unavailable:$apt_missing"
+    fi
+fi
+
+if [ -n "${DEEPTUTOR_EXTRAS:-}" ]; then
+    echo "🔧 Ensuring Python extras: ${DEEPTUTOR_EXTRAS}"
+    python /app/scripts/install_extras.py "${DEEPTUTOR_EXTRAS}" || true
+    chown -R deeptutor:deeptutor "$PIP_CACHE_DIR" 2>/dev/null || true
+fi
 
 echo "⚙️  Loading runtime JSON settings..."
 eval "$(python - <<'PY'
@@ -434,16 +479,24 @@ ENTRYPOINT ["/app/entrypoint.sh"]
 # ============================================
 FROM production AS development
 
-# Re-add full node_modules for development hot-reload
-# (Production uses standalone output which doesn't include full node_modules)
-COPY --from=frontend-builder /app/web/node_modules ./web/node_modules
-COPY --from=frontend-builder /app/web/package.json ./web/package.json
-COPY --from=frontend-builder /app/web/next.config.js ./web/next.config.js
+# `next dev` compiles from source, so the development image needs the whole
+# web tree. This used to cherry-pick node_modules, package.json and
+# next.config.js on top of the production stage — but that stage's ./web is
+# `.next/standalone/`, a compiled server bundle carrying no sources, no
+# tsconfig and no scripts/. So the supervisor program below launched
+# `node scripts/dev.mjs` against a path that never existed, the dev frontend
+# went FATAL, and the image looked broken (#906). Taking the builder's tree
+# wholesale also stops the list from drifting each time web/ grows a
+# top-level entry. `--chown` during the copy avoids re-layering node_modules.
+COPY --chown=deeptutor:deeptutor --from=frontend-builder /app/web ./web
 
 # `next dev` runs as the unprivileged deeptutor user (via `user=deeptutor` in
 # the supervisord config) and must create/write its build cache under
 # /app/web/.next, so give that user ownership of the web dir and the cache.
-RUN mkdir -p /app/web/.next \
+# The production build copied in above is not reusable by `next dev`, so it
+# starts from an empty cache rather than a half-valid one.
+RUN rm -rf /app/web/.next \
+    && mkdir -p /app/web/.next \
     && chown deeptutor:deeptutor /app/web /app/web/.next
 
 # Install development tools
@@ -463,7 +516,7 @@ RUN pip install --no-cache-dir \
 # the production stage is reused as-is.
 RUN cat > /etc/supervisor/conf.d/programs.conf <<'EOF'
 [program:backend]
-command=/bin/bash -c "exec python -m uvicorn deeptutor.api.main:app --host 0.0.0.0 --port ${BACKEND_PORT:-8001} --reload --no-access-log --ws-max-size $(python -c 'from deeptutor.services.config import get_ws_max_size; print(get_ws_max_size())' 2>/dev/null || echo 16777216)"
+command=/bin/bash -c "exec python -m uvicorn deeptutor.api.main:app --host 0.0.0.0 --port ${BACKEND_PORT:-8001} --reload --no-access-log --ws-max-size $(python -c 'from deeptutor.services.config import get_ws_max_size; print(get_ws_max_size())' 2>/dev/null || echo 16777216) --timeout-keep-alive $(python -c 'from deeptutor.services.config import HTTP_KEEP_ALIVE_TIMEOUT; print(HTTP_KEEP_ALIVE_TIMEOUT)' 2>/dev/null || echo 300)"
 directory=/app
 user=deeptutor
 autostart=true
@@ -475,7 +528,7 @@ stderr_logfile_maxbytes=0
 environment=PYTHONPATH="/app",PYTHONUNBUFFERED="1"
 
 [program:frontend]
-command=/bin/bash -c "cd /app/web && node node_modules/next/dist/bin/next dev -H 0.0.0.0 -p ${FRONTEND_PORT:-3782}"
+command=/bin/bash -c "cd /app/web && node scripts/dev.mjs -H 0.0.0.0 -p ${FRONTEND_PORT:-3782}"
 directory=/app/web
 user=deeptutor
 autostart=true

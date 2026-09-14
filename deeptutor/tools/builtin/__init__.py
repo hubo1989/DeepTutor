@@ -5,10 +5,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sys
 from typing import Any
 
+from deeptutor.capabilities.ima import IMA_TOOL_TYPES
+from deeptutor.capabilities.marginnote4 import MARGINNOTE_TOOL_TYPES
 from deeptutor.capabilities.mastery import MASTERY_TOOL_TYPES
 from deeptutor.capabilities.obsidian import OBSIDIAN_TOOL_TYPES
+from deeptutor.capabilities.reading import READING_TOOL_TYPES
+from deeptutor.capabilities.setup import SETUP_TOOL_TYPES
 from deeptutor.capabilities.solve import SOLVE_TOOL_TYPES
 from deeptutor.capabilities.subagent import SUBAGENT_TOOL_TYPES
 from deeptutor.core.tool_protocol import BaseTool, ToolDefinition, ToolParameter, ToolResult
@@ -22,6 +27,8 @@ from deeptutor.tools.partner_memory import (
     PartnerSearchTool,
 )
 from deeptutor.tools.prompting import load_prompt_hints
+from deeptutor.tools.question_bank import ACTIONS as QB_ACTIONS
+from deeptutor.tools.question_bank import FILTERS as QB_FILTERS
 
 logger = logging.getLogger(__name__)
 
@@ -299,6 +306,35 @@ class CodeExecutionTool(_PromptHintsMixin, BaseTool):
         "cc": "c",
     }
 
+    @classmethod
+    def _command_for_platform(cls, language: str, *, has_stdin: bool) -> str:
+        """Build the shell command understood by the selected host platform."""
+        if sys.platform != "win32":
+            source_name, command_template = cls._LANGUAGES[language]
+            stdin_redirect = "< stdin.txt" if has_stdin else ""
+            return command_template.format(src=source_name, stdin=stdin_redirect).strip()
+
+        commands = {
+            "python": "python main.py",
+            # Use syntax supported by Windows PowerShell 5 as well as 7;
+            # ``&&`` only exists in PowerShell 7.
+            "c": "gcc main.c -O2 -o prog.exe; if ($LASTEXITCODE -eq 0) { .\\prog.exe }",
+            "cpp": "g++ -std=c++17 -O2 main.cpp -o prog.exe; if ($LASTEXITCODE -eq 0) { .\\prog.exe }",
+        }
+        command = commands[language]
+        # PowerShell's pipeline supplies stdin without relying on POSIX `<`.
+        if not has_stdin:
+            return command
+        if language == "python":
+            return "Get-Content stdin.txt | python main.py"
+        compiler, source = ("gcc", "main.c") if language == "c" else ("g++", "main.cpp")
+        flags = "-O2" if language == "c" else "-std=c++17 -O2"
+        return (
+            "$stdinText = Get-Content -Raw stdin.txt; "
+            f"{compiler} {flags} {source} -o prog.exe; "
+            "if ($LASTEXITCODE -eq 0) { $stdinText | .\\prog.exe }"
+        )
+
     def get_definition(self) -> ToolDefinition:
         return ToolDefinition(
             name="code_execution",
@@ -362,7 +398,7 @@ class CodeExecutionTool(_PromptHintsMixin, BaseTool):
         if not code:
             raise ValueError("code_execution requires non-empty 'code'.")
         language = self._resolve_language(kwargs.get("language"))
-        source_name, command_template = self._LANGUAGES[language]
+        source_name, _ = self._LANGUAGES[language]
 
         try:
             timeout = int(kwargs.get("timeout") or 30)
@@ -390,11 +426,10 @@ class CodeExecutionTool(_PromptHintsMixin, BaseTool):
         run_dir.mkdir(parents=True, exist_ok=True)
         (run_dir / source_name).write_text(code, encoding="utf-8")
 
-        stdin_redirect = ""
-        if str(kwargs.get("stdin") or "") != "":
+        has_stdin = str(kwargs.get("stdin") or "") != ""
+        if has_stdin:
             (run_dir / "stdin.txt").write_text(str(kwargs["stdin"]), encoding="utf-8")
-            stdin_redirect = "< stdin.txt"
-        command = command_template.format(src=source_name, stdin=stdin_redirect).strip()
+        command = self._command_for_platform(language, has_stdin=has_stdin)
 
         limits = ResourceLimits(timeout_s=timeout)
         request = ExecRequest(
@@ -408,7 +443,7 @@ class CodeExecutionTool(_PromptHintsMixin, BaseTool):
         # The source file, compiled binary, and stdin scratch are inputs we
         # wrote ourselves — exclude them so only program-generated files
         # surface as artifacts.
-        meta_files = {source_name, "prog", "stdin.txt"}
+        meta_files = {source_name, "prog", "prog.exe", "stdin.txt"}
         artifacts = [
             artifact
             for artifact in collect_public_artifacts(str(run_dir))
@@ -984,6 +1019,120 @@ class ListNotebookTool(_PromptHintsMixin, BaseTool):
         return ToolResult(
             content=outcome.text,
             metadata=outcome.summary or {},
+        )
+
+
+class QuestionBankTool(_PromptHintsMixin, BaseTool):
+    """Read and organise the learner's question bank.
+
+    The bank (Learning Space → Question Bank) holds every graded quiz
+    question the learner has answered. It is a different store from the
+    notebooks ``write_note`` writes to; without this tool the agent had
+    no writable handle on it, so "file my wrong answers into my mistakes
+    set" silently became a note. Auto-mounted iff the bank has entries.
+
+    Actions are name-addressed, never id-addressed, for the one write
+    that matters: ``organize`` takes a category *name* and creates it
+    when missing, so filing is a single call from a single listing.
+    """
+
+    def get_definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="question_bank",
+            description=(
+                "Read and organise the learner's question bank — the graded "
+                "quiz questions saved under Learning Space → Question Bank. "
+                "This is where wrong answers and quiz history live; it is NOT "
+                "the notebook (`write_note`). Use it whenever the learner asks "
+                "to review, group, file, or tidy their questions or mistakes. "
+                "action='overview' for counts + existing categories; "
+                "action='list' to see entries (each prefixed with its id); "
+                "action='organize' to file entry_ids into a category by name "
+                "(the category is created if it does not exist); "
+                "action='unfile' to remove them; "
+                "action='bookmark' to star or unstar them."
+            ),
+            parameters=[
+                ToolParameter(
+                    name="action",
+                    type="string",
+                    description=(
+                        "'overview' (counts + categories, needs nothing else), "
+                        "'list', 'organize', 'unfile', or 'bookmark'."
+                    ),
+                    enum=list(QB_ACTIONS),
+                ),
+                ToolParameter(
+                    name="filter",
+                    type="string",
+                    description=(
+                        "For action='list'. 'wrong' = answered incorrectly, "
+                        "'uncategorized' = not filed anywhere yet (the triage "
+                        "inbox), 'bookmarked', or 'all'. Default 'all'."
+                    ),
+                    enum=list(QB_FILTERS),
+                    required=False,
+                ),
+                ToolParameter(
+                    name="category",
+                    type="string",
+                    description=(
+                        "Category name. Required for 'organize' / 'unfile'; "
+                        "optional on 'list' to look inside one category. "
+                        "'organize' creates the category when it is new."
+                    ),
+                    required=False,
+                ),
+                ToolParameter(
+                    name="search",
+                    type="string",
+                    description="For action='list'. Free-text match over question and answers.",
+                    required=False,
+                ),
+                ToolParameter(
+                    name="entry_ids",
+                    type="array",
+                    description=(
+                        "Entry ids to act on, from a `list` call (the number in "
+                        "[brackets]). Required for 'organize' / 'unfile' / 'bookmark'."
+                    ),
+                    items={"type": "integer"},
+                    required=False,
+                ),
+                ToolParameter(
+                    name="bookmarked",
+                    type="boolean",
+                    description="For action='bookmark'. true to star, false to unstar. Default true.",
+                    required=False,
+                ),
+                ToolParameter(
+                    name="limit",
+                    type="integer",
+                    description="For action='list'. Max entries to return (default 20, max 100).",
+                    required=False,
+                ),
+            ],
+        )
+
+    async def execute(self, **kwargs: Any) -> ToolResult:
+        from deeptutor.tools.question_bank import run_question_bank
+
+        outcome = await run_question_bank(
+            action=str(kwargs.get("action") or "overview"),
+            # ``filter`` is the schema name the model sees; the pure
+            # function avoids shadowing the builtin.
+            filter_mode=str(kwargs.get("filter") or "all"),
+            category=str(kwargs.get("category") or ""),
+            search=str(kwargs.get("search") or ""),
+            entry_ids=kwargs.get("entry_ids"),
+            bookmarked=bool(kwargs.get("bookmarked", True)),
+            limit=int(kwargs.get("limit") or 20),
+        )
+        if not outcome.ok:
+            return ToolResult(content=outcome.error, success=False)
+        return ToolResult(
+            content=outcome.text,
+            metadata={"question_bank": outcome.summary or {}},
         )
 
 
@@ -1576,6 +1725,7 @@ BUILTIN_TOOL_TYPES: tuple[type[BaseTool], ...] = (
     WebFetchTool,
     ListNotebookTool,
     WriteNoteTool,
+    QuestionBankTool,
     GithubTool,
     AskUserTool,
     CronTool,
@@ -1593,10 +1743,21 @@ BUILTIN_TOOL_TYPES: tuple[type[BaseTool], ...] = (
     *MASTERY_TOOL_TYPES,
     *SOLVE_TOOL_TYPES,
     *OBSIDIAN_TOOL_TYPES,
+    *MARGINNOTE_TOOL_TYPES,
     # Subagent consult tool — globally registered; the subagent knowledge
     # capability runs the turn exclusively on it when a connected agent is the
     # selected KB.
     *SUBAGENT_TOOL_TYPES,
+    # Tencent IMA tools — globally registered; the IMA capability mounts them
+    # (additively, alongside rag) when a connected IMA library is selected.
+    *IMA_TOOL_TYPES,
+    # Immersive-reading tools — globally registered; the reading capability
+    # mounts them (additively) and binds the open material server-side, so they
+    # are inert on a turn with no document open.
+    *READING_TOOL_TYPES,
+    # Self-configuration tools — globally registered; the setup capability
+    # mounts them (additively) on a turn that is actually about configuration.
+    *SETUP_TOOL_TYPES,
     # Partner-only memory + history tools. Globally registered so schemas/API
     # stay stable, but never mounted in product chat: the partner runtime
     # force-mounts them (and suppresses chat's read_memory/write_memory) on
@@ -1654,6 +1815,7 @@ CONFIGURABLE_BUILTIN_TOOL_NAMES: tuple[str, ...] = (
     "read_skill",
     "list_notebook",
     "write_note",
+    "question_bank",
     "web_fetch",
     "github",
     "exec",
@@ -1690,6 +1852,7 @@ __all__ = [
     "VideogenTool",
     "ListNotebookTool",
     "PaperSearchToolWrapper",
+    "QuestionBankTool",
     "PartnerMemorizeTool",
     "PartnerReadTool",
     "PartnerSearchTool",

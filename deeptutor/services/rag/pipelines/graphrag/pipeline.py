@@ -16,6 +16,7 @@ import asyncio
 import logging
 from pathlib import Path
 import shutil
+import tempfile
 import traceback
 from typing import Any, Dict, List, Optional
 
@@ -24,6 +25,7 @@ from deeptutor.commercial.storage_limits import (
     enforce_staging_scratch_limit,
     promote_staged_directory_with_storage_limits,
 )
+from deeptutor.logging import PROCESS_LOG_PRIVATE_ATTR
 from deeptutor.runtime.home import get_runtime_data_root
 from deeptutor.services.rag.index_versioning import (
     resolve_storage_dir_for_read,
@@ -74,6 +76,18 @@ class GraphRagPipeline:
         except Exception as exc:  # pragma: no cover - best-effort
             self.logger.warning("Could not clean up failed version dir %s: %s", root_dir, exc)
 
+    async def _preflight_settings(self, settings: dict[str, Any]) -> None:
+        """Probe a settings snapshot without touching an existing KB version."""
+        from . import engine
+
+        with tempfile.TemporaryDirectory(prefix="deeptutor-graphrag-preflight-") as temp_dir:
+            probe_root = Path(temp_dir)
+            gr_config.write_settings_payload(probe_root, settings)
+            # Check the cheaper embedding request first so an invalid endpoint
+            # does not trigger a structured completion call unnecessarily.
+            await engine.preflight_embedding(probe_root)
+            await engine.preflight_completion(probe_root)
+
     # ----- indexing -------------------------------------------------------
 
     async def initialize(self, kb_name: str, file_paths: List[str], **kwargs) -> bool:
@@ -108,7 +122,10 @@ class GraphRagPipeline:
             return True
         except Exception as exc:
             self.logger.error("Failed to initialize GraphRAG KB: %s", exc)
-            self.logger.error(traceback.format_exc())
+            self.logger.error(
+                traceback.format_exc(),
+                extra={PROCESS_LOG_PRIVATE_ATTR: True},
+            )
             shutil.rmtree(staging, ignore_errors=True)
             self._cleanup_failed_version_dir(root_dir)
             raise
@@ -131,7 +148,13 @@ class GraphRagPipeline:
         staging = create_staging_directory(root_dir, copy_existing=is_update)
         try:
             # Refresh settings so a changed model/endpoint is picked up.
-            gr_config.write_settings(staging)
+            settings = gr_config.build_settings()
+            if is_update:
+                # An update reuses the active version directory. Validate the
+                # exact settings snapshot first so a bad provider configuration
+                # cannot overwrite a working settings.yaml or add input files.
+                await self._preflight_settings(settings)
+            gr_config.write_settings_payload(staging, settings)
             enforce_staging_scratch_limit(staging, replacing_root=root_dir)
             count = await ingestion.prepare_input(
                 file_paths,
@@ -142,7 +165,11 @@ class GraphRagPipeline:
                 self.logger.warning("GraphRAG: no extractable documents to add for '%s'", kb_name)
                 shutil.rmtree(staging, ignore_errors=True)
                 return False
-            await self._build(staging, is_update=is_update)
+            await self._build(
+                staging,
+                is_update=is_update,
+                preflight_embedding_model=not is_update,
+            )
             storage.write_meta(staging, version_name=root_dir.name)
             await asyncio.to_thread(
                 promote_staged_directory_with_storage_limits,
@@ -153,16 +180,29 @@ class GraphRagPipeline:
             return True
         except Exception as exc:
             self.logger.error("Failed to add documents to GraphRAG KB: %s", exc)
-            self.logger.error(traceback.format_exc())
+            self.logger.error(
+                traceback.format_exc(),
+                extra={PROCESS_LOG_PRIVATE_ATTR: True},
+            )
             shutil.rmtree(staging, ignore_errors=True)
             if not is_update:
                 self._cleanup_failed_version_dir(root_dir)
             raise
 
-    async def _build(self, root_dir: Path, *, is_update: bool) -> None:
+    async def _build(
+        self,
+        root_dir: Path,
+        *,
+        is_update: bool,
+        preflight_embedding_model: bool = True,
+    ) -> None:
         from . import engine
 
-        await engine.build(root_dir, is_update=is_update)
+        await engine.build(
+            root_dir,
+            is_update=is_update,
+            preflight_embedding_model=preflight_embedding_model,
+        )
 
     # ----- retrieval ------------------------------------------------------
 
@@ -192,7 +232,10 @@ class GraphRagPipeline:
             return self._error_result(query, exc, error_type="not_configured")
         except Exception as exc:
             self.logger.error("GraphRAG search failed: %s", exc)
-            self.logger.error(traceback.format_exc())
+            self.logger.error(
+                traceback.format_exc(),
+                extra={PROCESS_LOG_PRIVATE_ATTR: True},
+            )
             return self._error_result(query, exc, error_type="retrieval_error")
 
         return {

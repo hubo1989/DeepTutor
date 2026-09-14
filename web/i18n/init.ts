@@ -6,7 +6,7 @@ import enApp from "@/locales/en/app.json";
 export type AppLanguage = "en" | "zh";
 
 export function normalizeLanguage(lang: unknown): AppLanguage {
-  if (!lang) return "en";
+  if (!lang) return "zh";
   const s = String(lang).toLowerCase();
   if (s === "zh" || s === "cn" || s === "chinese") return "zh";
   return "en";
@@ -24,6 +24,10 @@ export function initI18n(language?: unknown) {
   i18n.use(initReactI18next).init({
     resources,
     lng: normalizeLanguage(language),
+    // en is the only bundle loaded synchronously at init (zh is lazy-loaded
+    // by ensureLanguage). Falling back to zh when the zh bundle has not been
+    // imported yet would return raw keys; fall back to en so the first paint
+    // shows real copy instead of unrendered i18n keys.
     fallbackLng: "en",
     // Use a single default namespace to keep lookups simple.
     // We intentionally keep keySeparator disabled so keys like "Generating..." remain valid.

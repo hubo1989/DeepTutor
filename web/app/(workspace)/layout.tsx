@@ -3,6 +3,7 @@ import AppShell from "@/components/layout/AppShell";
 import { CapabilityAccessProvider } from "@/components/access/CapabilityAccessContext";
 import CapabilityGate from "@/components/access/CapabilityGate";
 import { UnifiedChatProvider } from "@/context/UnifiedChatContext";
+import { ReadingProvider } from "@/context/ReadingContext";
 import {
   CommercialAccessProvider,
   TrialStatusBanner,
@@ -17,10 +18,15 @@ export default function WorkspaceLayout({
     <CommercialAccessProvider>
       <CapabilityAccessProvider>
         <UnifiedChatProvider>
-          <AppShell sidebar={<WorkspaceSidebar />}>
-            <TrialStatusBanner />
-            <CapabilityGate>{children}</CapabilityGate>
-          </AppShell>
+          {/* Above the page on purpose: sending the first message navigates
+              /home → /home/<id>, which remounts the page. The open document
+              must not die with it. */}
+          <ReadingProvider>
+            <AppShell sidebar={<WorkspaceSidebar />}>
+              <TrialStatusBanner />
+              <CapabilityGate>{children}</CapabilityGate>
+            </AppShell>
+          </ReadingProvider>
         </UnifiedChatProvider>
       </CapabilityAccessProvider>
     </CommercialAccessProvider>

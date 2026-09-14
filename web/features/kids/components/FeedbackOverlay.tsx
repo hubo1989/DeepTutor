@@ -31,15 +31,18 @@ export default function FeedbackOverlay({
   onComplete,
   duration = 1200,
 }: FeedbackOverlayProps) {
-  const [visible, setVisible] = useState(false);
+  const [visible, setVisible] = useState(type !== null);
+  // A new feedback type re-shows the overlay immediately. Adjusting state
+  // during render against the previous value is the sanctioned React
+  // pattern; calling setState synchronously in an effect body is not.
+  const [prevType, setPrevType] = useState(type);
+  if (prevType !== type) {
+    setPrevType(type);
+    setVisible(type !== null);
+  }
 
   useEffect(() => {
-    if (type === null) {
-      setVisible(false);
-      return;
-    }
-
-    setVisible(true);
+    if (type === null) return;
     const timer = setTimeout(() => {
       setVisible(false);
       onComplete?.();

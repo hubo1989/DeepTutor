@@ -76,12 +76,18 @@ venv.bak/
 # Node.js and Frontend Build
 # ============================================
 # Node modules
+# Both spellings: the trailing slash matches only a real directory, so a
+# symlinked node_modules (how a git worktree usually borrows the main
+# checkout's install) would otherwise be staged by `git add -A`.
+node_modules
 node_modules/
+**/node_modules
 **/node_modules/
 
 # Next.js build output
 .next/
 web/.next/
+web/.next-deeptutor/
 out/
 web/out/
 .vercel/
@@ -131,6 +137,9 @@ cache/
 .cache/
 .ruff_cache
 .playwright-cli/
+# Written by `npm run audit` (the playwright ui-audit project).
+web/test-results/
+web/playwright-report/
 
 # Log files
 *.log
@@ -317,3 +326,6 @@ celerybeat.pid
 *.wav
 *.ogg
 !demo/*.mp4
+
+# local video-agent tooling artifacts
+.video_agent/

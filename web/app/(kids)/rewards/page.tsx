@@ -2,6 +2,7 @@
 
 import React, { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
+import { useTranslation } from "react-i18next";
 import { ChevronLeft, Zap, Flame, TrendingUp } from "lucide-react";
 import { kidsTheme } from "@/features/kids/theme/kidsTheme";
 import { useKidProfile } from "@/features/kids/hooks/useKidProfile";
@@ -21,6 +22,7 @@ import {
 
 export default function RewardsPage() {
   const router = useRouter();
+  const { t } = useTranslation();
   const { profile } = useKidProfile();
   const [maps, setMaps] = useState<MapProgressItem[]>([]);
   const [loading, setLoading] = useState(true);
@@ -74,7 +76,7 @@ export default function RewardsPage() {
         <button
           onClick={() => router.push("/kids-home")}
           className="p-2 rounded-full hover:bg-[var(--muted)]"
-          aria-label="Back"
+          aria-label={t("kids.back")}
         >
           <ChevronLeft className="w-6 h-6" style={{ color: "var(--foreground)" }} />
         </button>
@@ -82,7 +84,7 @@ export default function RewardsPage() {
           className="text-2xl font-extrabold"
           style={{ color: "var(--foreground)" }}
         >
-          My Achievements
+          {t("kids.myAchievements")}
         </h1>
       </div>
 
@@ -107,10 +109,10 @@ export default function RewardsPage() {
           {level}
         </div>
         <div className="flex-1">
-          <div className="text-sm opacity-90">Level {level}</div>
-          <div className="text-2xl font-extrabold">{totalXp} XP</div>
+          <div className="text-sm opacity-90">{t("kids.levelN", { n: level })}</div>
+          <div className="text-2xl font-extrabold">{totalXp} {t("kids.xp")}</div>
           <div className="text-xs opacity-75">
-            {nextLevelXp - totalXp} XP to Level {level + 1}
+            {t("kids.xpToLevel", { xp: nextLevelXp - totalXp, level: level + 1 })}
           </div>
         </div>
       </div>
@@ -126,7 +128,7 @@ export default function RewardsPage() {
       >
         <div className="flex items-center justify-between mb-2">
           <span className="text-sm font-semibold" style={{ color: "var(--foreground)" }}>
-            Progress to Level {level + 1}
+            {t("kids.progressToLevel", { n: level + 1 })}
           </span>
           <span className="text-xs" style={{ color: "var(--muted-foreground)" }}>
             {Math.round(progress * 100)}%
@@ -183,7 +185,7 @@ export default function RewardsPage() {
               {streakDays}
             </div>
             <div className="text-xs" style={{ color: "var(--muted-foreground)" }}>
-              day streak
+              {t("kids.dayStreak")}
             </div>
           </div>
         </div>
@@ -218,7 +220,7 @@ export default function RewardsPage() {
               {maps.reduce((sum, m) => sum + m.cleared_levels, 0)}
             </div>
             <div className="text-xs" style={{ color: "var(--muted-foreground)" }}>
-              levels cleared
+              {t("kids.levelsCleared")}
             </div>
           </div>
         </div>

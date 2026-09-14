@@ -342,13 +342,6 @@ export function SidebarShell({
       <div className="flex h-14 items-center justify-between px-4">
         <Link href="/" className="group flex items-center gap-1.5">
           <Image
-            src="/logo.png"
-            alt="LearnLeader"
-            width={22}
-            height={22}
-            className="h-[22px] w-[22px] transition-transform duration-200 group-hover:scale-105"
-          />
-          <Image
             src="/banner.png"
             alt="LearnLeader"
             width={897}

@@ -63,37 +63,37 @@ export function useTTS(config: UseTTSConfig): UseTTSReturn {
       ? config.enabled
       : TTS_DEFAULT_AGE_BANDS.includes(ageBand);
 
-  const [enabled, setEnabledState] = useState<boolean>(defaultEnabled);
+  // Read the persisted preference once, lazily, on first render. An effect
+  // cannot be used for this: setting state synchronously inside an effect
+  // body triggers cascading renders (react-hooks/set-state-in-effect). The
+  // profile is fixed for the hook's lifetime — callers remount the kids
+  // screen with a new key when the profile changes.
+  const storageKey = `deeptutor:tts:${profileId || "default"}`;
+  const [enabled, setEnabledState] = useState<boolean>(() => {
+    try {
+      const stored = localStorage.getItem(storageKey);
+      if (stored !== null) return stored === "true";
+    } catch {
+      // localStorage may be unavailable
+    }
+    return defaultEnabled;
+  });
   const [isSpeaking, setIsSpeaking] = useState<boolean>(false);
   const [error, setError] = useState<string>("");
 
   const currentUtteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
   const apiBase = apiBaseUrl || (typeof window !== "undefined" ? window.location.origin : "");
 
-  // Persist enabled state to localStorage for this profile
-  useEffect(() => {
-    const storageKey = `deeptutor:tts:${profileId || "default"}`;
-    try {
-      const stored = localStorage.getItem(storageKey);
-      if (stored !== null) {
-        setEnabledState(stored === "true");
-      }
-    } catch {
-      // localStorage may be unavailable
-    }
-  }, [profileId]);
-
   const setEnabled = useCallback(
     (value: boolean) => {
       setEnabledState(value);
-      const storageKey = `deeptutor:tts:${profileId || "default"}`;
       try {
         localStorage.setItem(storageKey, String(value));
       } catch {
         // Ignore storage errors
       }
     },
-    [profileId],
+    [storageKey],
   );
 
   const toggleEnabled = useCallback(() => {

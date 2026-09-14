@@ -2,6 +2,7 @@
 
 import React, { useEffect, useState, useCallback } from "react";
 import { useParams, useRouter } from "next/navigation";
+import { useTranslation } from "react-i18next";
 import { ChevronLeft } from "lucide-react";
 import { kidsTheme } from "@/features/kids/theme/kidsTheme";
 import MapNode, { type MapNodeStatus } from "@/features/kids/components/MapNode";
@@ -18,6 +19,7 @@ import type {
 
 export default function MapPage() {
   const router = useRouter();
+  const { t } = useTranslation();
   const params = useParams<{ mapId: string }>();
   const mapId = params.mapId;
 
@@ -55,7 +57,7 @@ export default function MapPage() {
         }
       } catch (err) {
         if (!cancelled) {
-          setError(err instanceof Error ? err.message : "Failed to load map");
+          setError(err instanceof Error ? err.message : t("kids.failedToLoadMap"));
         }
       } finally {
         if (!cancelled) setLoading(false);
@@ -66,7 +68,7 @@ export default function MapPage() {
     return () => {
       cancelled = true;
     };
-  }, [mapId]);
+  }, [mapId, t]);
 
   const handleLevelClick = useCallback(
     (level: LevelSummaryModel) => {
@@ -111,7 +113,7 @@ export default function MapPage() {
     return (
       <div className="text-center py-12">
         <p style={{ color: kidsTheme.colors.danger }}>
-          {error ?? "Map not found"}
+          {error ?? t("kids.mapNotFound")}
         </p>
         <button
           className="mt-4 px-6 py-3 font-bold text-white"
@@ -121,7 +123,7 @@ export default function MapPage() {
           }}
           onClick={() => router.push("/kids-home")}
         >
-          Back to Home
+          {t("kids.backToHome")}
         </button>
       </div>
     );
@@ -134,7 +136,7 @@ export default function MapPage() {
         <button
           onClick={() => router.push("/kids-home")}
           className="p-2 rounded-full hover:bg-[var(--muted)]"
-          aria-label="Back"
+          aria-label={t("kids.back")}
         >
           <ChevronLeft className="w-6 h-6" style={{ color: "var(--foreground)" }} />
         </button>
@@ -206,10 +208,10 @@ export default function MapPage() {
           }}
         >
           <span className="text-sm font-semibold" style={{ color: "var(--foreground)" }}>
-            Progress
+            {t("kids.progress")}
           </span>
           <span className="text-sm" style={{ color: "var(--muted-foreground)" }}>
-            {progress.cleared_levels} / {progress.total_levels} levels cleared
+            {t("kids.levelsClearedFull", { cleared: progress.cleared_levels, total: progress.total_levels })}
           </span>
         </div>
       )}

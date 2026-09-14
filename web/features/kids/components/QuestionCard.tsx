@@ -404,7 +404,15 @@ function MatchingInteraction({
   // If the child hasn't submitted yet, they tap pairs in order.
   // For simplicity in the kids UI, we present each left item with a dropdown
   // of right items to choose from.
-  const [selections, setSelections] = useState<Record<string, string>>({});
+  const [selections, setSelections] = useState<Record<string, string>>(() => {
+    if (!selectedValue || !selectedValue.includes(";;")) return {};
+    const parsed: Record<string, string> = {};
+    for (const part of selectedValue.split(";;")) {
+      const [l, r] = part.split("|");
+      if (l && r) parsed[l] = r;
+    }
+    return parsed;
+  });
   const rightItems = pairs.map((p) => p[1]);
 
   const handleChange = (left: string, right: string) => {
@@ -417,18 +425,6 @@ function MatchingInteraction({
       onSelect(answer);
     }
   };
-
-  // Sync from external selectedValue (e.g. after re-render)
-  useEffect(() => {
-    if (selectedValue && selectedValue.includes(";;")) {
-      const parsed: Record<string, string> = {};
-      for (const part of selectedValue.split(";;")) {
-        const [l, r] = part.split("|");
-        if (l && r) parsed[l] = r;
-      }
-      setSelections(parsed);
-    }
-  }, []);
 
   return (
     <div className="space-y-3">
@@ -500,23 +496,18 @@ function OrderingInteraction({
 }) {
   // The child taps items in the order they think is correct.
   // The correct answer is the original sequence joined by ";;".
-  const [userOrder, setUserOrder] = useState<string[]>([]);
-  const [available, setAvailable] = useState<string[]>([]);
-
-  // Shuffle the items on mount so the child has to reorder them
-  useEffect(() => {
-    const shuffled = [...sequence].sort(() => Math.random() - 0.5);
-    setAvailable(shuffled);
-    setUserOrder([]);
-  }, []);
-
-  // Sync from external selectedValue
-  useEffect(() => {
-    if (selectedValue && selectedValue.includes(";;")) {
-      setUserOrder(selectedValue.split(";;"));
-      setAvailable([]);
-    }
-  }, []);
+  // A pre-answered question restores the submitted order; otherwise the
+  // items are shuffled once on first render. Both effects of setting this
+  // state synchronously inside useEffect bodies are avoided by initializing
+  // lazily here.
+  const [userOrder, setUserOrder] = useState<string[]>(() =>
+    selectedValue && selectedValue.includes(";;") ? selectedValue.split(";;") : []
+  );
+  const [available, setAvailable] = useState<string[]>(() =>
+    selectedValue && selectedValue.includes(";;")
+      ? []
+      : [...sequence].sort(() => Math.random() - 0.5)
+  );
 
   const correctAnswer = sequence.join(";;");
 

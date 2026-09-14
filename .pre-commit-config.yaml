@@ -10,6 +10,15 @@
 #   git commit  # Hooks run automatically on commit
 
 repos:
+  - repo: local
+    hooks:
+      - id: deeptutor-repo-hygiene
+        name: DeepTutor repository hygiene
+        entry: python3 scripts/check_repo_hygiene.py
+        language: system
+        pass_filenames: false
+        always_run: true
+
   # ============================================
   # General file checks
   # ============================================
@@ -39,12 +48,15 @@ repos:
   # ============================================
   # Python code formatting and linting
   # ============================================
+  # Pinned to the version CI installs (.github/workflows/tests.yml). A drift
+  # here is invisible until it matters: the hook formats a file one way, then
+  # CI's `ruff format --check .` judges it with a different version.
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.14.7
+    rev: v0.16.0
     hooks:
       - id: ruff
-        # Added --quiet to suppress logs; --exit-zero makes it a "soft fail" if desired
-        args: [--fix, --quiet, --exit-zero]
+        # Keep local fixes, but fail the hook when Ruff reports remaining violations.
+        args: [--fix, --quiet]
 
       - id: ruff-format
         args: [--quiet]

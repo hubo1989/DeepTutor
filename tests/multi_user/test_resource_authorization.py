@@ -665,6 +665,13 @@ def test_partner_http_chat_requires_model_access(
         raising=False,
     )
 
+    class _StubManager:
+        def partner_exists(self, _partner_id: str) -> bool:
+            return True
+
+    monkeypatch.setattr(partners, "get_partner_manager", lambda: _StubManager())
+    monkeypatch.setattr(partners, "can_use_partner", lambda _pid, _user=None: True)
+
     async def must_not_start(_partner_id: str):
         raise AssertionError("partner execution must not start")
 
@@ -699,6 +706,13 @@ def test_partner_http_chat_requires_partner_assignment(
 
     monkeypatch.setattr(partners, "assert_partner_allowed", deny_unassigned)
     monkeypatch.setattr(partners, "has_capability_access", lambda _capability: True)
+
+    class _StubManager:
+        def partner_exists(self, _partner_id: str) -> bool:
+            return True
+
+    monkeypatch.setattr(partners, "get_partner_manager", lambda: _StubManager())
+    monkeypatch.setattr(partners, "can_use_partner", lambda _pid, _user=None: True)
 
     async def must_not_start(_partner_id: str):
         raise AssertionError("unassigned partner execution must not start")
