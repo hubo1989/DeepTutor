@@ -6,8 +6,8 @@ import pytest
 
 from deeptutor.agents.research.data_structures import DynamicTopicQueue, TopicBlock
 from deeptutor.agents.research.pipeline import ResearchPipeline, _BlockLoopHost
-from deeptutor.core.context import UnifiedContext
 from deeptutor.core.agentic.tool_dispatch import DispatchOutcome
+from deeptutor.core.context import UnifiedContext
 from deeptutor.core.stream_bus import StreamBus
 
 

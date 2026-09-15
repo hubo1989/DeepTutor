@@ -8,13 +8,13 @@ from typing import Any
 import pytest
 
 from deeptutor.services.llm.config import LLMConfig
+from deeptutor.services.llm.exceptions import LLMAPIError
 from deeptutor.services.llm.factory import (
     _commercial_factory_request_tokens,
     _reserve_factory_quota,
     complete,
     stream,
 )
-from deeptutor.services.llm.exceptions import LLMAPIError
 from deeptutor.services.llm.provider_core.base import LLMResponse
 
 

@@ -18,10 +18,10 @@ from deeptutor.services.private_state import (
     ensure_private_directory,
     exclusive_path_lock,
 )
+from deeptutor.utils.secret_files import write_secret_text
 
 from .models import Role
 from .paths import PROJECT_ROOT, SYSTEM_ROOT, migrate_legacy_multi_user_tree
-from deeptutor.utils.secret_files import write_secret_text
 
 logger = logging.getLogger(__name__)
 

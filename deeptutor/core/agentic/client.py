@@ -36,7 +36,6 @@ from deeptutor.services.llm.reasoning_params import (
 )
 from deeptutor.services.provider_registry import (
     find_by_name,
-    model_overrides_for,
     wire_api_for_provider,
 )
 
