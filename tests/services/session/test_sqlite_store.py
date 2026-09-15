@@ -396,6 +396,8 @@ def test_delete_last_turn_leaves_prefix_intact(store: SQLiteSessionStore) -> Non
     assert remaining[0]["parent_message_id"] is None
     assert remaining[1]["parent_message_id"] == remaining[0]["id"]
     assert remaining[1]["id"] == a1
+
+
 # ── Context messages ──────────────────────────────────────────────
 
 
