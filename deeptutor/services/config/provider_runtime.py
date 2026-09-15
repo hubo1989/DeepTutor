@@ -29,6 +29,7 @@ from deeptutor.services.provider_registry import (
     find_by_model,
     find_by_name,
     find_gateway,
+    wire_api_for_provider,
 )
 from deeptutor.services.videogen.config import VideogenConfig
 from deeptutor.services.voice.config import (
@@ -545,6 +546,7 @@ class ResolvedLLMConfig:
     effective_url: str | None = None
     api_version: str | None = None
     extra_headers: dict[str, str] = field(default_factory=dict)
+    wire_api: str = "auto"
     reasoning_effort: str | None = None
     context_window: int | None = None
     source: str = "platform"
@@ -835,6 +837,7 @@ def resolve_llm_runtime_config(
     active_api_key = _as_api_key((profile or {}).get("api_key"))
     active_api_base = _as_str((profile or {}).get("base_url"))
     active_api_version = _as_str((profile or {}).get("api_version"))
+    configured_wire_api = _as_str((profile or {}).get("wire_api")) or "auto"
     reasoning_effort = _as_str((model or {}).get("reasoning_effort")) or None
     # Per-conversation override (#641): an explicit reasoning_effort on the
     # caller's LLMSelection takes precedence over the profile/model default
@@ -877,6 +880,7 @@ def resolve_llm_runtime_config(
         effective_url=api_base or None,
         api_version=api_version or None,
         extra_headers=extra_headers,
+        wire_api=wire_api_for_provider(configured_wire_api, spec),
         reasoning_effort=reasoning_effort,
         context_window=context_window,
         source="platform",

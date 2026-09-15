@@ -18,7 +18,11 @@ from typing import TYPE_CHECKING, TypedDict
 
 from deeptutor.services.config import resolve_llm_runtime_config
 from deeptutor.services.keypool import primary_api_key
-from deeptutor.services.provider_registry import canonical_provider_name, find_by_name
+from deeptutor.services.provider_registry import (
+    canonical_provider_name,
+    find_by_name,
+    wire_api_for_provider,
+)
 
 from .exceptions import LLMConfigError
 
@@ -38,6 +42,7 @@ class LLMConfigUpdate(TypedDict, total=False):
     provider_mode: str
     api_version: str | None
     extra_headers: dict[str, str]
+    wire_api: str
     reasoning_effort: str | None
     context_window: int | None
     source: str
@@ -110,6 +115,7 @@ class LLMConfig:
     provider_mode: str = "standard"
     api_version: str | None = None
     extra_headers: dict[str, str] | None = None
+    wire_api: str = "auto"
     reasoning_effort: str | None = None
     context_window: int | None = None
     # Whether this config resolves credentials from the platform catalog or a
@@ -126,6 +132,8 @@ class LLMConfig:
     def __post_init__(self) -> None:
         if self.effective_url is None:
             self.effective_url = self.base_url
+        spec = find_by_name(self.provider_name) or find_by_name(self.binding)
+        self.wire_api = wire_api_for_provider(self.wire_api, spec)
 
     def model_copy(self, update: LLMConfigUpdate | None = None) -> "LLMConfig":
         """Return a copy of the config with optional updates."""
@@ -184,7 +192,11 @@ def _get_llm_config_from_resolver() -> LLMConfig:
         raise LLMConfigError(
             "No effective LLM endpoint resolved. Please configure base_url or provider defaults."
         )
-    is_placeholder_key = resolved.api_key in {"", "no-key", "sk-no-key-required"}
+    # api_key may be a list (key pool); only the resolved primary key counts
+    # for the placeholder check — set membership on the raw list raises
+    # TypeError for unhashable list (PR #962 semantics).
+    primary_key = primary_api_key(resolved.api_key)
+    is_placeholder_key = primary_key in {None, "", "no-key", "sk-no-key-required"}
     if (
         resolved.provider_name == "openai"
         and resolved.provider_mode == "standard"
@@ -204,6 +216,7 @@ def _get_llm_config_from_resolver() -> LLMConfig:
         provider_mode=resolved.provider_mode,
         api_version=resolved.api_version,
         extra_headers=resolved.extra_headers,
+        wire_api=resolved.wire_api,
         reasoning_effort=resolved.reasoning_effort,
         context_window=resolved.context_window,
         source=getattr(resolved, "source", "platform"),

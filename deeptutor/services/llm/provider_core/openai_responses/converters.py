@@ -27,6 +27,13 @@ def convert_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str
             continue
 
         if role == "assistant":
+            state = msg.get("_provider_response_state")
+            state_items = state.get("responses_output_items") if isinstance(state, dict) else None
+            if not isinstance(state_items, list):
+                state_items = msg.get("_responses_output_items")
+            if isinstance(state_items, list) and state_items:
+                input_items.extend(dict(item) for item in state_items if isinstance(item, dict))
+                continue
             if isinstance(content, str) and content:
                 input_items.append(
                     {

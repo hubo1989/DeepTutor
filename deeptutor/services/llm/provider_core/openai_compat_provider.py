@@ -9,8 +9,10 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 import hashlib
+import re
 import secrets
 import string
+import sys
 import time
 from typing import TYPE_CHECKING, Any
 import uuid
@@ -34,7 +36,7 @@ from deeptutor.services.llm.reasoning_params import (
     build_openai_compatible_reasoning_kwargs,
 )
 from deeptutor.services.llm.usage_frame import token_counts
-from deeptutor.services.provider_registry import model_overrides_for
+from deeptutor.services.provider_registry import model_overrides_for, normalize_wire_api
 
 if TYPE_CHECKING:
     from deeptutor.services.provider_registry import ProviderSpec
@@ -48,9 +50,13 @@ _ALLOWED_MSG_KEYS = frozenset(
         "name",
         "reasoning_content",
         "extra_content",
+        "_provider_response_state",
+        "_responses_output_items",
     }
 )
 _ALNUM = string.ascii_letters + string.digits
+
+_INTERNAL_RESPONSE_STATE_KEYS = frozenset({"_provider_response_state", "_responses_output_items"})
 
 _DEFAULT_OPENROUTER_HEADERS = {
     "HTTP-Referer": "https://github.com/HKUDS/DeepTutor",
@@ -58,6 +64,8 @@ _DEFAULT_OPENROUTER_HEADERS = {
 }
 _RESPONSES_FAILURE_THRESHOLD = 2
 _RESPONSES_PROBE_INTERVAL_S = 300.0
+_INPUT_ITEM_STATUS_PARAM = re.compile(r"^input\[(0|[1-9][0-9]*)\]\.status$")
+_MAX_INPUT_ITEM_INDEX_DIGITS = len(str(sys.maxsize))
 
 
 def _short_tool_id() -> str:
@@ -82,6 +90,16 @@ def _coerce_dict(value: Any) -> dict[str, Any] | None:
         if isinstance(dumped, dict) and dumped:
             return dumped
     return None
+
+
+def _provider_state_output_items(message: dict[str, Any]) -> list[dict[str, Any]]:
+    state = message.get("_provider_response_state")
+    items = state.get("responses_output_items") if isinstance(state, dict) else None
+    if not isinstance(items, list):
+        items = message.get("_responses_output_items")
+    if not isinstance(items, list):
+        return []
+    return [dict(item) for item in items if isinstance(item, dict)]
 
 
 def _uses_openrouter(spec: "ProviderSpec | None", api_base: str | None) -> bool:
@@ -122,6 +140,7 @@ class OpenAICompatProvider(LLMProvider):
         extra_headers: dict[str, str] | None = None,
         spec: Any = None,
         provider_name: str | None = None,
+        wire_api: str = "auto",
     ):
         keys = api_key if isinstance(api_key, list) else [api_key]
         keys = [str(key).strip() for key in keys if str(key or "").strip()]
@@ -132,6 +151,7 @@ class OpenAICompatProvider(LLMProvider):
         self.extra_headers = extra_headers or {}
         self._spec = spec
         self._provider_name = provider_name
+        self._wire_api = normalize_wire_api(wire_api)
 
         if primary_key and spec and spec.env_key:
             self._setup_env(primary_key, api_base)
@@ -166,6 +186,7 @@ class OpenAICompatProvider(LLMProvider):
         )
         self._responses_failures: dict[str, int] = {}
         self._responses_tripped_at: dict[str, float] = {}
+        self._responses_without_message_status_models: set[str] = set()
 
     @staticmethod
     def _status_code(exc: Exception) -> int | None:
@@ -262,8 +283,50 @@ class OpenAICompatProvider(LLMProvider):
             return tool_call_id
         return hashlib.sha256(tool_call_id.encode()).hexdigest()[:9]
 
-    def _sanitize_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        sanitized = LLMProvider._sanitize_request_messages(messages, _ALLOWED_MSG_KEYS)
+    def _sanitize_messages(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        responses_api: bool = False,
+    ) -> list[dict[str, Any]]:
+        prepared: list[dict[str, Any]] = []
+        for message in messages:
+            if not isinstance(message, dict):
+                prepared.append(message)
+                continue
+            clean = {
+                key: value
+                for key, value in message.items()
+                if key not in _INTERNAL_RESPONSE_STATE_KEYS
+            }
+            if responses_api:
+                output_items = _provider_state_output_items(message)
+                if output_items:
+                    clean["_provider_response_state"] = {"responses_output_items": output_items}
+            else:
+                # Replay the round's own reasoning on the assistant turn that
+                # produced it. A thinking model's provider rejects a history
+                # that lost it ("the reasoning_content in the thinking mode
+                # must be passed back to the API"), and only a provider that
+                # SENT ``reasoning_content``/``reasoning`` can have put it in
+                # this state — so replaying it is symmetric, never additive.
+                #
+                # This used to be gated on ``"deepseek" in model``, which is
+                # not how a model announces the dialect: Volcengine Ark takes
+                # an endpoint id (``ep-…``) as the model name, and Doubao /
+                # GLM / Qwen / Kimi thinking models speak the same field under
+                # their own names. Every one of them lost its reasoning the
+                # moment a turn replayed history, while the *same* round
+                # inside one turn kept it (the loop sets the field directly).
+                state = message.get("_provider_response_state")
+                reasoning_content = (
+                    state.get("reasoning_content") if isinstance(state, dict) else None
+                )
+                if isinstance(reasoning_content, str) and reasoning_content:
+                    clean.setdefault("reasoning_content", reasoning_content)
+            prepared.append(clean)
+
+        sanitized = LLMProvider._sanitize_request_messages(prepared, _ALLOWED_MSG_KEYS)
         id_map: dict[str, str] = {}
 
         def map_id(value: Any) -> Any:
@@ -361,6 +424,11 @@ class OpenAICompatProvider(LLMProvider):
         model: str | None,
         reasoning_effort: str | None,
     ) -> bool:
+        if self._wire_api == "responses":
+            return True
+        if self._wire_api == "chat_completions":
+            return False
+
         spec = self._spec
         if spec and spec.name not in {"openai", "github_copilot"}:
             return False
@@ -395,6 +463,89 @@ class OpenAICompatProvider(LLMProvider):
         circuit_key = _responses_circuit_key(model, self.default_model, reasoning_effort)
         self._responses_failures.pop(circuit_key, None)
         self._responses_tripped_at.pop(circuit_key, None)
+
+    @staticmethod
+    def _input_item_status_index(fields: Any) -> int | None:
+        parameter = _get(fields, "param")
+        match = (
+            _INPUT_ITEM_STATUS_PARAM.fullmatch(parameter)
+            if _get(fields, "code") == "unknown_parameter" and isinstance(parameter, str)
+            else None
+        )
+        if match is None:
+            return None
+        index_text = match.group(1)
+        if len(index_text) > _MAX_INPUT_ITEM_INDEX_DIGITS:
+            return None
+        try:
+            item_index = int(index_text)
+        except ValueError:
+            return None
+        return item_index if item_index <= sys.maxsize else None
+
+    @classmethod
+    def _rejected_input_item_status_index(cls, exc: Exception) -> int | None:
+        if cls._status_code(exc) not in {400, 422}:
+            return None
+        for body in (getattr(exc, "body", None), getattr(exc, "doc", None)):
+            if not isinstance(body, dict):
+                continue
+            error = body.get("error")
+            fields: dict[str, Any] = error if isinstance(error, dict) else body
+            if (item_index := cls._input_item_status_index(fields)) is not None:
+                return item_index
+        return None
+
+    @staticmethod
+    def _responses_body_without_input_message_status(
+        body: dict[str, Any], item_index: int | None = None
+    ) -> dict[str, Any] | None:
+        input_items = body.get("input")
+        if not isinstance(input_items, list):
+            return None
+
+        if item_index is not None:
+            if item_index >= len(input_items):
+                return None
+            rejected_item = input_items[item_index]
+            if (
+                not isinstance(rejected_item, dict)
+                or rejected_item.get("type") != "message"
+                or "status" not in rejected_item
+            ):
+                return None
+
+        sanitized_items: list[Any] = []
+        has_status = False
+        for item in input_items:
+            if isinstance(item, dict) and item.get("type") == "message" and "status" in item:
+                sanitized_items.append(
+                    {key: value for key, value in item.items() if key != "status"}
+                )
+                has_status = True
+            else:
+                sanitized_items.append(item)
+        return {**body, "input": sanitized_items} if has_status else None
+
+    async def _create_responses_with_status_retry(
+        self,
+        body: dict[str, Any],
+    ) -> Any:
+        model_name = str(body.get("model") or self.default_model).strip().lower()
+        request_body = body
+        if model_name in self._responses_without_message_status_models:
+            request_body = self._responses_body_without_input_message_status(body) or body
+        try:
+            return await self._create_with_key_rotation(self._client.responses.create, request_body)
+        except Exception as exc:
+            item_index = self._rejected_input_item_status_index(exc)
+            if item_index is None:
+                raise
+            retry_body = self._responses_body_without_input_message_status(request_body, item_index)
+            if retry_body is None:
+                raise
+            self._responses_without_message_status_models.add(model_name)
+            return await self._create_with_key_rotation(self._client.responses.create, retry_body)
 
     @staticmethod
     def _should_fallback_from_responses_error(exc: Exception) -> bool:
@@ -458,7 +609,7 @@ class OpenAICompatProvider(LLMProvider):
             model_name = model_name.split("/")[-1]
 
         instructions, input_items = convert_messages(
-            self._sanitize_messages(self._sanitize_empty_content(messages))
+            self._sanitize_messages(self._sanitize_empty_content(messages), responses_api=True)
         )
         body: dict[str, Any] = {
             "model": model_name,
@@ -725,12 +876,14 @@ class OpenAICompatProvider(LLMProvider):
                     )
                     body.update(adapt_chat_kwargs_to_responses(extra_kwargs))
                     result = parse_response_output(
-                        await self._create_with_key_rotation(self._client.responses.create, body)
+                        await self._create_responses_with_status_retry(body)
                     )
                     self._record_responses_success(model, reasoning_effort)
                     return result
                 except Exception as responses_error:
                     if self._spec and self._spec.name == "github_copilot":
+                        raise
+                    if self._wire_api == "responses":
                         raise
                     if not self._should_fallback_from_responses_error(responses_error):
                         raise
@@ -818,9 +971,7 @@ class OpenAICompatProvider(LLMProvider):
                     )
                     body.update(adapt_chat_kwargs_to_responses(extra_kwargs))
                     body["stream"] = True
-                    stream = await self._create_with_key_rotation(
-                        self._client.responses.create, body
-                    )
+                    stream = await self._create_responses_with_status_retry(body)
 
                     async def _timed_stream():
                         stream_iter = stream.__aiter__()
@@ -854,6 +1005,8 @@ class OpenAICompatProvider(LLMProvider):
                     )
                 except Exception as responses_error:
                     if self._spec and self._spec.name == "github_copilot":
+                        raise
+                    if self._wire_api == "responses":
                         raise
                     if not self._should_fallback_from_responses_error(responses_error):
                         raise

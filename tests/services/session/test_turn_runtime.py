@@ -14,6 +14,7 @@ from deeptutor.services.session.turn_runtime import (
     _format_followup_question_context,
     _narration_marker_call_id,
     _should_capture_assistant_content,
+    _stamp_ask_user_content_offset,
 )
 
 # ---------------------------------------------------------------------------
@@ -129,6 +130,14 @@ class TestAssemblePersistedAnswer:
         ]
 
         assert _assemble_persisted_answer(segments, {"search-round"}) == "Answer."
+
+
+def test_ask_user_resolution_records_the_current_answer_boundary() -> None:
+    event = {"type": "progress", "metadata": {"ask_user_resolved": True}}
+
+    _stamp_ask_user_content_offset(event, "Visible teaching before the card.")
+
+    assert event["metadata"]["assistant_content_offset"] == 33
 
 
 # ---------------------------------------------------------------------------

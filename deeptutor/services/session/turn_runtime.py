@@ -111,6 +111,16 @@ def _assemble_persisted_answer(
     )
 
 
+def _stamp_ask_user_content_offset(
+    payload_event: dict[str, Any],
+    assistant_content: str,
+) -> None:
+    """Attach the replay boundary to a persisted ask_user resolution event."""
+    metadata = payload_event.get("metadata")
+    if isinstance(metadata, dict) and metadata.get("ask_user_resolved"):
+        metadata.setdefault("assistant_content_offset", len(assistant_content))
+
+
 def _clip_text(value: str, limit: int = 4000) -> str:
     text = str(value or "").strip()
     if len(text) <= limit:
@@ -1485,6 +1495,7 @@ class TurnRuntimeManager:
         attachment_records = []
         assistant_events: list[dict[str, Any]] = []
         assistant_content = ""
+        provider_response_state: dict[str, Any] | None = None
         # Per-round content segments + narration call_ids: a chat-loop round's
         # text is captured live but a round that resolves as narration is
         # dropped from the persisted answer (mirrors the frontend bubble).
@@ -2007,6 +2018,10 @@ class TurnRuntimeManager:
                     continue
                 payload_event = await self._publish_live_event(execution, event)
                 if payload_event.get("type") not in {"done", "session"}:
+                    # A card reply lives inside this assistant row. Persist
+                    # the exact user-facing answer boundary so future context
+                    # can replay assistant -> user -> assistant in order.
+                    _stamp_ask_user_content_offset(payload_event, _persisted_answer())
                     assistant_events.append(payload_event)
                 if _should_capture_assistant_content(event):
                     call_id = (event.metadata or {}).get("call_id")
@@ -2018,6 +2033,15 @@ class TurnRuntimeManager:
                     if attachment["url"] not in seen_artifact_urls:
                         seen_artifact_urls.add(attachment["url"])
                         generated_attachments.append(attachment)
+
+            provider_response_state = context.metadata.pop("_provider_response_state", None)
+            if not isinstance(provider_response_state, dict):
+                provider_response_state = None
+            assistant_provider_metadata = (
+                {"provider_response_state": provider_response_state}
+                if provider_response_state is not None
+                else None
+            )
 
             # A mastery turn may have changed which path it is on
             # (``mastery_switch`` / ``mastery_leave``). The conversation's
@@ -2055,6 +2079,7 @@ class TurnRuntimeManager:
                     events=assistant_events,
                     attachments=generated_attachments or None,
                     parent_message_id=new_user_message_id,
+                    metadata=assistant_provider_metadata,
                 )
             elif branch_parent_explicit:
                 assistant_message_id = await self.store.add_message(
@@ -2065,6 +2090,7 @@ class TurnRuntimeManager:
                     events=assistant_events,
                     attachments=generated_attachments or None,
                     parent_message_id=branch_parent_id,
+                    metadata=assistant_provider_metadata,
                 )
             else:
                 assistant_message_id = await self.store.add_message(
@@ -2074,6 +2100,7 @@ class TurnRuntimeManager:
                     capability=capability_name,
                     events=assistant_events,
                     attachments=generated_attachments or None,
+                    metadata=assistant_provider_metadata,
                 )
             turn_status, turn_error = _resolve_turn_outcome(
                 assistant_events,
@@ -2174,6 +2201,11 @@ class TurnRuntimeManager:
                             capability=capability_name,
                             events=assistant_events,
                             attachments=generated_attachments or None,
+                            metadata=(
+                                {"provider_response_state": provider_response_state}
+                                if provider_response_state is not None
+                                else None
+                            ),
                         )
                     )
             with contextlib.suppress(Exception):

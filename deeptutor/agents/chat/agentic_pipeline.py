@@ -275,6 +275,7 @@ class AgenticChatPipeline:
             extra_headers=self.extra_headers or None,
             reasoning_effort=self.reasoning_effort,
             source=getattr(self.llm_config, "source", "platform"),
+            wire_api=getattr(self.llm_config, "wire_api", None) or "auto",
         )
 
     @property
@@ -410,7 +411,10 @@ class AgenticChatPipeline:
             role = item.get("role")
             content = item.get("content")
             if role in {"user", "assistant"} and isinstance(content, (str, list)):
-                messages.append({"role": role, "content": content})
+                message: dict[str, Any] = {"role": role, "content": content}
+                if role == "assistant" and isinstance(item.get("_provider_response_state"), dict):
+                    message["_provider_response_state"] = item["_provider_response_state"]
+                messages.append(message)
             elif role == "system" and isinstance(content, str) and content.strip():
                 # ContextBuilder emits the compressed-history summary as a
                 # leading system message; deliver it right after the system

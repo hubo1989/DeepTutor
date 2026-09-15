@@ -26,7 +26,7 @@ from deeptutor.core.agentic.tool_dispatch import dispatch_tool_calls
 from deeptutor.core.context import UnifiedContext
 from deeptutor.core.stream import StreamEvent, StreamEventType
 from deeptutor.core.stream_bus import StreamBus
-from deeptutor.core.tool_protocol import ToolResult
+from deeptutor.core.tool_protocol import ToolDefinition, ToolParameter, ToolResult
 from deeptutor.core.trace import derive_trace_metadata
 from deeptutor.runtime.registry.tool_registry import ToolRegistry
 from deeptutor.services.sandbox import Mount
@@ -35,6 +35,53 @@ from deeptutor.services.sandbox import Mount
 class _Registry:
     async def execute(self, name: str, **kwargs: Any) -> ToolResult:
         return ToolResult(content="ok", success=True)
+
+
+class _SlowRegistry:
+    async def execute(self, name: str, **kwargs: Any) -> ToolResult:
+        await asyncio.sleep(0.05)
+        return ToolResult(content="too late", success=True)
+
+
+class _FlakyConnectionRegistry:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def execute(self, name: str, **kwargs: Any) -> ToolResult:
+        self.calls += 1
+        if self.calls == 1:
+            raise ConnectionError("provider offline")
+        return ToolResult(content="recovered", success=True)
+
+
+class _PausingRegistry:
+    async def execute(self, name: str, **kwargs: Any) -> ToolResult:
+        assert name == "ask_user"
+        await asyncio.sleep(0.02)
+        return ToolResult(content="user card", success=True)
+
+
+class _SensitiveArgRegistry(_Registry):
+    """A tool whose schema marks one argument as not-for-display."""
+
+    class _Tool:
+        def get_definition(self) -> ToolDefinition:
+            return ToolDefinition(
+                name="quiz",
+                description="Pose a question",
+                parameters=[
+                    ToolParameter(name="question", type="string", description="prompt"),
+                    ToolParameter(
+                        name="expected_answer",
+                        type="string",
+                        description="answer key",
+                        sensitive=True,
+                    ),
+                ],
+            )
+
+    def get(self, name: str) -> Any:
+        return self._Tool() if name == "quiz" else None
 
 
 class _RaisingRegistry:
@@ -87,6 +134,8 @@ async def _run_dispatch(
     registry: Any,
     kwarg_augmenter: Any = None,
     retrieve_meta_factory: Any = None,
+    tool_timeout: float | None = None,
+    tool_max_retries: int = 0,
 ) -> list[StreamEvent]:
     """Dispatch through a real StreamBus and return everything it emitted."""
     bus = StreamBus()
@@ -109,6 +158,8 @@ async def _run_dispatch(
         registry=registry,
         kwarg_augmenter=kwarg_augmenter,
         retrieve_meta_factory=retrieve_meta_factory,
+        tool_timeout=tool_timeout,
+        tool_max_retries=tool_max_retries,
     )
     await bus.close()
     await consumer
@@ -133,6 +184,48 @@ def _call_states(events: list[StreamEvent], call_id: str | None = None) -> list[
 
 def _call_id_of(event: StreamEvent) -> str:
     return str((event.metadata or {}).get("call_id") or "")
+
+
+@pytest.mark.asyncio
+async def test_tool_timeout_returns_actionable_error() -> None:
+    events = await _run_dispatch(
+        [{"id": "c1", "name": "web_search", "arguments": '{"query": "x"}'}],
+        registry=_SlowRegistry(),
+        tool_timeout=0.01,
+        tool_max_retries=0,
+    )
+
+    status_events = _status_events(events)
+    assert status_events
+    assert _call_states(events) == ["running", "error"]
+    assert "web_search timed out after" in str(status_events[-1].metadata.get("error"))
+
+
+@pytest.mark.asyncio
+async def test_transient_connection_error_is_retried() -> None:
+    registry = _FlakyConnectionRegistry()
+
+    events = await _run_dispatch(
+        [{"id": "c1", "name": "web_search", "arguments": '{"query": "x"}'}],
+        registry=registry,
+        tool_timeout=1,
+        tool_max_retries=1,
+    )
+
+    assert registry.calls == 2
+    assert _call_states(events) == ["running", "complete"]
+
+
+@pytest.mark.asyncio
+async def test_pause_tool_waits_beyond_tool_timeout() -> None:
+    events = await _run_dispatch(
+        [{"id": "c1", "name": "ask_user", "arguments": '{"question": "continue?"}'}],
+        registry=_PausingRegistry(),
+        tool_timeout=0.001,
+        tool_max_retries=0,
+    )
+
+    assert _call_states(events) == ["running", "complete"]
 
 
 @pytest.mark.asyncio

@@ -68,6 +68,7 @@ from deeptutor.core.agentic import (
     run_agentic_loop,
     run_labeled_step,
 )
+from deeptutor.core.agentic.messages import assistant_message
 from deeptutor.core.agentic.tool_dispatch import (
     MAX_PARALLEL_TOOL_CALLS,
 )
@@ -380,6 +381,31 @@ class ResearchPipeline:
             key="max_iterations",
             default=DEFAULT_BLOCK_MAX_ITERATIONS,
         )
+        # A ceiling on a stalled provider, not a service-level objective. A
+        # research tool is not quick by nature: one ``rag`` call against a
+        # LightRAG or GraphRAG index makes its own LLM calls before it returns
+        # anything, and a search-then-fetch chain waits on someone else's site.
+        # 60s would have cancelled work that was going to succeed, and each
+        # retry then pays the full timeout again. 240s matches the ceiling
+        # ``geogebra_analysis`` uses for the same reason, and retries are off by
+        # default: only a caller who knows its tools are flaky (rather than
+        # slow) should pay for a second attempt.
+        self.tool_timeout = max(
+            1,
+            _read_int(
+                researching,
+                key="tool_timeout",
+                default=240,
+            ),
+        )
+        self.tool_max_retries = max(
+            0,
+            _read_int(
+                researching,
+                key="tool_max_retries",
+                default=0,
+            ),
+        )
         self.max_parallel_topics = max(
             1,
             _read_int(
@@ -421,6 +447,7 @@ class ResearchPipeline:
             extra_headers=self.extra_headers or None,
             reasoning_effort=self.reasoning_effort,
             source=getattr(self.llm_config, "source", "platform"),
+            wire_api=getattr(self.llm_config, "wire_api", None) or "auto",
         )
 
         self.registry = get_tool_registry()
@@ -978,7 +1005,13 @@ class ResearchPipeline:
             calls += 1
             if result.label == LABEL_FINISH and result.text.strip():
                 return result.text, True, calls
-            messages.append({"role": "assistant", "content": result.text[:500]})
+            messages.append(
+                assistant_message(
+                    result.text[:500],
+                    reasoning_content=result.reasoning_content or None,
+                    thinking_blocks=list(result.thinking_blocks) or None,
+                )
+            )
             messages.append({"role": "user", "content": self._t("protocol.force_finish_repair")})
         return self._t("protocol.fallback_final"), False, calls
 
@@ -2436,6 +2469,8 @@ class _BlockLoopHost:
                 default=f"Error executing {tn}.",
             ),
             trace_id_prefix=f"research-{self._block.block_id}-iter",
+            tool_timeout=self._pipeline.tool_timeout,
+            tool_max_retries=self._pipeline.tool_max_retries,
         )
         pageindex_sources = [
             source for source in outcome.sources if source.get("type") == "pageindex"

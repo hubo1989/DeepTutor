@@ -65,6 +65,46 @@ def test_runtime_settings_creates_defaults_without_reading_dotenv(tmp_path: Path
     assert _read_json(service.path_for("auth"))["enabled"] is False
 
 
+def test_capability_routing_defaults_to_disabled(tmp_path) -> None:
+    service = RuntimeSettingsService(tmp_path / "settings")
+
+    assert service.load_system()["capability_routing_enabled"] is False
+
+
+def test_web_search_source_filter_defaults_to_safe_runtime_json(tmp_path) -> None:
+    service = RuntimeSettingsService(tmp_path / "settings")
+
+    assert service.load_system()["web_search_source_filtering"] == {
+        "enabled": True,
+        "blocked_domains": [],
+        "trusted_domains": [],
+        "content_filtering": True,
+        "use_educational_trusted_domains": False,
+        "use_moderation": False,
+    }
+
+    service.save_system(
+        {
+            "web_search_source_filtering": {
+                "enabled": True,
+                "blocked_domains": ["unsafe.example"],
+                "trusted_domains": [],
+                "content_filtering": False,
+                "use_educational_trusted_domains": True,
+                "use_moderation": True,
+            }
+        }
+    )
+    assert service.load_system()["web_search_source_filtering"] == {
+        "enabled": True,
+        "blocked_domains": ["unsafe.example"],
+        "trusted_domains": [],
+        "content_filtering": False,
+        "use_educational_trusted_domains": True,
+        "use_moderation": True,
+    }
+
+
 def test_runtime_process_env_is_explicit_override(tmp_path: Path) -> None:
     service = RuntimeSettingsService(
         tmp_path / "settings",

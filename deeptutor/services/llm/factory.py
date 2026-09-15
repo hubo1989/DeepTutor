@@ -205,6 +205,7 @@ def _resolve_call_config(
             provider_mode=provider_mode,
             api_version=api_version,
             extra_headers=merged_headers,
+            wire_api=current.wire_api if current is not None else "auto",
             reasoning_effort=resolved_reasoning_effort,
             source=(
                 "byok"
@@ -249,6 +250,7 @@ def _resolve_call_config(
             "provider_mode": provider_mode,
             "api_version": resolved_api_version,
             "extra_headers": merged_headers,
+            "wire_api": current.wire_api,
             "reasoning_effort": (
                 reasoning_effort if reasoning_effort is not None else current.reasoning_effort
             ),
@@ -805,9 +807,12 @@ async def stream(
                 in_think_block = False
                 await queue.put("</think>")
             # Some providers synthesize a final response only after the stream.
-            # Do not replay reasoning_content as user-visible answer text.
+            # Do not replay reasoning_content as user-visible answer text, and
+            # never surface an error-shaped response's operator message as if
+            # the model had written it: that case is raised below instead.
             if (
-                not saw_content
+                response.finish_reason != "error"
+                and not saw_content
                 and response.content
                 and response.content != response.reasoning_content
             ):

@@ -19,7 +19,7 @@ from __future__ import annotations
 import pytest
 
 from deeptutor.services.llm.provider_core.openai_compat_provider import OpenAICompatProvider
-from deeptutor.services.provider_registry import find_by_name, model_overrides_for
+from deeptutor.services.provider_registry import find_by_model, find_by_name, model_overrides_for
 
 _MOONSHOT_BASE = "https://api.moonshot.cn/v1"
 
@@ -83,3 +83,24 @@ def test_vendor_prefixed_routing_still_finds_the_model() -> None:
     assert model_overrides_for("moonshotai/kimi-k2", find_by_name("openai")) == {
         "temperature": None
     }
+
+
+def test_the_k3_family_covers_its_variants_without_capturing_short_ids() -> None:
+    """One family name, not one rule per released id.
+
+    ``k3-256k`` was added to the Kimi coding endpoint after ``k3`` and got
+    HTTP 400 on every call (#1227), because the rule named the one id that
+    existed when it was written. A sibling that ships tomorrow is covered
+    here; an unrelated short id still is not.
+    """
+    moonshot = find_by_name("moonshot")
+    assert model_overrides_for("k3", moonshot) == {"temperature": None}
+    assert model_overrides_for("k3-256k", moonshot) == {"temperature": None}
+    assert model_overrides_for("k3-1m", moonshot) == {"temperature": None}
+    assert model_overrides_for("sk3", moonshot) == {}
+    assert model_overrides_for("k30", moonshot) == {}
+    assert model_overrides_for("k3x", moonshot) == {}
+    assert find_by_model("k3") is moonshot
+    assert find_by_model("k3-256k") is moonshot
+    assert find_by_model("k3-1m") is moonshot
+    assert find_by_model("sk3") is None
