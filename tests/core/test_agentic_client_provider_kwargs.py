@@ -181,7 +181,7 @@ def test_build_openai_client_routes_oauth_backend_through_adapter(monkeypatch) -
 
 
 @pytest.mark.asyncio
-async def test_build_openai_client_rotates_api_keys_after_429(monkeypatch) -> None:
+async def test_build_openai_client_tries_every_api_key_after_429(monkeypatch) -> None:
     await agentic_client.close_agentic_client_pool()
     seen_keys: list[str] = []
 
@@ -194,7 +194,7 @@ async def test_build_openai_client_rotates_api_keys_after_429(monkeypatch) -> No
 
         async def create(self, **_kwargs):
             seen_keys.append(self.api_key)
-            if self.api_key == "key-a":
+            if self.api_key != "key-c":
                 raise RateLimitError("rate limited")
             return "ok"
 
@@ -213,7 +213,7 @@ async def test_build_openai_client_rotates_api_keys_after_429(monkeypatch) -> No
         LLMClientConfig(
             binding="openai",
             model="gpt-test",
-            api_key=["key-a", "key-b"],
+            api_key=["key-a", "key-b", "key-c"],
             base_url="https://example.test/v1",
         )
     )
@@ -221,7 +221,7 @@ async def test_build_openai_client_rotates_api_keys_after_429(monkeypatch) -> No
     result = await client.chat.completions.create(model="gpt-test", messages=[])
 
     assert result == "ok"
-    assert seen_keys == ["key-a", "key-b"]
+    assert seen_keys == ["key-a", "key-b", "key-c"]
     await agentic_client.close_agentic_client_pool()
 
 
