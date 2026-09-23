@@ -623,6 +623,11 @@ class OpenAICompatProvider(LLMProvider):
 
         if self._supports_temperature(model_name, reasoning_effort):
             body["temperature"] = temperature
+        for key, value in model_overrides_for(model_name, self._spec).items():
+            if value is None:
+                body.pop(key, None)
+            else:
+                body[key] = value
         if reasoning_effort and reasoning_effort.lower() != "none":
             body["reasoning"] = {"effort": reasoning_effort}
             body["include"] = ["reasoning.encrypted_content"]
