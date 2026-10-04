@@ -129,7 +129,23 @@ export function reasoningEffortOptions(
       : options([], current);
   }
 
-  if (BINARY_THINKING_PROVIDERS.has(provider) || provider === "custom") {
+  if (
+    (OPENAI_PROVIDERS.has(provider) || provider === "custom" || provider === "zhipu") &&
+    (modelName === "glm-5.3" || modelName.endsWith("/glm-5.3"))
+  ) {
+    // GLM-5.3 always thinks; older GLM families have different controls.
+    // https://docs.bigmodel.cn/cn/guide/models/text/glm-5.3
+    return options(["low", "high", "max"], current);
+  }
+
+  if (provider === "custom") {
+    // A user-supplied OpenAI-compatible endpoint may route to any upstream
+    // model, so expose the common cross-gateway levels and let Auto handle
+    // providers without an explicit control.
+    return options(["none", "low", "medium", "high"], current);
+  }
+
+  if (BINARY_THINKING_PROVIDERS.has(provider)) {
     const supported =
       provider === "minimax" ||
       includesAny(modelName, [
@@ -159,12 +175,6 @@ export function reasoningEffortOptions(
     }
     if (includesAny(modelName, ["o1", "o3", "o4"])) {
       return options(["low", "medium", "high"], current);
-    }
-    if (includesAny(modelName, ["glm"])) {
-      // Zhipu GLM (open.bigmodel.cn coding endpoint) accepts the four levels;
-      // `none` means "omit the parameter", which for GLM turns server-side
-      // thinking fully on, so it stays off the menu.
-      return options(["minimal", "low", "medium", "high"], current);
     }
     return options([], current);
   }
