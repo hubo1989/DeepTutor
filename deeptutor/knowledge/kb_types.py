@@ -143,7 +143,6 @@ def external_root_of(entry: Any) -> str | None:
     return entry.get("external_path") or entry.get("vault_path")
 
 
-
 __all__ = [
     "OBSIDIAN_KB_TYPE",
     "LINKED_KB_TYPE",

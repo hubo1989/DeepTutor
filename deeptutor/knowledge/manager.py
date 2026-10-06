@@ -1540,7 +1540,6 @@ class KnowledgeBaseManager:
         if name not in config_kbs and not (self.base_dir / name).exists():
             raise ValueError(f"Knowledge base not found: {name}")
 
-
         # Resolve the directory directly to stay idempotent: if the on-disk
         # folder was already removed (e.g. manually rm-rf'd) we still want to
         # purge the orphaned entry from kb_config.json instead of failing.
@@ -1716,7 +1715,6 @@ class KnowledgeBaseManager:
         if kb_name not in self.list_knowledge_bases():
             raise ValueError(f"Knowledge base not found: {kb_name}")
 
-
         # Normalize path (cross-platform: handles ~, relative paths, etc.)
         folder = Path(folder_path).expanduser().resolve()
 
@@ -1810,7 +1808,6 @@ class KnowledgeBaseManager:
         if kb_name not in self.list_knowledge_bases():
             raise ValueError(f"Knowledge base not found: {kb_name}")
 
-
         kb_dir = self.base_dir / kb_name
         metadata_file = kb_dir / "metadata.json"
 
@@ -1875,7 +1872,6 @@ class KnowledgeBaseManager:
         if kb_name not in self.list_knowledge_bases():
             raise ValueError(f"Knowledge base not found: {kb_name}")
 
-
         # Get folder info
         folders = self.get_linked_folders(kb_name)
         folder_info = next((f for f in folders if f["id"] == folder_id), None)
@@ -1937,7 +1933,6 @@ class KnowledgeBaseManager:
         """
         if kb_name not in self.list_knowledge_bases():
             raise ValueError(f"Knowledge base not found: {kb_name}")
-
 
         kb_dir = self.base_dir / kb_name
         metadata_file = kb_dir / "metadata.json"

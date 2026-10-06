@@ -572,6 +572,7 @@ app.include_router(unified_ws.router, prefix="/api/v1", tags=["unified-ws"])
 # inside the handler so the WS upgrade isn't rejected by an HTTP-style dep.
 app.include_router(quiz_judge.router, prefix="/api/v1", tags=["quiz-judge"])
 
+
 @app.get("/")
 async def root():
     return {"message": "Welcome to LearnLeader API"}
