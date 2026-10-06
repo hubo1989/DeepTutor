@@ -31,7 +31,7 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
-from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import FileResponse, PlainTextResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from deeptutor.api.routers.auth import require_admin
@@ -1263,17 +1263,27 @@ async def run_upload_processing_task(
 
 @router.get("/health")
 async def health_check():
-    """Health check endpoint"""
+    """Count registered KBs without constructing/probing the catalog (#1711)."""
+    return await asyncio.to_thread(_knowledge_health)
+
+
+def _knowledge_health():
     try:
-        manager = get_kb_manager()
-        config_exists = manager.config_file.exists()
-        kb_count = len(manager.list_knowledge_bases())
+        base_dir = current_kb_base_dir()
+        config_file = base_dir / "kb_config.json"
+        config_exists = config_file.exists()
+        config = (
+            json.loads(config_file.read_text(encoding="utf-8").strip() or "{}")
+            if config_exists
+            else {}
+        )
+        kb_count = len(config.get("knowledge_bases", {}))
         return {
             "status": "ok",
-            "config_file": str(manager.config_file),
+            "config_file": str(config_file),
             "config_exists": config_exists,
-            "base_dir": str(manager.base_dir),
-            "base_dir_exists": manager.base_dir.exists(),
+            "base_dir": str(base_dir),
+            "base_dir_exists": base_dir.exists(),
             "knowledge_bases_count": kb_count,
         }
     except Exception as e:
@@ -1453,6 +1463,7 @@ class LlamaIndexConfigUpdate(BaseModel):
     chunk_size: int | None = None
     chunk_overlap: int | None = None
     image_description_concurrency: int | None = None
+    image_description_batch_size: int | None = None
     image_description_timeout_seconds: int | None = None
 
 
@@ -2281,6 +2292,11 @@ async def connect_ima_route(
 
 @router.get("/list", response_model=list[KnowledgeBaseInfo])
 async def list_knowledge_bases():
+    """Disk probes must not block the async worker or its other requests (#1711)."""
+    return await asyncio.to_thread(_list_knowledge_bases)
+
+
+def _list_knowledge_bases():
     """List all available knowledge bases with their details."""
     try:
         manager = get_kb_manager()
@@ -2675,6 +2691,28 @@ async def serve_kb_raw_file(kb_name: str, filename: str):
         media_type=media_type or "application/octet-stream",
         filename=target.name,
         content_disposition_type="inline",
+    )
+
+
+@router.get("/{kb_name}/visual-assets/{asset_id}")
+async def serve_kb_visual_asset(kb_name: str, asset_id: str):
+    """Serve a verified source image from an access-checked local KB."""
+    from deeptutor.services.rag.visual_assets import VisualAssetStore
+
+    raw_dir = _resolve_kb_raw_dir(kb_name)
+    if raw_dir is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Connected knowledge bases have no local visual assets.",
+        )
+    loaded = VisualAssetStore(raw_dir.parent).read(asset_id)
+    if loaded is None:
+        raise HTTPException(status_code=404, detail="Visual asset not found")
+    record, data = loaded
+    return Response(
+        content=data,
+        media_type=record["mime_type"],
+        headers={"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"},
     )
 
 

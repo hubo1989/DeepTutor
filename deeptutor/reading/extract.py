@@ -34,6 +34,13 @@ from pathlib import Path
 import re
 
 from deeptutor.reading.models import OutlineEntry, ReadingError, UnitKind
+from deeptutor.utils.document_images import (
+    EmbeddedImage,
+    build_marker,
+    extract_pdf_images,
+    find_markers,
+    reading_image_budget,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -68,10 +75,42 @@ class Extraction:
     # Otherwise the outline is synthesised later from unit first lines, so that
     # a material without bookmarks is still navigable by meaning.
     outline: tuple[OutlineEntry, ...] = field(default_factory=tuple)
+    # Locator-pinned embedded pictures. PDF ingestion is best effort: image
+    # extraction failure never fails a readable document.
+    media: tuple[MediaItem, ...] = field(default_factory=tuple)
 
     @property
     def char_count(self) -> int:
         return sum(len(u) for u in self.units)
+
+
+@dataclass(frozen=True, slots=True)
+class MediaItem:
+    """One embedded image pinned to the locator whose text references it."""
+
+    name: str
+    mime_type: str
+    data: bytes
+    locator: int
+
+
+def _media_for_units(
+    units: tuple[str, ...], images: tuple[EmbeddedImage, ...]
+) -> tuple[MediaItem, ...]:
+    """Map image markers in unit texts back to locator-pinned bytes."""
+    by_name = {image.name: image for image in images}
+    items: list[MediaItem] = []
+    seen: set[tuple[int, str]] = set()
+    for locator, unit in enumerate(units, start=1):
+        for _, name in find_markers(unit):
+            image = by_name.get(name)
+            if image is None or (locator, name) in seen:
+                continue
+            seen.add((locator, name))
+            items.append(
+                MediaItem(name=name, mime_type=image.mime_type, data=image.data, locator=locator)
+            )
+    return tuple(items)
 
 
 def extract_material(path: str | Path) -> Extraction:
@@ -124,6 +163,8 @@ def _extract_pdf(source: Path) -> Extraction:
     except Exception as exc:
         raise ReadingError(f"{source.name}: failed to read PDF ({exc})") from exc
 
+    units, media = _pdf_media_for_units(units, source)
+
     return Extraction(
         units=units,
         unit="page",
@@ -131,7 +172,31 @@ def _extract_pdf(source: Path) -> Extraction:
         has_raw_view=True,
         title=title,
         outline=outline,
+        media=media,
     )
+
+
+def _pdf_media_for_units(
+    units: tuple[str, ...], source: Path
+) -> tuple[tuple[str, ...], tuple[MediaItem, ...]]:
+    """Append figure markers to page tails and return the matching media."""
+    try:
+        pdf_images = extract_pdf_images(source.read_bytes(), budget=reading_image_budget())
+    except Exception:
+        logger.warning("%s: PDF image extraction failed", source.name, exc_info=True)
+        return units, ()
+    if not pdf_images.collection.images:
+        return units, ()
+    marker_by_page: dict[int, list[str]] = {}
+    for page_number, indices in pdf_images.page_map:
+        marker_by_page[page_number] = [
+            build_marker(pdf_images.collection.images[index]) for index in indices
+        ]
+    targeted = tuple(
+        unit + ("\n" + "\n".join(marker_by_page[i]) if i in marker_by_page else "")
+        for i, unit in enumerate(units, 1)
+    )
+    return targeted, _media_for_units(targeted, pdf_images.collection.images)
 
 
 def _pdf_outline(doc: object, *, page_count: int) -> tuple[OutlineEntry, ...]:

@@ -172,6 +172,8 @@ class MaterialManifest:
     # (today: PDF). Other formats read from extracted text, so the reader shows
     # its text view and the export falls back to a Markdown excerpt.
     has_raw_view: bool = False
+    # Embedded images stored under media/ and indexed by media.json.
+    media_count: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -187,6 +189,7 @@ class MaterialManifest:
             "char_count": self.char_count,
             "created_at": self.created_at,
             "has_raw_view": self.has_raw_view,
+            "media_count": self.media_count,
         }
 
     @classmethod
@@ -205,6 +208,7 @@ class MaterialManifest:
             char_count=int(data.get("char_count") or 0),
             created_at=float(data.get("created_at") or 0.0),
             has_raw_view=bool(data.get("has_raw_view")),
+            media_count=max(0, int(data.get("media_count") or 0)),
         )
 
 
