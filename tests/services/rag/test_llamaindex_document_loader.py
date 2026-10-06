@@ -295,11 +295,13 @@ def test_loader_embeds_images_with_qwen38_max_vision_capability(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     pytest.importorskip("llama_index.core")
+    from types import SimpleNamespace
+
     from llama_index.core.schema import ImageNode
 
+    from deeptutor.services.llm import image_caption_cache
     from deeptutor.services.llm.client import LLMClient
     from deeptutor.services.llm.config import LLMConfig
-    from deeptutor.services.llm import image_caption_cache
     from deeptutor.services.rag.pipelines.llamaindex import document_loader as loader_module
 
     image_path = tmp_path / "photo.png"
