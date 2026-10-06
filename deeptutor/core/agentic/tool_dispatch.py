@@ -84,6 +84,8 @@ class DispatchOutcome:
     pause: bool = False
     pause_payload: dict[str, Any] | None = None
     pause_tool_call_id: str | None = None
+    # Request-only messages anchored to their tool-call IDs.
+    model_messages: list[dict[str, Any]] = field(default_factory=list)
 
 
 async def dispatch_tool_calls(
@@ -646,6 +648,7 @@ async def execute_tool_call(
             "metadata": result.metadata,
             "terminate_turn": getattr(result, "terminate_turn", False),
             "pause_for_user": getattr(result, "pause_for_user", None),
+            "model_message": getattr(result, "model_message", None),
         }
     except Exception as exc:
         # Unknown tool names arrive here too (the registry raises KeyError), so
@@ -689,6 +692,7 @@ async def execute_tool_call(
             "metadata": {"error": str(exc)},
             "terminate_turn": False,
             "pause_for_user": None,
+            "model_message": None,
         }
 
 
@@ -717,6 +721,7 @@ async def _collect_outcome(
     pause = False
     pause_payload: dict[str, Any] | None = None
     pause_tool_call_id: str | None = None
+    model_messages: list[dict[str, Any]] = []
     suppress_ui_indices = suppress_ui_indices or set()
     for tool_index, ((tool_call_id, tool_name, _exec_args), result) in enumerate(
         zip(prepared, results, strict=False)
@@ -749,6 +754,14 @@ async def _collect_outcome(
         )
         if isinstance(tool_extra_meta, dict) and tool_extra_meta:
             tool_metadata_by_id[tool_call_id] = dict(tool_extra_meta)
+        model_message = result.get("model_message")
+        if isinstance(model_message, dict):
+            model_messages.append(
+                {
+                    **model_message,
+                    "_after_tool_call_id": tool_call_id,
+                }
+            )
         if result.get("terminate_turn") and not terminate:
             terminate = True
             terminate_payload = {
@@ -774,4 +787,5 @@ async def _collect_outcome(
         pause=pause,
         pause_payload=pause_payload,
         pause_tool_call_id=pause_tool_call_id,
+        model_messages=model_messages,
     )

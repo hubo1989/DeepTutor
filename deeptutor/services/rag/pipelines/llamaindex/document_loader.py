@@ -23,8 +23,12 @@ from llama_index.core import Document
 from llama_index.core.schema import ImageNode
 
 from deeptutor.services.embedding import get_embedding_client
-from deeptutor.services.llm.client import get_llm_client
+from deeptutor.services.llm.image_description import get_image_description_client
 from deeptutor.services.rag.file_routing import FileTypeRouter
+from deeptutor.services.rag.visual_assets import (
+    VisualAssetCandidate,
+    collect_visual_assets,
+)
 from deeptutor.utils.document_validator import DocumentValidator
 
 from .config import image_description_limits
@@ -54,6 +58,7 @@ class _ImageSource:
 
     path: Path
     origin: Path
+    visual: dict[str, Any] | None = None
 
 
 class LlamaIndexDocumentLoader:
@@ -67,6 +72,8 @@ class LlamaIndexDocumentLoader:
         self,
         file_paths: Iterable[str],
         image_progress_callback: Callable[[int, int], None] | None = None,
+        kb_dir: Path | None = None,
+        visual_candidates: list[VisualAssetCandidate] | None = None,
     ) -> list[Any]:
         documents: list[Any] = []
         image_sources: list[_ImageSource] = []
@@ -79,9 +86,12 @@ class LlamaIndexDocumentLoader:
             # archive download) on a synchronous httpx.Client — running it on
             # the event loop stalls every other request for the whole PDF
             # (same class of bug as upstream #761/#777). Hand it to a thread.
+            parsed_sink: list[Any] = []
             text, extracted_images, page_texts, page_image_paths = await asyncio.to_thread(
-                self._parse_document, file_path
+                self._parse_document, file_path, parsed_sink=parsed_sink
             )
+            if kb_dir is not None and visual_candidates is not None and parsed_sink:
+                visual_candidates.extend(collect_visual_assets(parsed_sink[-1], file_path, kb_dir))
             if page_texts:
                 for page_label, page_text in page_texts:
                     self._append_if_nonempty(
@@ -104,6 +114,9 @@ class LlamaIndexDocumentLoader:
                     },
                 )
             image_sources.extend(extracted_images)
+            self._attach_visual_page_metadata(documents, visual_candidates)
+            self._attach_visual_records(extracted_images, visual_candidates)
+            self._append_visual_documents(documents, extracted_images, visual_candidates)
 
         for file_path_str in classification.text_files:
             file_path = Path(file_path_str)
@@ -115,10 +128,10 @@ class LlamaIndexDocumentLoader:
             path = Path(file_path_str)
             image_sources.append(_ImageSource(path=path, origin=path))
 
-        if image_sources:
+        if legacy_image_sources := [source for source in image_sources if source.visual is None]:
             documents.extend(
                 await self._load_image_nodes(
-                    image_sources, image_progress_callback=image_progress_callback
+                    legacy_image_sources, image_progress_callback=image_progress_callback
                 )
             )
 
@@ -128,7 +141,10 @@ class LlamaIndexDocumentLoader:
         return documents
 
     def _parse_document(
-        self, file_path: Path
+        self,
+        file_path: Path,
+        *,
+        parsed_sink: list[Any] | None = None,
     ) -> tuple[str, list[_ImageSource], list[tuple[str, str]], dict[str, list[str]]]:
         """Parse a document through the shared, engine-pluggable parse layer.
 
@@ -150,6 +166,8 @@ class LlamaIndexDocumentLoader:
                 f"not handle it ({exc}). Change the engine in Settings → Document Parsing."
             )
             return "", [], [], {}
+        if parsed_sink is not None:
+            parsed_sink.append(parsed)
 
         text = parsed.markdown.strip() or self._text_from_blocks(parsed.blocks)
         page_texts = self._page_texts_from_blocks(parsed.blocks)
@@ -356,7 +374,7 @@ class LlamaIndexDocumentLoader:
         # keeps text-only embedding setups independent of LLM configuration and
         # reuses one client for the whole image batch.
         try:
-            llm_client = get_llm_client()
+            llm_client = get_image_description_client()
         except Exception as exc:
             self._log_skipped_images(sources, f"LLM client is unavailable ({exc})")
             return []
@@ -476,6 +494,106 @@ class LlamaIndexDocumentLoader:
             self.logger.info(f"Loaded image: {source.path.name} ({len(embedding)}D vector)")
         return nodes
 
+    @staticmethod
+    def _attach_visual_page_metadata(
+        documents: list[Any], candidates: list[VisualAssetCandidate] | None
+    ) -> None:
+        """Let a retrieved page document carry the figure provenance it contains."""
+        if not candidates:
+            return
+        by_page: dict[tuple[str, int], VisualAssetCandidate] = {}
+        for candidate in candidates:
+            record = candidate.record
+            page = record.get("page_number")
+            source_path = str(record.get("source_path") or "")
+            if isinstance(page, int):
+                by_page.setdefault((source_path, page), candidate)
+        for document in documents:
+            metadata = getattr(document, "metadata", None)
+            if not isinstance(metadata, dict) or metadata.get("visual_asset_id"):
+                continue
+            source_path = str(Path(str(metadata.get("file_path") or "")).name)
+            try:
+                page = int(metadata.get("page_label") or metadata.get("page") or 0)
+            except (TypeError, ValueError):
+                continue
+            candidate = by_page.get((source_path, page))
+            if not candidate:
+                continue
+            record = candidate.record
+            metadata.update(
+                {
+                    "visual_asset_id": record["asset_id"],
+                    "source_document_id": record.get("source_document_id", ""),
+                    "caption": record.get("caption", ""),
+                    "page": page,
+                    **({"bbox": record["bbox"]} if record.get("bbox") else {}),
+                    **(
+                        {"source_locator": record["source_locator"]}
+                        if record.get("source_locator")
+                        else {}
+                    ),
+                }
+            )
+
+    @staticmethod
+    def _attach_visual_records(
+        sources: list[_ImageSource],
+        candidates: list[VisualAssetCandidate] | None,
+    ) -> None:
+        if not candidates:
+            return
+        by_path = {candidate.path.resolve(): candidate.record for candidate in candidates}
+        for index, source in enumerate(sources):
+            record = by_path.get(source.path.resolve())
+            if record:
+                sources[index] = _ImageSource(path=source.path, origin=source.origin, visual=record)
+
+    @staticmethod
+    def _append_visual_documents(
+        documents: list[Any],
+        sources: list[_ImageSource],
+        candidates: list[VisualAssetCandidate] | None,
+    ) -> None:
+        if not candidates:
+            return
+        by_path = {candidate.path.resolve(): candidate.record for candidate in candidates}
+        seen: set[str] = set()
+        for source in sources:
+            record = by_path.get(source.path.resolve())
+            if not record or record["asset_id"] in seen:
+                continue
+            seen.add(record["asset_id"])
+            caption = str(record.get("caption") or "Source figure")
+            context = str(record.get("context") or "")
+            documents.append(
+                Document(
+                    text="\n\n".join(part for part in (caption, context) if part),
+                    metadata={
+                        "file_name": source.origin.name,
+                        "file_path": str(source.origin),
+                        "content_type": "source_visual",
+                        "visual_asset_id": record["asset_id"],
+                        "source_document_id": record.get("source_document_id", ""),
+                        "caption": caption,
+                        **(
+                            {
+                                "page": record["page_number"],
+                                "page_label": str(record["page_number"]),
+                            }
+                            if record.get("page_number") is not None
+                            else {}
+                        ),
+                        **({"bbox": record["bbox"]} if record.get("bbox") else {}),
+                        **(
+                            {"source_locator": record["source_locator"]}
+                            if record.get("source_locator")
+                            else {}
+                        ),
+                    },
+                )
+            )
+
     def _log_skipped_images(self, sources: list[_ImageSource], reason: str) -> None:
         for source in sources:
             self.logger.warning(
@@ -486,7 +604,10 @@ class LlamaIndexDocumentLoader:
     async def _describe_image(
         self, llm_client: Any, file_path: Path, image_base64: str, mimetype: str
     ) -> str:
-        response = await llm_client.complete(
+        from deeptutor.services.llm.image_caption_cache import complete_image_caption
+
+        response = await complete_image_caption(
+            llm_client,
             IMAGE_DESCRIPTION_PROMPT,
             system_prompt=IMAGE_DESCRIPTION_SYSTEM_PROMPT,
             image_data=image_base64,

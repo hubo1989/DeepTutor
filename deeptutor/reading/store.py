@@ -55,6 +55,8 @@ OUTLINE_NAME = "outline.json"
 ANNOTATIONS_NAME = "annotations.json"
 UNITS_DIR = "units"
 RAW_DIR = "raw"
+MEDIA_DIR = "media"
+MEDIA_INDEX_NAME = "media.json"
 
 # Material ids are content hashes, so this is both an id validator and the
 # traversal guard for every path built from a caller-supplied id.
@@ -183,6 +185,25 @@ class ReadingStore:
                 raw_path = raw_dir / _safe_filename(display_name, fallback=path.name)
                 raw_path.write_bytes(data)
 
+            media_rows: list[dict[str, Any]] = []
+            if extraction.media:
+                media_dir = material_dir / MEDIA_DIR
+                media_dir.mkdir(parents=True, exist_ok=True)
+                for item in extraction.media:
+                    (media_dir / item.name).write_bytes(item.data)
+                    media_rows.append(
+                        {
+                            "name": item.name,
+                            "locator": item.locator,
+                            "mime": item.mime_type,
+                            "bytes": len(item.data),
+                        }
+                    )
+                _atomic_write(
+                    material_dir / MEDIA_INDEX_NAME,
+                    json.dumps(media_rows, ensure_ascii=False),
+                )
+
             outline = extraction.outline or synthesise_outline(extraction.units)
             _atomic_write(
                 material_dir / OUTLINE_NAME,
@@ -202,6 +223,7 @@ class ReadingStore:
                 char_count=extraction.char_count,
                 created_at=time.time(),
                 has_raw_view=raw_path is not None,
+                media_count=len(media_rows),
             )
             # Manifest last: its presence is the "this material is usable"
             # signal, so it must not appear before the units it describes.
@@ -219,6 +241,8 @@ class ReadingStore:
         if not self._unit_file(material_dir, manifest.unit_count).exists():
             return False
         if manifest.has_raw_view and self._find_raw(material_dir) is None:
+            return False
+        if manifest.media_count and not (material_dir / MEDIA_INDEX_NAME).is_file():
             return False
         return True
 
@@ -344,6 +368,54 @@ class ReadingStore:
         if not manifest.has_raw_view:
             return None
         return self._find_raw(self._dir(material_id))
+
+    def media_items(self, material_id: str) -> list[dict[str, Any]]:
+        """The embedded-image index: name / locator / mime / byte-size rows."""
+        self.manifest(material_id)
+        rows = _read_json(self._dir(material_id) / MEDIA_INDEX_NAME)
+        if not isinstance(rows, list):
+            return []
+        return [row for row in rows if isinstance(row, dict) and row.get("name")]
+
+    def media_items_at(self, material_id: str, locator: int) -> list[dict[str, Any]]:
+        """Embedded images attached to one locator, in extraction order."""
+        return [row for row in self.media_items(material_id) if row.get("locator") == locator]
+
+    def media_path(self, material_id: str, name: str) -> Path | None:
+        """Resolve an indexed media file without permitting traversal."""
+        from posixpath import basename as posix_basename
+
+        clean = posix_basename(str(name or "").replace("\\", "/"))
+        if not clean or not any(row.get("name") == clean for row in self.media_items(material_id)):
+            return None
+        path = self._dir(material_id) / MEDIA_DIR / clean
+        return path if path.is_file() else None
+
+    def update_media_captions(self, material_id: str, captions: dict[str, str]) -> int:
+        """Write per-image captions into media.json; return rows changed."""
+        wanted = {
+            str(name): str(value).strip()
+            for name, value in captions.items()
+            if str(value or "").strip()
+        }
+        if not wanted:
+            return 0
+        index_path = self._dir(material_id) / MEDIA_INDEX_NAME
+        with self._locked(material_id):
+            rows = _read_json(index_path)
+            if not isinstance(rows, list):
+                return 0
+            changed = 0
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                caption = wanted.get(str(row.get("name") or ""))
+                if caption and str(row.get("caption") or "") != caption:
+                    row["caption"] = caption
+                    changed += 1
+            if changed:
+                _atomic_write(index_path, json.dumps(rows, ensure_ascii=False))
+            return changed
 
     @staticmethod
     def _find_raw(material_dir: Path) -> Path | None:

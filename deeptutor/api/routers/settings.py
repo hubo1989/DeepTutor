@@ -36,6 +36,7 @@ from deeptutor.services.config import (
     redact_catalog_secrets,
     restore_catalog_secrets,
 )
+from deeptutor.services.config.image_description import ImageDescriptionModelSelection
 from deeptutor.services.config.origins import normalize_origins
 from deeptutor.services.config.runtime_settings import (
     CHAT_ATTACHMENT_CHARS_RANGE,
@@ -284,6 +285,7 @@ class DocumentParsingUpdate(BaseModel):
 
     engine: Optional[str] = None
     engines: Optional[dict[str, dict]] = None
+    image_description_model: Optional[ImageDescriptionModelSelection] = None
 
 
 class DocumentParsingTest(BaseModel):
@@ -912,6 +914,7 @@ def _document_parsing_payload() -> dict[str, Any]:
     docling_slice = engines.get("docling", {})
     return {
         "engine": full.get("engine"),
+        "image_description_model": full.get("image_description_model"),
         "engines": redacted,
         "available_engines": available,
         "readiness": readiness,
@@ -962,6 +965,8 @@ async def update_mineru_settings(payload: MinerUSettingsUpdate):
             "enable_formula": payload.enable_formula,
             "enable_table": payload.enable_table,
             "is_ocr": payload.is_ocr,
+            "normalize_tiny_scans": current.get("normalize_tiny_scans", False),
+            "max_pages_per_part": current.get("max_pages_per_part", 180),
             "allow_local_model_download": payload.allow_local_model_download,
         }
     )
@@ -980,6 +985,20 @@ async def update_document_parsing_settings(payload: DocumentParsingUpdate):
     service = get_runtime_settings_service()
     full = service.load_document_parsing(include_process_overrides=False)
     engines = {name: dict(slice_) for name, slice_ in full.get("engines", {}).items()}
+    image_model = full.get("image_description_model")
+    if "image_description_model" in payload.model_fields_set:
+        image_model = (
+            payload.image_description_model.model_dump()
+            if payload.image_description_model is not None
+            else None
+        )
+        if image_model is not None:
+            from deeptutor.services.llm.image_description import resolve_image_description_config
+
+            try:
+                resolve_image_description_config(image_model)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     for name, update in (payload.engines or {}).items():
         if name not in engines:
@@ -993,7 +1012,13 @@ async def update_document_parsing_settings(payload: DocumentParsingUpdate):
         engines[name].update(merged)
 
     new_engine = payload.engine or full.get("engine")
-    service.save_document_parsing({"engine": new_engine, "engines": engines})
+    service.save_document_parsing(
+        {
+            "engine": new_engine,
+            "image_description_model": image_model,
+            "engines": engines,
+        }
+    )
     return _document_parsing_payload()
 
 

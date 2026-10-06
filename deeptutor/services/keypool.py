@@ -19,6 +19,9 @@ class KeyPool:
         self._cooldown_until = {key: 0.0 for key in self._keys}
         self._lock = Lock()
 
+    def __len__(self) -> int:
+        return len(self._keys)
+
     def next(self) -> str:
         """Return the next key, preferring one that is not cooling down.
 

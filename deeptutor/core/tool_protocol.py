@@ -148,6 +148,8 @@ class ToolResult:
     content: str = ""
     sources: list[dict[str, Any]] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Request-only multimodal payload; never persisted as conversation.
+    model_message: dict[str, Any] | None = None
     success: bool = True
     terminate_turn: bool = False
     pause_for_user: dict[str, Any] | None = None

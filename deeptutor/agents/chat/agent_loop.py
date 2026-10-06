@@ -91,6 +91,37 @@ def _join_answer_parts(parts: list[str], final_text: str) -> str:
     return "".join([*parts, final_text])
 
 
+def _with_transient_model_messages(
+    messages: list[dict[str, Any]], transient: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Place model-only images after their tool result without mutating history."""
+    if not transient:
+        return messages
+    anchored: dict[str, list[dict[str, Any]]] = {}
+    for item in transient:
+        tool_call_id = item.get("_after_tool_call_id")
+        if not isinstance(tool_call_id, str) or not tool_call_id:
+            continue
+        anchored.setdefault(tool_call_id, []).append({"role": "user", "content": item["content"]})
+    request_messages: list[dict[str, Any]] = []
+    pending: list[dict[str, Any]] = []
+    for index, message in enumerate(messages):
+        request_messages.append(message)
+        if message.get("role") == "tool":
+            pending.extend(anchored.pop(str(message.get("tool_call_id") or ""), []))
+            if index + 1 == len(messages) or messages[index + 1].get("role") != "tool":
+                request_messages.extend(pending)
+                pending.clear()
+    return request_messages
+
+
+def _transient_image_count(message: dict[str, Any]) -> int:
+    content = message.get("content")
+    if not isinstance(content, list):
+        return 0
+    return sum(1 for part in content if isinstance(part, dict) and part.get("type") == "image_url")
+
+
 class InlineThinkFilter:
     """Incremental ``<think>``/``<thinking>`` splitter for streamed content.
 
@@ -317,6 +348,7 @@ class AgentLoop:
         settlement_started = False
         nudged_empty_finish = False
         continued_answer_parts: list[str] = []
+        transient_model_messages: list[dict[str, Any]] = []
         while True:
             settling = state.exploration_rounds >= exploration_budget
             if settling:
@@ -334,7 +366,7 @@ class AgentLoop:
                     settlement_started = True
             try:
                 result = await self._call_llm(
-                    messages=messages,
+                    messages=_with_transient_model_messages(messages, transient_model_messages),
                     label=settlement_label if settling else explore_label,
                     call_kind="agent_loop_round",
                     trace_role="response" if settling else "explore",
@@ -474,6 +506,9 @@ class AgentLoop:
                     attachments=new_rag_images,
                 )
             messages.extend(dispatch.tool_messages)
+            transient_model_messages.extend(dispatch.model_messages)
+            while sum(_transient_image_count(item) for item in transient_model_messages) > 2:
+                transient_model_messages.pop(0)
 
             if dispatch.pause:
                 resumed = await self.pipeline._await_user_reply_and_resolve(
