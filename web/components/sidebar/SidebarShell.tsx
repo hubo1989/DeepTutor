@@ -11,6 +11,7 @@ import {
   Bot,
   Brain,
   ChevronDown,
+  Gamepad2,
   Github,
   HeartHandshake,
   House,
@@ -82,6 +83,12 @@ const PRIMARY_NAV: NavEntry[] = [
     requires: "llm",
   },
   {
+    href: "/kids",
+    label: "Quest Island",
+    icon: Gamepad2,
+    tooltipKey: "Quest Island tooltip",
+  },
+  {
     href: "/space",
     label: "Learning Space",
     icon: LayoutGrid,
@@ -110,7 +117,7 @@ const SECONDARY_NAV: NavEntry[] = [
   },
   { href: "/settings", label: "Settings", icon: Settings },
 ];
-const GITHUB_REPO_URL = "https://github.com/HKUDS/LearnLeader";
+const GITHUB_REPO_URL = "https://github.com/hubo1989/DeepTutor";
 const DOCS_URL = "https://deeptutor.info/";
 const RECENTS_COLLAPSED_KEY = "deeptutor.sidebar.recentsCollapsed";
 
@@ -217,7 +224,7 @@ export function SidebarShell({
               alt="LearnLeader"
               width={22}
               height={22}
-              className="h-[22px] w-[22px] rounded-md"
+              className="h-[28px] w-[28px] rounded-md"
             />
           </Link>
           <button
@@ -347,7 +354,7 @@ export function SidebarShell({
             width={897}
             height={236}
             priority
-            className="h-[22px] w-auto transition-transform duration-200 group-hover:scale-105"
+            className="h-[32px] w-auto transition-transform duration-200 group-hover:scale-105"
           />
         </Link>
         {/* The rail is a desktop affordance; in the drawer the scrim and the
