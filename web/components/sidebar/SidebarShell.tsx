@@ -11,7 +11,6 @@ import {
   Bot,
   Brain,
   ChevronDown,
-  Gamepad2,
   Github,
   HeartHandshake,
   House,
@@ -81,12 +80,6 @@ const PRIMARY_NAV: NavEntry[] = [
     icon: Library,
     tooltipKey: "Book tooltip",
     requires: "llm",
-  },
-  {
-    href: "/kids",
-    label: "Quest Island",
-    icon: Gamepad2,
-    tooltipKey: "Quest Island tooltip",
   },
   {
     href: "/space",

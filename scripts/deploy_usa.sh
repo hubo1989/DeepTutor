@@ -46,9 +46,6 @@ esac
 
 echo "==> Deploying ghcr.io/hubo1989/learnleader:${tag} to ${HOST}"
 
-# The data volume shadows packaged seed data. Refresh the tracked public quest
-# themes before rollout while preserving any operator-added theme directories.
-rsync -a data/public_kb/ "${HOST}:deeptutor/data/public_kb/"
 
 ssh -o BatchMode=yes "$HOST" "set -e
 cd ~/deeptutor
