@@ -29,7 +29,6 @@ from deeptutor.knowledge.kb_types import (
     SUBAGENT_KB_TYPE,
     external_root_of,
     is_connected_kb,
-    is_public_kb,
 )
 from deeptutor.knowledge.manifest import iter_kb_documents
 from deeptutor.services.file_io import atomic_write_json
@@ -1541,11 +1540,6 @@ class KnowledgeBaseManager:
         if name not in config_kbs and not (self.base_dir / name).exists():
             raise ValueError(f"Knowledge base not found: {name}")
 
-        # Public knowledge bases are curated, read-only resources shared
-        # across all child profiles — deleting one is forbidden.
-        if is_public_kb(config_kbs.get(name, {})):
-            raise PermissionError("Public knowledge bases are read-only")
-
         # Resolve the directory directly to stay idempotent: if the on-disk
         # folder was already removed (e.g. manually rm-rf'd) we still want to
         # purge the orphaned entry from kb_config.json instead of failing.
@@ -1657,10 +1651,6 @@ class KnowledgeBaseManager:
             True if cleaned successfully
         """
         kb_name = name or self.get_default()
-        # Public knowledge bases are read-only — cleaning their index is forbidden.
-        kb_entry = self.get_kb_entry(kb_name)
-        if is_public_kb(kb_entry):
-            raise PermissionError("Public knowledge bases are read-only")
         kb_dir = self.get_knowledge_base_path(kb_name)
         from deeptutor.services.rag.index_versioning import (
             LEGACY_VERSION_DIRNAME,
@@ -1724,11 +1714,6 @@ class KnowledgeBaseManager:
         """
         if kb_name not in self.list_knowledge_bases():
             raise ValueError(f"Knowledge base not found: {kb_name}")
-
-        # Public knowledge bases are read-only — linking folders is forbidden.
-        kb_entry = self.get_kb_entry(kb_name)
-        if is_public_kb(kb_entry):
-            raise PermissionError("Public knowledge bases are read-only")
 
         # Normalize path (cross-platform: handles ~, relative paths, etc.)
         folder = Path(folder_path).expanduser().resolve()
@@ -1823,11 +1808,6 @@ class KnowledgeBaseManager:
         if kb_name not in self.list_knowledge_bases():
             raise ValueError(f"Knowledge base not found: {kb_name}")
 
-        # Public knowledge bases are read-only — unlinking folders is forbidden.
-        kb_entry = self.get_kb_entry(kb_name)
-        if is_public_kb(kb_entry):
-            raise PermissionError("Public knowledge bases are read-only")
-
         kb_dir = self.base_dir / kb_name
         metadata_file = kb_dir / "metadata.json"
 
@@ -1892,11 +1872,6 @@ class KnowledgeBaseManager:
         if kb_name not in self.list_knowledge_bases():
             raise ValueError(f"Knowledge base not found: {kb_name}")
 
-        # Public knowledge bases are read-only — change detection is not applicable.
-        kb_entry = self.get_kb_entry(kb_name)
-        if is_public_kb(kb_entry):
-            raise PermissionError("Public knowledge bases are read-only")
-
         # Get folder info
         folders = self.get_linked_folders(kb_name)
         folder_info = next((f for f in folders if f["id"] == folder_id), None)
@@ -1958,11 +1933,6 @@ class KnowledgeBaseManager:
         """
         if kb_name not in self.list_knowledge_bases():
             raise ValueError(f"Knowledge base not found: {kb_name}")
-
-        # Public knowledge bases are read-only — updating sync state is forbidden.
-        kb_entry = self.get_kb_entry(kb_name)
-        if is_public_kb(kb_entry):
-            raise PermissionError("Public knowledge bases are read-only")
 
         kb_dir = self.base_dir / kb_name
         metadata_file = kb_dir / "metadata.json"
