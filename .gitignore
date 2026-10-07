@@ -329,3 +329,10 @@ celerybeat.pid
 
 # local video-agent tooling artifacts
 .video_agent/
+
+# ============================================
+# Local working notes / teaching artifacts
+# ============================================
+.workbuddy/
+.workbuddy/memory/
+教学产物/
