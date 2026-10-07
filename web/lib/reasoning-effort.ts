@@ -11,6 +11,7 @@ const LABELS: Record<string, string> = {
   medium: "Medium",
   high: "High",
   xhigh: "Extra high",
+  max: "Maximum",
   adaptive: "Adaptive",
 };
 
