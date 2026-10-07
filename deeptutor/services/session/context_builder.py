@@ -266,13 +266,6 @@ class ContextBuilder:
         cutoff = len(messages) - len(selected)
         return messages[:cutoff], selected
 
-    def _model_tokens(self, messages: list[dict[str, Any]], summary: str = "") -> int:
-        if any(model_turn(row) is not None for row in messages):
-            return _count_model_context_tokens(replay_history(messages, summary))
-        return count_tokens(build_history_text(self._build_history(summary, messages))) + sum(
-            _provider_response_state_tokens(row) for row in messages
-        )
-
     async def _summarize(
         self,
         *,

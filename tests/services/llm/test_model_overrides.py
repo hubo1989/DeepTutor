@@ -57,7 +57,9 @@ def test_tunable_moonshot_series_keeps_the_callers_temperature(model: str) -> No
     assert _payload("moonshot", model)["temperature"] == pytest.approx(0.7)
 
 
-@pytest.mark.parametrize("model", ["gpt-4o", "claude-sonnet-5", "deepseek-chat"])
+@pytest.mark.parametrize(
+    "model", ["gpt-4o", "claude-haiku-4-5-20251001", "claude-3-5-sonnet", "deepseek-chat"]
+)
 def test_unrelated_models_are_untouched(model: str) -> None:
     assert _payload("openai", model)["temperature"] == pytest.approx(0.7)
 
