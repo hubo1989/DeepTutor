@@ -34,8 +34,10 @@ from deeptutor.services.llm.openai_http_client import sanitize_invalid_ssl_env
 from deeptutor.services.llm.reasoning_params import (
     build_openai_compatible_reasoning_kwargs,
 )
+from deeptutor.services.llm.usage_estimation import estimate_prompt_tokens
 from deeptutor.services.provider_registry import (
     find_by_name,
+    model_overrides_for,
     wire_api_for_provider,
 )
 
@@ -192,11 +194,10 @@ def _estimate_tokens(value: Any) -> int:
 
 
 def _request_token_estimate(kwargs: dict[str, Any]) -> tuple[int, int, int]:
-    prompt_tokens = _estimate_tokens(
-        {
-            "messages": kwargs.get("messages") or [],
-            "tools": kwargs.get("tools") or [],
-        }
+    # Agentic calls share the image-safe prompt estimator with the provider
+    # factory. Tool schemas remain a separate conservative text estimate.
+    prompt_tokens = estimate_prompt_tokens(kwargs.get("messages") or []) + _estimate_tokens(
+        {"tools": kwargs.get("tools") or []}
     )
     raw_output = kwargs.get("max_completion_tokens", kwargs.get("max_tokens", 4096))
     try:
@@ -207,17 +208,22 @@ def _request_token_estimate(kwargs: dict[str, Any]) -> tuple[int, int, int]:
 
 
 def _request_commercial_token_bound(kwargs: dict[str, Any], output_tokens: int) -> int:
-    """Bound prompt tokenizer pieces by serialized UTF-8 bytes."""
+    """Bound commercial usage without treating image transport bytes as text."""
 
-    value = {
-        "messages": kwargs.get("messages") or [],
+    message_bound = estimate_prompt_tokens(kwargs.get("messages") or [])
+    other_value = {
         "tools": kwargs.get("tools") or [],
     }
     try:
-        serialized = json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
+        serialized = json.dumps(
+            other_value,
+            ensure_ascii=False,
+            default=str,
+            separators=(",", ":"),
+        )
     except (TypeError, ValueError):
-        serialized = str(value)
-    return max(1, len(serialized.encode("utf-8"))) + output_tokens
+        serialized = str(other_value)
+    return message_bound + _estimate_tokens(other_value) + output_tokens
 
 
 def _usage_total(value: Any) -> int:
@@ -1026,6 +1032,13 @@ def build_completion_kwargs(
             reasoning_effort=reasoning_effort,
         )
     )
+    # Raw AsyncOpenAI calls bypass OpenAICompatProvider, which normally applies
+    # these intrinsic model restrictions (for example Claude temperature).
+    for key, value in model_overrides_for(model, find_by_name(binding)).items():
+        if value is None:
+            kwargs.pop(key, None)
+        else:
+            kwargs[key] = value
     return kwargs
 
 
