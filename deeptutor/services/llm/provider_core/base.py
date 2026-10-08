@@ -326,6 +326,7 @@ class LLMProvider(ABC):
         if status_code is not None:
             return status_code in cls._RETRYABLE_HTTP_STATUS_CODES
         err = (content or "").lower()
+
         message_status = cls._status_code_from_message(err)
         if message_status is not None:
             return message_status in cls._RETRYABLE_HTTP_STATUS_CODES
