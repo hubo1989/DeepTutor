@@ -92,7 +92,9 @@ test("known reasoning families get conservative provider-specific choices", () =
     "high",
   ]);
   assert.deepEqual(values("dashscope", "qwen3-max"), ["", "minimal", "high"]);
-  assert.deepEqual(values("custom", "deepseek-reasoner"), [
+  assert.deepEqual(values("custom", "deepseek-reasoner"), ["", "minimal", "high"]);
+  assert.deepEqual(values("custom", "qwen3-max"), ["", "minimal", "high"]);
+  assert.deepEqual(values("custom", "unknown-model"), [
     "",
     "none",
     "low",

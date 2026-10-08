@@ -1288,11 +1288,18 @@ class TurnRuntimeManager:
     ) -> bool:
         """Cancel a turn and wait until persisted teardown has completed."""
         active_statuses = {"queued", "running", "waiting_input"}
-        cancelled = await self.cancel_turn(turn_id)
+        deadline = asyncio.get_running_loop().time() + max(0.0, timeout_seconds)
+        try:
+            # Bound the cancellation await too: its cleanup can itself stall.
+            cancelled = await asyncio.wait_for(
+                self.cancel_turn(turn_id),
+                timeout=max(0.0, deadline - asyncio.get_running_loop().time()),
+            )
+        except asyncio.TimeoutError:
+            return False
         if not cancelled:
             turn = await self.store.get_turn(turn_id)
             return turn is None or str(turn.get("status") or "") not in active_statuses
-        deadline = asyncio.get_running_loop().time() + max(0.0, timeout_seconds)
         while True:
             turn = await self.store.get_turn(turn_id)
             status = str((turn or {}).get("status") or "")

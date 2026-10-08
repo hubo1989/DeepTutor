@@ -44,6 +44,14 @@ const BINARY_THINKING_PROVIDERS = new Set([
   "dashscope",
   "minimax",
 ]);
+const BINARY_THINKING_MODELS = [
+  "deepseek-reasoner",
+  "deepseek-v4-pro",
+  "qwen3",
+  "qwen-3",
+  "qwq",
+  "qwen-plus",
+];
 
 function includesAny(value: string, patterns: string[]): boolean {
   return patterns.some((pattern) => value.includes(pattern));
@@ -139,6 +147,13 @@ export function reasoningEffortOptions(
     return options(["low", "high", "max"], current);
   }
 
+  if (
+    (BINARY_THINKING_PROVIDERS.has(provider) || provider === "custom") &&
+    includesAny(modelName, BINARY_THINKING_MODELS)
+  ) {
+    return options(["minimal", "high"], current);
+  }
+
   if (provider === "custom") {
     // A user-supplied OpenAI-compatible endpoint may route to any upstream
     // model, so expose the common cross-gateway levels and let Auto handle
@@ -147,26 +162,11 @@ export function reasoningEffortOptions(
   }
 
   if (BINARY_THINKING_PROVIDERS.has(provider)) {
-    const supported =
-      provider === "minimax" ||
-      includesAny(modelName, [
-        "deepseek-reasoner",
-        "deepseek-v4-pro",
-        "qwen3",
-        "qwen-3",
-        "qwq",
-        "qwen-plus",
-      ]);
-    if (supported) {
-      return options(["minimal", "high"], current);
-    }
-    if (BINARY_THINKING_PROVIDERS.has(provider)) {
-      // Deliberately no selector for the rest — VolcEngine/BytePlus thinking
-      // models are switched on by the backend from the spec's
-      // reasoning_model_patterns, so an explicit per-model choice here would
-      // duplicate a decision the registry already owns.
-      return options([], current);
-    }
+    // Deliberately no selector for the rest — VolcEngine/BytePlus thinking
+    // models are switched on by the backend from the spec's
+    // reasoning_model_patterns, so an explicit per-model choice here would
+    // duplicate a decision the registry already owns.
+    return options([], current);
   }
 
   if (OPENAI_PROVIDERS.has(provider) || provider === "custom") {
