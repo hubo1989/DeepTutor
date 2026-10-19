@@ -15,31 +15,44 @@ import string
 import sys
 import time
 from typing import TYPE_CHECKING, Any
-import uuid
 
 import json_repair
+from loguru import logger
 from openai import AsyncOpenAI
 
 from deeptutor.services.keypool import KeyPool
-from deeptutor.services.llm.capabilities import disable_response_format_at_runtime
+from deeptutor.services.llm.capabilities import (
+    disable_forced_tool_choice_at_runtime,
+    disable_response_format_at_runtime,
+    is_forced_tool_choice_disabled_at_runtime,
+)
 from deeptutor.services.llm.exceptions import LLMConfigError
-from deeptutor.services.llm.openai_http_client import openai_client_kwargs
+from deeptutor.services.llm.openai_http_client import openai_sdk_client_kwargs
 from deeptutor.services.llm.provider_core.base import LLMProvider, LLMResponse, ToolCallRequest
 from deeptutor.services.llm.provider_core.openai_responses import (
+    ToolArgsDeltaHook,
     adapt_chat_kwargs_to_responses,
     consume_sdk_stream,
     convert_messages,
+    convert_tool_choice,
     convert_tools,
     parse_response_output,
 )
 from deeptutor.services.llm.reasoning_params import (
     build_openai_compatible_reasoning_kwargs,
 )
-from deeptutor.services.llm.usage_frame import token_counts
+from deeptutor.services.llm.request_compat import (
+    is_forced_tool_choice_unsupported,
+    is_response_format_unsupported,
+)
+from deeptutor.services.llm.usage_frame import usage_breakdown
 from deeptutor.services.provider_registry import model_overrides_for, normalize_wire_api
+from deeptutor.services.session.provider_response_state import (
+    normalize_provider_response_state,
+)
 
 if TYPE_CHECKING:
-    from deeptutor.services.provider_registry import ProviderSpec
+    pass
 
 _ALLOWED_MSG_KEYS = frozenset(
     {
@@ -58,10 +71,6 @@ _ALNUM = string.ascii_letters + string.digits
 
 _INTERNAL_RESPONSE_STATE_KEYS = frozenset({"_provider_response_state", "_responses_output_items"})
 
-_DEFAULT_OPENROUTER_HEADERS = {
-    "HTTP-Referer": "https://github.com/HKUDS/DeepTutor",
-    "X-OpenRouter-Title": "DeepTutor",
-}
 _RESPONSES_FAILURE_THRESHOLD = 2
 _RESPONSES_PROBE_INTERVAL_S = 300.0
 _INPUT_ITEM_STATUS_PARAM = re.compile(r"^input\[(0|[1-9][0-9]*)\]\.status$")
@@ -79,6 +88,36 @@ def _get(obj: Any, key: str) -> Any:
     return getattr(obj, key, None)
 
 
+def _accumulate_streamed_tool_call(
+    buffers: dict[int, dict[str, str]],
+    tc_delta: Any,
+) -> dict[str, str] | None:
+    """Fold one live ``delta.tool_calls`` entry into *buffers*, return it.
+
+    ``id`` and ``name`` arrive complete on whichever chunk carries them and
+    are assigned; ``arguments`` arrives in fragments and is concatenated
+    (appending a repeated ``id`` is issue #937). The id falls back to the
+    stream index so a provider that streams arguments before an id still
+    yields something a consumer can correlate previews by.
+    """
+    index = int(_get(tc_delta, "index") or 0)
+    buffer = buffers.setdefault(index, {"id": "", "name": "", "arguments": ""})
+    tc_id = _get(tc_delta, "id")
+    if tc_id:
+        buffer["id"] = str(tc_id)
+    fn = _get(tc_delta, "function")
+    if fn is not None:
+        fn_name = _get(fn, "name")
+        if fn_name:
+            buffer["name"] = str(fn_name)
+        fn_args = _get(fn, "arguments")
+        if fn_args:
+            buffer["arguments"] += str(fn_args)
+    if not buffer["id"]:
+        buffer["id"] = f"call_{index}"
+    return buffer
+
+
 def _coerce_dict(value: Any) -> dict[str, Any] | None:
     if value is None:
         return None
@@ -93,19 +132,16 @@ def _coerce_dict(value: Any) -> dict[str, Any] | None:
 
 
 def _provider_state_output_items(message: dict[str, Any]) -> list[dict[str, Any]]:
-    state = message.get("_provider_response_state")
-    items = state.get("responses_output_items") if isinstance(state, dict) else None
+    state = normalize_provider_response_state(message.get("_provider_response_state"))
+    items = state.get("responses_output_items") if state is not None else None
     if not isinstance(items, list):
-        items = message.get("_responses_output_items")
+        legacy_state = normalize_provider_response_state(
+            {"responses_output_items": message.get("_responses_output_items")}
+        )
+        items = legacy_state.get("responses_output_items") if legacy_state is not None else None
     if not isinstance(items, list):
         return []
     return [dict(item) for item in items if isinstance(item, dict)]
-
-
-def _uses_openrouter(spec: "ProviderSpec | None", api_base: str | None) -> bool:
-    if spec and spec.name == "openrouter":
-        return True
-    return bool(api_base and "openrouter" in api_base.lower())
 
 
 def _is_direct_openai_base(api_base: str | None) -> bool:
@@ -141,6 +177,7 @@ class OpenAICompatProvider(LLMProvider):
         spec: Any = None,
         provider_name: str | None = None,
         wire_api: str = "auto",
+        configure_env: bool = True,
     ):
         keys = api_key if isinstance(api_key, list) else [api_key]
         keys = [str(key).strip() for key in keys if str(key or "").strip()]
@@ -153,7 +190,7 @@ class OpenAICompatProvider(LLMProvider):
         self._provider_name = provider_name
         self._wire_api = normalize_wire_api(wire_api)
 
-        if primary_key and spec and spec.env_key:
+        if configure_env and primary_key and spec and spec.env_key:
             self._setup_env(primary_key, api_base)
 
         effective_base = api_base or (spec.default_api_base if spec else None) or None
@@ -171,18 +208,14 @@ class OpenAICompatProvider(LLMProvider):
                 "OpenAI API key is not configured. Set it in Settings > Catalog, "
                 "or select a local provider such as Ollama."
             )
-        default_headers: dict[str, str] = {"x-session-affinity": uuid.uuid4().hex}
-        if _uses_openrouter(spec, effective_base):
-            default_headers.update(_DEFAULT_OPENROUTER_HEADERS)
-        if extra_headers:
-            default_headers.update(extra_headers)
-
         self._client = AsyncOpenAI(
-            api_key=primary_key or "no-key",
-            base_url=effective_base,
-            default_headers=default_headers,
-            max_retries=0,
-            **openai_client_kwargs(),
+            **openai_sdk_client_kwargs(
+                api_key=primary_key or "no-key",
+                base_url=effective_base,
+                extra_headers=extra_headers,
+                spec=spec,
+                sdk_max_retries=0,
+            )
         )
         self._responses_failures: dict[str, int] = {}
         self._responses_tripped_at: dict[str, float] = {}
@@ -244,6 +277,7 @@ class OpenAICompatProvider(LLMProvider):
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]] | None]:
         cache_marker = {"type": "ephemeral"}
         new_messages = list(messages)
+        budget = 4
 
         def _mark(msg: dict[str, Any]) -> dict[str, Any]:
             content = msg.get("content")
@@ -262,13 +296,15 @@ class OpenAICompatProvider(LLMProvider):
 
         if new_messages and new_messages[0].get("role") == "system":
             new_messages[0] = _mark(new_messages[0])
-        if len(new_messages) >= 3:
-            new_messages[-2] = _mark(new_messages[-2])
+            budget -= 1
+        if len(new_messages) >= 2:
+            new_messages[-1] = _mark(new_messages[-1])
+            budget -= 1
 
         new_tools = tools
         if tools:
             new_tools = list(tools)
-            for idx in cls._tool_cache_marker_indices(new_tools):
+            for idx in cls._tool_cache_marker_indices(new_tools)[:budget]:
                 new_tools[idx] = {**new_tools[idx], "cache_control": cache_marker}
         return new_messages, new_tools
 
@@ -319,15 +355,20 @@ class OpenAICompatProvider(LLMProvider):
                 # their own names. Every one of them lost its reasoning the
                 # moment a turn replayed history, while the *same* round
                 # inside one turn kept it (the loop sets the field directly).
-                state = message.get("_provider_response_state")
-                reasoning_content = (
-                    state.get("reasoning_content") if isinstance(state, dict) else None
-                )
+                state = normalize_provider_response_state(message.get("_provider_response_state"))
+                reasoning_content = state.get("reasoning_content") if state is not None else None
                 if isinstance(reasoning_content, str) and reasoning_content:
                     clean.setdefault("reasoning_content", reasoning_content)
             prepared.append(clean)
 
         sanitized = LLMProvider._sanitize_request_messages(prepared, _ALLOWED_MSG_KEYS)
+        if responses_api:
+            # Responses function calls use the provider-issued ``call_id`` as
+            # a protocol identity. The converter splits DeepTutor's compound
+            # ``call_id|item_id`` form itself; hashing it here would make the
+            # later function_call_output point at a different call than the
+            # replayed native function_call item.
+            return sanitized
         id_map: dict[str, str] = {}
 
         def map_id(value: Any) -> Any:
@@ -416,7 +457,7 @@ class OpenAICompatProvider(LLMProvider):
 
         if tools:
             kwargs["tools"] = tools
-            kwargs["tool_choice"] = tool_choice or "auto"
+            kwargs["tool_choice"] = self._effective_tool_choice(tool_choice, model) or "auto"
 
         return kwargs
 
@@ -424,6 +465,7 @@ class OpenAICompatProvider(LLMProvider):
         self,
         model: str | None,
         reasoning_effort: str | None,
+        tools: list[dict[str, Any]] | None = None,
     ) -> bool:
         if self._wire_api == "responses":
             return True
@@ -431,6 +473,8 @@ class OpenAICompatProvider(LLMProvider):
             return False
 
         spec = self._spec
+        if self._uses_native_web_search(model, tools):
+            return self._responses_circuit_allows(model, reasoning_effort)
         if spec and spec.name not in {"openai", "github_copilot"}:
             return False
         if spec is None or spec.name != "github_copilot":
@@ -445,6 +489,13 @@ class OpenAICompatProvider(LLMProvider):
         if not wants_responses:
             return False
 
+        return self._responses_circuit_allows(model, reasoning_effort)
+
+    def _responses_circuit_allows(
+        self,
+        model: str | None,
+        reasoning_effort: str | None,
+    ) -> bool:
         circuit_key = _responses_circuit_key(model, self.default_model, reasoning_effort)
         failures = self._responses_failures.get(circuit_key, 0)
         if failures >= _RESPONSES_FAILURE_THRESHOLD:
@@ -452,6 +503,25 @@ class OpenAICompatProvider(LLMProvider):
             if (time.monotonic() - tripped_at) < _RESPONSES_PROBE_INTERVAL_S:
                 return False
         return True
+
+    def _uses_native_web_search(
+        self,
+        model: str | None,
+        tools: list[dict[str, Any]] | None,
+    ) -> bool:
+        patterns = {
+            str(name).strip().lower()
+            for name in getattr(self._spec, "native_web_search_models", ())
+            if str(name).strip()
+        }
+        model_name = (model or self.default_model or "").strip().lower().split("/")[-1]
+        if model_name not in patterns:
+            return False
+        return any(
+            ((tool.get("function") or {}).get("name") == "web_search")
+            for tool in tools or []
+            if isinstance(tool, dict) and tool.get("type") == "function"
+        )
 
     def _record_responses_failure(self, model: str | None, reasoning_effort: str | None) -> None:
         circuit_key = _responses_circuit_key(model, self.default_model, reasoning_effort)
@@ -563,7 +633,7 @@ class OpenAICompatProvider(LLMProvider):
             or getattr(response, "text", None)
         )
         body_text = str(body).lower() if body is not None else ""
-        return any(
+        endpoint_unsupported = any(
             marker in body_text
             for marker in (
                 "responses",
@@ -577,23 +647,72 @@ class OpenAICompatProvider(LLMProvider):
                 "not supported",
             )
         )
+        # DeepSeek V4 reports a very specific three-part error when a
+        # Responses continuation cannot replay its prior reasoning item.  Keep
+        # these markers conjunctive: each phrase on its own is common in
+        # unrelated validation errors and must not trip the circuit breaker.
+        reasoning_replay_rejected = (
+            any(field in body_text for field in ("reasoning_text", "reasoning_content"))
+            and "thinking mode" in body_text
+            and "passed back" in body_text
+        )
+        return endpoint_unsupported or reasoning_replay_rejected
 
     @staticmethod
     def _is_response_format_error(exc: Exception) -> bool:
-        text = str(getattr(exc, "body", None) or getattr(exc, "message", None) or exc).lower()
-        if "response_format" not in text and "response format" not in text:
+        return is_response_format_unsupported(exc)
+
+    def _binding_name(self) -> str:
+        return self._provider_name or (self._spec.name if self._spec else "openai")
+
+    def _effective_tool_choice(
+        self,
+        tool_choice: str | dict[str, Any] | None,
+        model: str | None,
+    ) -> str | dict[str, Any] | None:
+        """Soften a forced tool for a provider already known to refuse one.
+
+        Naming the tool is an optimisation, not the contract: ``"required"``
+        still says a tool must be called, and the loop wraps the model's own
+        question into a card if it answers in prose anyway. Only pairs
+        recorded by a previous rejection are softened, so a provider that
+        honours a forced tool keeps getting one.
+        """
+        if not self._names_a_tool(tool_choice):
+            return tool_choice
+        if is_forced_tool_choice_disabled_at_runtime(
+            self._binding_name(), model or self.default_model
+        ):
+            return "required"
+        return tool_choice
+
+    @staticmethod
+    def _names_a_tool(tool_choice: Any) -> bool:
+        if not isinstance(tool_choice, dict):
             return False
-        return any(
-            marker in text
-            for marker in (
-                "not supported",
-                "unsupported",
-                "json_object",
-                "json_schema",
-                "must be 'json_schema' or 'text'",
-                "specified for 'response_format.type' is not valid",
-            )
+        return bool(tool_choice.get("name") or (tool_choice.get("function") or {}).get("name"))
+
+    def _note_forced_tool_choice_rejected(
+        self,
+        exc: Exception,
+        tool_choice: str | dict[str, Any] | None,
+        model: str | None,
+    ) -> bool:
+        """Record a refusal to force one tool; True when a retry is worth it."""
+        if not self._names_a_tool(tool_choice):
+            return False
+        if not is_forced_tool_choice_unsupported(exc):
+            return False
+        target = model or self.default_model
+        # loguru formats with ``{}``, not printf placeholders.
+        logger.warning(
+            "provider refused a forced tool_choice for model={}; retrying with "
+            "tool_choice=required. error={}",
+            target,
+            str(exc)[:200],
         )
+        disable_forced_tool_choice_at_runtime(self._binding_name(), target)
+        return True
 
     def _build_responses_body(
         self,
@@ -632,8 +751,13 @@ class OpenAICompatProvider(LLMProvider):
             body["reasoning"] = {"effort": reasoning_effort}
             body["include"] = ["reasoning.encrypted_content"]
         if tools:
-            body["tools"] = convert_tools(tools)
-            body["tool_choice"] = tool_choice or "auto"
+            body["tools"] = convert_tools(
+                tools,
+                native_web_search=self._uses_native_web_search(model, tools),
+            )
+            body["tool_choice"] = (
+                convert_tool_choice(self._effective_tool_choice(tool_choice, model)) or "auto"
+            )
         return body
 
     # ------------------------------------------------------------------
@@ -682,7 +806,7 @@ class OpenAICompatProvider(LLMProvider):
             usage_obj = response_map.get("usage")
         else:
             usage_obj = getattr(response, "usage", None)
-        return token_counts(usage_obj)
+        return usage_breakdown(usage_obj)
 
     def _parse(self, response: Any) -> LLMResponse:
         if isinstance(response, str):
@@ -705,8 +829,6 @@ class OpenAICompatProvider(LLMProvider):
                     finish_reason = ch.finish_reason
             if not content and m.content:
                 content = m.content
-            if not content and getattr(m, "reasoning", None):
-                content = m.reasoning
 
         tool_calls = []
         for tc in raw_tool_calls:
@@ -728,6 +850,12 @@ class OpenAICompatProvider(LLMProvider):
         reasoning_content = getattr(msg, "reasoning_content", None) or None
         if not reasoning_content and getattr(msg, "reasoning", None):
             reasoning_content = msg.reasoning
+
+        # ``reasoning`` is a private trace on gateways such as OpenRouter.  It
+        # must never be promoted to visible content when the provider omits a
+        # final answer (the old fallback here leaked untagged scratchpads).
+        if content and reasoning_content and content == reasoning_content:
+            content = None
 
         usage = self._extract_usage(response)
 
@@ -869,7 +997,7 @@ class OpenAICompatProvider(LLMProvider):
         **extra_kwargs: Any,
     ) -> LLMResponse:
         try:
-            if self._should_use_responses_api(model, reasoning_effort):
+            if self._should_use_responses_api(model, reasoning_effort, tools):
                 try:
                     body = self._build_responses_body(
                         messages,
@@ -926,6 +1054,19 @@ class OpenAICompatProvider(LLMProvider):
                     )
                 raise
         except Exception as e:
+            if self._note_forced_tool_choice_rejected(e, tool_choice, model):
+                # ``"required"`` cannot be refused for the same reason, so this
+                # retries at most once.
+                return await self.chat(
+                    messages,
+                    tools,
+                    model,
+                    max_tokens,
+                    temperature,
+                    reasoning_effort,
+                    "required",
+                    **extra_kwargs,
+                )
             if tools and self._is_tool_format_error(e):
                 return await self.chat_stream(
                     messages,
@@ -950,6 +1091,10 @@ class OpenAICompatProvider(LLMProvider):
         tool_choice: str | dict[str, Any] | None = None,
         on_content_delta: Callable[[str], Awaitable[None]] | None = None,
         on_reasoning_delta: Callable[[str], Awaitable[None]] | None = None,
+        # Declared, never forwarded to the wire: ``extra_kwargs`` becomes
+        # request body below, so a callback passed through it would be
+        # serialised into the request.
+        on_tool_args_delta: ToolArgsDeltaHook | None = None,
         **extra_kwargs: Any,
     ) -> LLMResponse:
         request_kwargs = self._build_kwargs(
@@ -964,7 +1109,7 @@ class OpenAICompatProvider(LLMProvider):
         request_kwargs.update({k: v for k, v in extra_kwargs.items() if v is not None})
         idle_timeout_s = 90
         try:
-            if self._should_use_responses_api(model, reasoning_effort):
+            if self._should_use_responses_api(model, reasoning_effort, tools):
                 try:
                     body = self._build_responses_body(
                         messages,
@@ -990,6 +1135,18 @@ class OpenAICompatProvider(LLMProvider):
                             except StopAsyncIteration:
                                 break
 
+                    native_output_items: list[dict[str, Any]] = []
+                    native_citations: list[dict[str, Any]] = []
+
+                    def _collect_provider_event(
+                        kind: str,
+                        payload: dict[str, Any],
+                    ) -> None:
+                        if kind == "output_item":
+                            native_output_items.append(payload)
+                        elif kind == "citation":
+                            native_citations.append(payload)
+
                     (
                         content,
                         tool_calls,
@@ -1000,7 +1157,15 @@ class OpenAICompatProvider(LLMProvider):
                         _timed_stream(),
                         on_content_delta,
                         on_reasoning_delta=on_reasoning_delta,
+                        on_provider_event=_collect_provider_event,
+                        on_tool_args_delta=on_tool_args_delta,
                     )
+                    if not any(item.get("type") == "reasoning" for item in native_output_items):
+                        native_output_items = [
+                            item
+                            for item in native_output_items
+                            if item.get("type") in {"web_search_call", "web_search"}
+                        ]
                     self._record_responses_success(model, reasoning_effort)
                     return LLMResponse(
                         content=content or None,
@@ -1008,6 +1173,14 @@ class OpenAICompatProvider(LLMProvider):
                         finish_reason=finish_reason,
                         usage=usage,
                         reasoning_content=reasoning_content,
+                        provider_specific_fields=(
+                            {
+                                "native_output_items": native_output_items,
+                                "citations": native_citations,
+                            }
+                            if native_output_items or native_citations
+                            else {}
+                        ),
                     )
                 except Exception as responses_error:
                     if self._spec and self._spec.name == "github_copilot":
@@ -1041,6 +1214,10 @@ class OpenAICompatProvider(LLMProvider):
 
             chunks: list[Any] = []
             stream_iter = stream.__aiter__()
+            # Mirrors the accumulation ``_parse_chunks`` does after the fact,
+            # but live, so ``on_tool_args_delta`` can report a call while it is
+            # still being written. The authoritative parse stays below.
+            streaming_tool_args: dict[int, dict[str, str]] = {}
             while True:
                 try:
                     chunk = await asyncio.wait_for(
@@ -1062,6 +1239,15 @@ class OpenAICompatProvider(LLMProvider):
                         text = getattr(delta, "content", None)
                         if text:
                             await on_content_delta(text)
+                    if on_tool_args_delta and delta is not None:
+                        for tc in getattr(delta, "tool_calls", None) or []:
+                            buffered = _accumulate_streamed_tool_call(streaming_tool_args, tc)
+                            if buffered is not None and buffered["name"]:
+                                await on_tool_args_delta(
+                                    buffered["id"],
+                                    buffered["name"],
+                                    buffered["arguments"],
+                                )
             return self._parse_chunks(chunks)
         except asyncio.TimeoutError:
             return LLMResponse(
@@ -1069,6 +1255,24 @@ class OpenAICompatProvider(LLMProvider):
                 finish_reason="error",
             )
         except Exception as e:
+            if self._note_forced_tool_choice_rejected(e, tool_choice, model):
+                # Safe to replay: the refusal happens when the request is
+                # created, so no part of a response has been streamed yet.
+                # ``"required"`` cannot be refused for the same reason, so
+                # this retries at most once.
+                return await self.chat_stream(
+                    messages,
+                    tools,
+                    model,
+                    max_tokens,
+                    temperature,
+                    reasoning_effort,
+                    "required",
+                    on_content_delta,
+                    on_reasoning_delta,
+                    on_tool_args_delta,
+                    **extra_kwargs,
+                )
             return self._handle_error(e)
 
     def get_default_model(self) -> str:

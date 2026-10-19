@@ -97,6 +97,12 @@ const nextConfig = {
   // process while it is running.
   distDir: process.env.DEEPTUTOR_NEXT_DIST_DIR || ".next",
 
+  // Build/typecheck wrappers can point Next at a process-local config so a
+  // production build never rewrites the tsconfig watched by a live dev server.
+  typescript: {
+    tsconfigPath: process.env.DEEPTUTOR_NEXT_TSCONFIG || "tsconfig.json",
+  },
+
   // Expose the build-time version to the browser so the sidebar badge
   // can compare it against GitHub's latest release.
   env: {
@@ -108,6 +114,12 @@ const nextConfig = {
   // Standalone output: self-contained server.js + minimal node_modules
   // This eliminates the need to copy the full node_modules into Docker production images
   output: "standalone",
+
+  // Keep the standalone bundle rooted at this frontend directory. Without an
+  // explicit root, Next.js can mirror the absolute checkout path inside
+  // `.next-deeptutor/standalone`, while the DeepTutor launcher expects
+  // `.next-deeptutor/standalone/server.js` directly.
+  outputFileTracingRoot: __dirname,
 
   // web/proxy.ts clones request bodies before rewriting them. Keep enough room
   // for individual large-body endpoints that still use Proxy. Knowledge-base
@@ -127,6 +139,25 @@ const nextConfig = {
 
   // Transpile mermaid and related packages for proper ESM handling
   transpilePackages: ["mermaid"],
+
+  // Compatibility lives here; every rendered link uses learning-routes.ts.
+  async redirects() {
+    return [
+      // The workspace root has one destination; sessions live under /chat.
+      // Kept out of a page component on purpose: a page that only calls
+      // redirect() throws mid-render, and React 19.2's dev performance track
+      // then measures that aborted render with a negative end time — the
+      // "cannot have a negative time stamp" overlay (vercel/next.js#86060).
+      { source: "/", destination: "/chat", permanent: false },
+      { source: "/mastery/:pathId/study", destination: "/learning/mastery/:pathId/sessions", statusCode: 301 },
+      { source: "/mastery/:pathId/study/:sessionId", destination: "/learning/mastery/:pathId/sessions/:sessionId", statusCode: 301 },
+      ...["books", "mastery", "reading", "watching"].map((surface) => ({
+        source: `/${surface}/:path*`,
+        destination: `/learning/${surface}/:path*`,
+        statusCode: 301,
+      })),
+    ];
+  },
 
   // Next.js 16 blocks cross-origin access to /_next/* dev resources (HMR
   // WebSocket, fonts, dev-only scripts) unless the request host is on this
@@ -153,6 +184,11 @@ const nextConfig = {
   // Webpack configuration (used for production builds - next build)
   webpack: (config) => {
     const path = require("path");
+    config.module.rules.push({
+      test: /locales[/\\]en[/\\]app\.json$/,
+      type: "javascript/auto",
+      use: path.resolve(__dirname, "scripts/compact-locale-loader.cjs"),
+    });
     config.resolve.alias = {
       ...config.resolve.alias,
       cytoscape: path.resolve(

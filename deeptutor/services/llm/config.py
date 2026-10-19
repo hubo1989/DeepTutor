@@ -19,9 +19,14 @@ from typing import TYPE_CHECKING, TypedDict
 from deeptutor.services.config import resolve_llm_runtime_config
 from deeptutor.services.keypool import primary_api_key
 from deeptutor.services.provider_registry import (
+    api_format_for_provider,
+    api_format_from_legacy,
     canonical_provider_name,
+    effective_backend,
     find_by_name,
+    normalize_api_format,
     wire_api_for_provider,
+    wire_api_from_api_format,
 )
 
 from .exceptions import LLMConfigError
@@ -43,9 +48,9 @@ class LLMConfigUpdate(TypedDict, total=False):
     api_version: str | None
     extra_headers: dict[str, str]
     wire_api: str
+    api_format: str
     reasoning_effort: str | None
     context_window: int | None
-    source: str
     max_tokens: int
     temperature: float
     max_concurrency: int
@@ -58,12 +63,12 @@ logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 
-def _is_openai_compatible_binding(binding: str | None) -> bool:
+def _is_openai_compatible(binding: str | None, api_format: str = "auto") -> bool:
     canonical = canonical_provider_name(binding) or (binding or "").strip().lower()
     spec = find_by_name(canonical)
     if not spec or spec.is_oauth:
         return False
-    return spec.backend in {"openai_compat", "azure_openai"}
+    return effective_backend(spec, api_format) in {"openai_compat", "azure_openai"}
 
 
 def _set_openai_env_vars(
@@ -94,7 +99,7 @@ def _setup_openai_env_vars_early() -> None:
         resolved = resolve_llm_runtime_config()
     except Exception:
         return
-    if _is_openai_compatible_binding(resolved.binding):
+    if _is_openai_compatible(resolved.binding, resolved.api_format):
         _set_openai_env_vars(resolved.api_key, resolved.effective_url, source="early init")
 
 
@@ -116,13 +121,9 @@ class LLMConfig:
     api_version: str | None = None
     extra_headers: dict[str, str] | None = None
     wire_api: str = "auto"
+    api_format: str = "auto"
     reasoning_effort: str | None = None
     context_window: int | None = None
-    # Whether this config resolves credentials from the platform catalog or a
-    # request-scoped BYOK profile.  Consumers must use this durable marker
-    # instead of inferring the source from ContextVars, which do not propagate
-    # across every async/thread boundary.
-    source: str = "platform"
     max_tokens: int = 4096
     temperature: float = 0.7
     max_concurrency: int = 20
@@ -133,7 +134,15 @@ class LLMConfig:
         if self.effective_url is None:
             self.effective_url = self.base_url
         spec = find_by_name(self.provider_name) or find_by_name(self.binding)
-        self.wire_api = wire_api_for_provider(self.wire_api, spec)
+        # ``api_format`` is the user-facing protocol choice; ``wire_api`` is the
+        # OpenAI endpoint it implies. Callers that still speak only ``wire_api``
+        # get the format derived from it, so both fields always agree.
+        if normalize_api_format(self.api_format) == "auto":
+            self.api_format = api_format_from_legacy(spec, self.wire_api)
+            self.wire_api = wire_api_for_provider(self.wire_api, spec)
+        else:
+            self.api_format = api_format_for_provider(self.api_format, spec)
+            self.wire_api = wire_api_for_provider(wire_api_from_api_format(self.api_format), spec)
 
     def model_copy(self, update: LLMConfigUpdate | None = None) -> "LLMConfig":
         """Return a copy of the config with optional updates."""
@@ -160,6 +169,11 @@ def set_scoped_llm_config(config: LLMConfig | None) -> Token[LLMConfig | None]:
     return _SCOPED_LLM_CONFIG.set(config)
 
 
+def get_scoped_llm_config() -> LLMConfig | None:
+    """Return the request-local config without falling back to the catalog."""
+    return _SCOPED_LLM_CONFIG.get()
+
+
 def reset_scoped_llm_config(token: Token[LLMConfig | None]) -> None:
     """Reset a scoped LLM config token returned by ``set_scoped_llm_config``."""
     _SCOPED_LLM_CONFIG.reset(token)
@@ -173,7 +187,7 @@ def initialize_environment() -> None:
     aligned with current config values.
     """
     resolved = resolve_llm_runtime_config()
-    if _is_openai_compatible_binding(resolved.binding):
+    if _is_openai_compatible(resolved.binding, resolved.api_format):
         _set_openai_env_vars(
             resolved.api_key,
             resolved.effective_url,
@@ -217,9 +231,9 @@ def _get_llm_config_from_resolver() -> LLMConfig:
         api_version=resolved.api_version,
         extra_headers=resolved.extra_headers,
         wire_api=resolved.wire_api,
+        api_format=resolved.api_format,
         reasoning_effort=resolved.reasoning_effort,
         context_window=resolved.context_window,
-        source=getattr(resolved, "source", "platform"),
     )
 
 
@@ -239,26 +253,11 @@ def get_llm_config() -> LLMConfig:
     if scoped is not None:
         return scoped
 
-    # The process cache contains the deployment/admin active model and its
-    # credential. It is never a safe source for an ordinary user: resolve the
-    # caller's currently granted platform model or owner-bound BYOK profile on
-    # every request instead. This also makes grant changes effective without a
-    # process-wide cache flush.
-    from deeptutor.multi_user.context import get_current_user
-
-    if not get_current_user().is_admin:
-        return _get_llm_config_from_resolver()
-
     if _LLM_CONFIG_CACHE is not None:
         return _LLM_CONFIG_CACHE
 
     _LLM_CONFIG_CACHE = _get_llm_config_from_resolver()
     return _LLM_CONFIG_CACHE
-
-
-def get_scoped_llm_config() -> LLMConfig | None:
-    """Return the request-local config without falling back to the catalog."""
-    return _SCOPED_LLM_CONFIG.get()
 
 
 async def get_llm_config_async() -> LLMConfig:
@@ -338,7 +337,6 @@ def get_token_limit_kwargs(model: str, max_tokens: int) -> dict[str, int]:
 __all__ = [
     "LLMConfig",
     "get_llm_config",
-    "get_scoped_llm_config",
     "get_llm_config_async",
     "clear_llm_config_cache",
     "reload_config",

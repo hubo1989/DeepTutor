@@ -1,5 +1,6 @@
 "use client";
 
+import Tooltip from "@/shared/ui/Tooltip";
 import { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Github, Loader2, Plus, RefreshCw, Trash2 } from "lucide-react";
@@ -10,7 +11,7 @@ import {
   syncGitHubSources,
   type GitHubSource,
   type GitHubSyncResult,
-} from "@/lib/knowledge-api";
+} from "@/features/knowledge/api/sources";
 import { formatKnowledgeTimestamp } from "@/lib/knowledge-helpers";
 
 interface KbGitHubSourcesSectionProps {
@@ -124,7 +125,7 @@ export default function KbGitHubSourcesSection({
           </div>
           <p className="mt-0.5 text-[11.5px] text-[var(--muted-foreground)]">
             {t(
-              "Track a GitHub repo's Markdown docs. DeepTutor auto-syncs daily; you can also trigger a sync manually.",
+              "Track a GitHub repo's Markdown docs. LearnLeader auto-syncs daily; you can also trigger a sync manually.",
             )}
           </p>
         </div>
@@ -169,7 +170,7 @@ export default function KbGitHubSourcesSection({
                 type="text"
                 value={repoInput}
                 onChange={(e) => setRepoInput(e.target.value)}
-                placeholder={t("e.g. HKUDS/DeepTutor")}
+                placeholder={t("e.g. hubo1989/LearnLeader")}
                 className="w-full rounded-md border border-[var(--border)] bg-[var(--card)] px-2.5 py-1.5 text-[12.5px] text-[var(--foreground)] outline-none focus:border-[var(--primary)]"
               />
             </FormField>
@@ -305,14 +306,16 @@ function SourceCard({
           </p>
         )}
       </div>
-      <button
-        type="button"
-        onClick={onRemove}
-        title={t("Remove source")}
-        className="shrink-0 rounded-md p-1.5 text-[var(--muted-foreground)] transition-colors hover:bg-[var(--muted)] hover:text-red-600"
-      >
-        <Trash2 className="h-3.5 w-3.5" />
-      </button>
+      <Tooltip label={t("Remove source")} side="top">
+        <button
+          type="button"
+          onClick={onRemove}
+          aria-label={t("Remove source")}
+          className="shrink-0 rounded-md p-1.5 text-[var(--muted-foreground)] transition-colors hover:bg-[var(--muted)] hover:text-red-600"
+        >
+          <Trash2 className="h-3.5 w-3.5" />
+        </button>
+      </Tooltip>
     </div>
   );
 }

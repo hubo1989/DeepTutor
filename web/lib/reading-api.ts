@@ -8,9 +8,11 @@ import { apiFetch, apiUrl } from "@/lib/api";
 // unit word is carried on the material so the UI can say "page 12" or
 // "chapter 3" without ever branching on the file type itself.
 
-export type UnitKind = "page" | "chapter" | "slide" | "section";
-export type AnnotationKind = "highlight" | "underline" | "note";
+export type UnitKind = "page" | "chapter" | "slide" | "section" | "segment";
+export type AnnotationKind = "highlight" | "underline" | "note" | "citation";
 export type ExportFormat = "auto" | "pdf" | "markdown";
+export type RenderMode = "text" | "pdf" | "epub" | "video" | "audio";
+export type ContentFormat = "plain_text" | "web_markdown";
 
 /** Palette offered by the annotation toolbar; mirrored server-side. */
 export const ANNOTATION_COLORS = [
@@ -21,6 +23,21 @@ export const ANNOTATION_COLORS = [
   "purple",
 ] as const;
 export type AnnotationColor = (typeof ANNOTATION_COLORS)[number];
+
+/**
+ * Swatch for each highlight colour.
+ *
+ * Deliberately literal rather than themed: a highlight is content — it is
+ * written into the exported PDF and has to look the same everywhere the
+ * annotation is read back.
+ */
+export const ANNOTATION_SWATCH: Record<AnnotationColor, string> = {
+  yellow: "#facd5a",
+  green: "#8cdb94",
+  blue: "#7ac0fa",
+  pink: "#faa1c7",
+  purple: "#c7aefa",
+};
 
 export interface MaterialInfo {
   material_id: string;
@@ -34,6 +51,12 @@ export interface MaterialInfo {
   created_at: number;
   /** True when the original bytes can be rendered faithfully (PDF today). */
   has_raw_view: boolean;
+  render_mode: RenderMode;
+  extractor: string;
+  content_format?: ContentFormat;
+  source_type?: string;
+  source_url?: string;
+  revision?: number;
   annotation_count: number;
 }
 
@@ -42,11 +65,20 @@ export interface OutlineRow {
   title: string;
   level: number;
   synthesised: boolean;
+  source_href?: string;
+  source_anchor?: string;
 }
 
 export interface MaterialDetail extends MaterialInfo {
   outline: OutlineRow[];
   outline_text: string;
+  unit_refs: UnitReference[];
+}
+
+export interface UnitReference {
+  locator: number;
+  source_href: string;
+  title: string;
 }
 
 /**
@@ -59,14 +91,36 @@ export interface MaterialDetail extends MaterialInfo {
  */
 export type NormalisedRect = [number, number, number, number];
 
+export type ReadingTextSelector =
+  | {
+      type: "TextQuoteSelector";
+      exact: string;
+      prefix?: string;
+      suffix?: string;
+    }
+  | {
+      type: "TextPositionSelector";
+      start: number;
+      end: number;
+    };
+
 export interface AnnotationItem {
   annotation_id: string;
   locator: number;
+  material_revision?: number;
   kind: AnnotationKind;
   color: string;
   quote: string;
   note: string;
   rects: NormalisedRect[];
+  source_anchor: string;
+  selectors?: ReadingTextSelector[];
+  /**
+   * Selector validity against the current content revision. Backend revision
+   * migration marks rows "unresolved" or "ambiguous" when the stored quote
+   * no longer identifies exactly one passage in the new text.
+   */
+  resolution?: "resolved" | "unresolved" | "ambiguous";
   /** "user" or "assistant" — the model can annotate too. */
   author: string;
   created_at: number;
@@ -81,6 +135,48 @@ export interface AnnotationDraft {
   quote?: string;
   note?: string;
   rects?: NormalisedRect[];
+  source_anchor?: string;
+  selectors?: ReadingTextSelector[];
+}
+
+export interface ReadingPosition {
+  locator: number;
+  source_anchor: string;
+  percentage: number;
+  updated_at: number;
+}
+
+export function parseReadingPosition(payload: unknown): ReadingPosition {
+  if (!payload || typeof payload !== "object") {
+    throw new Error("Invalid reading position response");
+  }
+  const position = payload as Record<string, unknown>;
+  if (
+    typeof position.locator !== "number" ||
+    !Number.isFinite(position.locator) ||
+    position.locator < 1 ||
+    typeof position.source_anchor !== "string" ||
+    typeof position.percentage !== "number" ||
+    !Number.isFinite(position.percentage) ||
+    typeof position.updated_at !== "number" ||
+    !Number.isFinite(position.updated_at)
+  ) {
+    throw new Error("Invalid reading position response");
+  }
+  return position as unknown as ReadingPosition;
+}
+
+/**
+ * A place the reader chose to keep, as opposed to the position above — which
+ * is the single automatic "where I got to", overwritten on every move. These
+ * are deliberate and plural, and each has its own id.
+ */
+export interface ReadingBookmark {
+  bookmark_id: string;
+  locator: number;
+  label: string;
+  source_anchor: string;
+  created_at: number;
 }
 
 export interface SupportedFormats {
@@ -89,7 +185,30 @@ export interface SupportedFormats {
   raw_view_extensions: string[];
 }
 
-const BASE = "/api/v1/reading";
+export interface ReadingExtensionAction {
+  id: string;
+  label: string;
+  trigger: "toolbar";
+  requires: Array<"selection" | "visible_text">;
+}
+
+export interface ReadingExtensionManifest {
+  id: string;
+  version: string;
+  name: string;
+  protocol_version: "1";
+  actions: ReadingExtensionAction[];
+  result_types: Array<"card" | "quiz" | "feedback" | "browser_speech">;
+}
+
+export interface ReadingExtensionResult {
+  type: "card" | "quiz" | "feedback" | "browser_speech";
+  title: string;
+  message: string;
+  payload: Record<string, unknown>;
+}
+
+const BASE = "/api/reading";
 
 /** Surface the server's own message — it explains what the user can do next. */
 async function unwrap<T>(response: Response): Promise<T> {
@@ -98,6 +217,13 @@ async function unwrap<T>(response: Response): Promise<T> {
   try {
     const body = (await response.json()) as { detail?: unknown };
     if (typeof body?.detail === "string" && body.detail) detail = body.detail;
+    else if (
+      typeof body?.detail === "object" &&
+      body.detail !== null &&
+      "message" in body.detail
+    ) {
+      detail = String((body.detail as { message: unknown }).message);
+    }
   } catch {
     // Non-JSON error body (a proxy page, say) — keep the status line.
   }
@@ -114,11 +240,21 @@ export async function listMaterials(): Promise<MaterialInfo[]> {
   );
 }
 
-export async function uploadMaterial(file: File): Promise<MaterialDetail> {
+export async function uploadMaterial(
+  file: File,
+  options?: { reuse?: boolean },
+): Promise<MaterialDetail> {
   const form = new FormData();
   form.append("file", file, file.name);
+  // reuse=false asks the server to mint a separate material for content it
+  // already holds, so a second copy carries its own annotations instead of
+  // silently collapsing onto the first upload.
+  const query = options?.reuse === false ? "?reuse=false" : "";
   return unwrap(
-    await apiFetch(apiUrl(`${BASE}/materials`), { method: "POST", body: form }),
+    await apiFetch(apiUrl(`${BASE}/materials${query}`), {
+      method: "POST",
+      body: form,
+    }),
   );
 }
 
@@ -149,9 +285,289 @@ export async function getUnitText(
   );
 }
 
+export interface MaterialMediaItem {
+  name: string;
+  locator: number;
+  mime: string;
+  bytes: number;
+}
+
+/** Embedded images (DOCX/PPTX) with the locator each belongs to. */
+export async function getMaterialMedia(
+  materialId: string,
+): Promise<MaterialMediaItem[]> {
+  const payload: unknown = await unwrap(
+    await apiFetch(apiUrl(`${BASE}/materials/${materialId}/media`), {
+      cache: "no-store",
+    }),
+  );
+  if (!Array.isArray(payload)) return [];
+  return payload.filter(
+    (row): row is MaterialMediaItem =>
+      Boolean(row) &&
+      typeof row === "object" &&
+      typeof (row as MaterialMediaItem).name === "string" &&
+      Number.isFinite((row as MaterialMediaItem).locator),
+  );
+}
+
+/** Public URL for one stored embedded image. */
+export function materialMediaUrl(materialId: string, name: string): string {
+  return apiUrl(
+    `${BASE}/materials/${encodeURIComponent(materialId)}/media/${encodeURIComponent(name)}`,
+  );
+}
+
+export interface ReadingTranscript {
+  material_id: string;
+  revision: number;
+  unit_count: number;
+  truncated: boolean;
+  segments: {
+    locator: number;
+    text: string;
+    title: string;
+    source_href: string;
+  }[];
+}
+
+/**
+ * Every transcript segment of a timed material in one round trip.
+ *
+ * Segments follow the speaker's sentences, so a lecture has hundreds of them —
+ * one request each would be hundreds of requests to draw a single panel.
+ */
+export async function getReadingTranscript(
+  materialId: string,
+): Promise<ReadingTranscript> {
+  return unwrap(
+    await apiFetch(apiUrl(`${BASE}/materials/${materialId}/transcript`), {
+      cache: "no-store",
+    }),
+  );
+}
+
+export async function listReadingExtensions(): Promise<
+  ReadingExtensionManifest[]
+> {
+  const payload: unknown = await unwrap(
+    await apiFetch(apiUrl(`${BASE}/extensions`), { cache: "no-store" }),
+  );
+  if (!Array.isArray(payload)) return [];
+  return payload.filter(
+    (row): row is ReadingExtensionManifest =>
+      Boolean(row) &&
+      typeof row === "object" &&
+      typeof (row as ReadingExtensionManifest).id === "string" &&
+      Array.isArray((row as ReadingExtensionManifest).actions),
+  );
+}
+
+export async function runReadingExtension(
+  materialId: string,
+  extensionId: string,
+  action: string,
+  context: {
+    locator: number;
+    selection?: string;
+    locale?: string;
+  },
+): Promise<ReadingExtensionResult> {
+  return unwrap(
+    await apiFetch(
+      apiUrl(
+        `${BASE}/materials/${materialId}/extensions/${extensionId}/actions/${action}`,
+      ),
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(context),
+      },
+    ),
+  );
+}
+
+/**
+ * Fetch natural speech for a stored reading unit.
+ *
+ * The request deliberately carries no text: the server re-reads the material
+ * unit and is the only side that can decide what restricted learners may hear.
+ */
+export async function readReadingAloudAudio(
+  materialId: string,
+  context: { locator: number },
+): Promise<Blob> {
+  const response = await apiFetch(
+    apiUrl(`${BASE}/materials/${materialId}/read-aloud`),
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(context),
+    },
+  );
+  if (response.ok) return response.blob();
+
+  let detail = `Request failed: ${response.status}`;
+  try {
+    const body = (await response.json()) as { detail?: unknown };
+    if (typeof body?.detail === "string" && body.detail) detail = body.detail;
+    else if (typeof body?.detail === "object" && body.detail !== null && "message" in body.detail) {
+      detail = String((body.detail as { message: unknown }).message);
+    }
+  } catch {
+    // Binary and proxy error bodies both fall back to the status message.
+  }
+  throw new Error(detail);
+}
+
+export interface ReadingQuizAnswer {
+  question_id: string;
+  selected_index: number;
+}
+
+export interface ReadingQuizAnswerVerdict {
+  question_id: string;
+  is_correct: boolean;
+  result: "correct" | "incorrect" | "partial" | "ungraded";
+}
+
+export interface ReadingQuizReward {
+  locator: number;
+  stars: number;
+  updated_at: number;
+  awarded: boolean;
+}
+
+/**
+ * Persist a reading Focus-Check on the server.
+ *
+ * The browser sends only the chosen index and shows the server's verdict
+ * after the answer has been saved successfully.
+ */
+export async function submitReadingQuizAnswers(
+  materialId: string,
+  payload: {
+    locator: number;
+    source_anchor?: string;
+    section_title?: string;
+    session_id?: string;
+    turn_id?: string;
+    submission_id?: string;
+    answers: ReadingQuizAnswer[];
+  },
+): Promise<{
+  answers: ReadingQuizAnswerVerdict[];
+  reward?: ReadingQuizReward;
+}> {
+  const data = await unwrap<{
+    answers?: ReadingQuizAnswerVerdict[];
+    reward?: ReadingQuizReward;
+  }>(
+    await apiFetch(
+      apiUrl(`${BASE}/materials/${materialId}/extensions/quiz/answers`),
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          locator: payload.locator,
+          source_anchor: payload.source_anchor || "",
+          section_title: payload.section_title || "",
+          session_id: payload.session_id || "",
+          turn_id: payload.turn_id || "",
+          submission_id: payload.submission_id || "",
+          answers: payload.answers.map((row) => ({
+            question_id: row.question_id,
+            selected_index: row.selected_index,
+          })),
+        }),
+      },
+    ),
+  );
+  return { answers: data.answers ?? [], reward: data.reward };
+}
+
+export async function listReadingQuizRewards(
+  materialId: string,
+): Promise<{ rewards: ReadingQuizReward[]; total_stars: number }> {
+  return unwrap(
+    await apiFetch(apiUrl(`${BASE}/materials/${materialId}/quiz/rewards`), {
+      cache: "no-store",
+    }),
+  );
+}
+
 /** URL of the original bytes. Served with Range support so pdf.js can stream. */
 export function rawMaterialUrl(materialId: string): string {
   return apiUrl(`${BASE}/materials/${materialId}/raw`);
+}
+
+export function renderMaterialUrl(materialId: string): string {
+  return apiUrl(`${BASE}/materials/${materialId}/render`);
+}
+
+export async function getReadingPosition(
+  materialId: string,
+): Promise<ReadingPosition> {
+  return parseReadingPosition(
+    await unwrap(
+      await apiFetch(apiUrl(`${BASE}/materials/${materialId}/position`), {
+        cache: "no-store",
+      }),
+    ),
+  );
+}
+
+export async function saveReadingPosition(
+  materialId: string,
+  position: Pick<ReadingPosition, "locator" | "source_anchor"> & Partial<Pick<ReadingPosition, "percentage">>,
+): Promise<ReadingPosition> {
+  return parseReadingPosition(
+    await unwrap(
+      await apiFetch(apiUrl(`${BASE}/materials/${materialId}/position`), {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(position),
+      }),
+    ),
+  );
+}
+
+export async function listBookmarks(
+  materialId: string,
+): Promise<ReadingBookmark[]> {
+  const data = await unwrap<{ bookmarks?: ReadingBookmark[] }>(
+    await apiFetch(apiUrl(`${BASE}/materials/${materialId}/bookmarks`), {
+      cache: "no-store",
+    }),
+  );
+  return data.bookmarks ?? [];
+}
+
+/** Keep a place. Bookmarking an already-kept locator returns that bookmark. */
+export async function addBookmark(
+  materialId: string,
+  locator: number,
+  label = "",
+): Promise<ReadingBookmark> {
+  return unwrap(
+    await apiFetch(apiUrl(`${BASE}/materials/${materialId}/bookmarks`), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ locator, label }),
+    }),
+  );
+}
+
+export async function deleteBookmark(
+  materialId: string,
+  bookmarkId: string,
+): Promise<void> {
+  await unwrap(
+    await apiFetch(
+      apiUrl(`${BASE}/materials/${materialId}/bookmarks/${bookmarkId}`),
+      { method: "DELETE" },
+    ),
+  );
 }
 
 export async function listAnnotations(

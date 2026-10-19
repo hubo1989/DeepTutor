@@ -147,7 +147,7 @@ def test_backend_uploads_copy_and_keeps_configuration(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cloud, "parse_cloud", parse)
     assert (
-        backend.parse_pdf_to_workdir(source, tmp_path / "out", config=CFG)
+        backend.parse_document_to_workdir(source, tmp_path / "out", config=CFG)
         == tmp_path / "out" / "scan"
     )
     assert len(calls) == 1 and not calls[0].exists()
@@ -176,3 +176,52 @@ async def test_settings_enable_disable_and_legacy_save_preserves_opt_in(tmp_path
         settings.DocumentParsingUpdate(engines={"mineru": {"normalize_tiny_scans": False}})
     )
     assert not config.resolve_mineru_config().normalize_tiny_scans
+
+
+@pytest.mark.asyncio
+async def test_normalization_and_slicing_survive_settings_updates_and_profile_export(
+    tmp_path, monkeypatch
+):
+    from dataclasses import replace
+
+    from deeptutor.api.routers import settings
+    from deeptutor.services.config.runtime_settings import RuntimeSettingsService
+    from deeptutor.services.config.settings_profile import (
+        export_settings_profile,
+        review_settings_profile_import,
+    )
+    from deeptutor.services.parsing.engines.mineru import config
+    from deeptutor.services.parsing.engines.mineru.engine import MinerUParser
+
+    service = RuntimeSettingsService(tmp_path / "settings", process_env={})
+    monkeypatch.setattr(settings, "_require_settings_admin", lambda: None)
+    monkeypatch.setattr(settings, "get_runtime_settings_service", lambda: service)
+    monkeypatch.setattr(settings, "_document_parsing_payload", service.load_document_parsing)
+    monkeypatch.setattr(settings, "_mineru_settings_payload", service.load_mineru)
+    monkeypatch.setattr(config, "load_mineru_settings", service.load_mineru)
+    await settings.update_document_parsing_settings(
+        settings.DocumentParsingUpdate(
+            engines={
+                "mineru": {"mode": "cloud", "normalize_tiny_scans": True, "max_pages_per_part": 90}
+            }
+        )
+    )
+    await settings.update_mineru_settings(
+        settings.MinerUSettingsUpdate(mode="cloud", language="en")
+    )
+    effective = config.resolve_mineru_config()
+    assert effective.normalize_tiny_scans is True
+    assert effective.max_pages_per_part == 90
+    exported = export_settings_profile(service=service, catalog={})
+    portable = exported["profile"]["settings"]["document_parsing"]["engines"]["mineru"]
+    assert portable["normalize_tiny_scans"] is True
+    assert portable["max_pages_per_part"] == 90
+    assert review_settings_profile_import(exported, service=service, catalog={})["summary"] == {
+        "changed": 0,
+        "unsupported": 0,
+        "compatible": True,
+    }
+    parser = MinerUParser()
+    signature = parser.signature(effective)
+    assert signature != parser.signature(replace(effective, normalize_tiny_scans=False))
+    assert signature != parser.signature(replace(effective, max_pages_per_part=180))

@@ -76,7 +76,16 @@ class AddRecordRequest(BaseModel):
     """Add record request"""
 
     notebook_ids: list[str]
-    record_type: Literal["solve", "question", "research", "chat", "co_writer", "tutorbot"]
+    record_type: Literal[
+        "solve",
+        "question",
+        "research",
+        "chat",
+        "co_writer",
+        "tutorbot",
+        "reading",
+        "video_learning",
+    ]
     title: str
     summary: str = ""
     user_query: str
@@ -185,13 +194,13 @@ async def _stream_add_record_with_summary(
 # NOTE: every literal path below must stay above the `/{notebook_id}` routes.
 # FastAPI matches in declaration order, so a literal declared later is shadowed
 # by the parameterised route and becomes unreachable.
-@router.get("/health")
+@router.get("/notebooks/health")
 async def health_check():
     """Health check"""
     return {"status": "healthy", "service": "notebook"}
 
 
-@router.get("/list")
+@router.get("/notebooks")
 async def list_notebooks():
     """
     Get all notebook list
@@ -208,7 +217,7 @@ async def list_notebooks():
         _raise_notebook_error(e)
 
 
-@router.get("/statistics")
+@router.get("/notebooks/statistics")
 async def get_statistics():
     """
     Get notebook statistics
@@ -225,7 +234,7 @@ async def get_statistics():
         _raise_notebook_error(e)
 
 
-@router.post("/create")
+@router.post("/notebooks")
 async def create_notebook(request: CreateNotebookRequest):
     """
     Create new notebook
@@ -250,7 +259,7 @@ async def create_notebook(request: CreateNotebookRequest):
         _raise_notebook_error(e)
 
 
-@router.get("/{notebook_id}")
+@router.get("/notebooks/{notebook_id}")
 async def get_notebook(notebook_id: str):
     """
     Get notebook details
@@ -274,7 +283,7 @@ async def get_notebook(notebook_id: str):
         _raise_notebook_error(e)
 
 
-@router.put("/{notebook_id}")
+@router.put("/notebooks/{notebook_id}")
 async def update_notebook(notebook_id: str, request: UpdateNotebookRequest):
     """
     Update notebook information
@@ -305,7 +314,7 @@ async def update_notebook(notebook_id: str, request: UpdateNotebookRequest):
         _raise_notebook_error(e)
 
 
-@router.delete("/{notebook_id}")
+@router.delete("/notebooks/{notebook_id}")
 async def delete_notebook(notebook_id: str):
     """
     Delete notebook
@@ -329,7 +338,7 @@ async def delete_notebook(notebook_id: str):
         _raise_notebook_error(e)
 
 
-@router.post("/add_record")
+@router.post("/notebooks/actions/add-record")
 async def add_record(request: AddRecordRequest):
     """
     Add record to notebook
@@ -364,7 +373,7 @@ async def add_record(request: AddRecordRequest):
         _raise_notebook_error(e)
 
 
-@router.post("/add_record_with_summary")
+@router.post("/notebooks/actions/add-record-with-summary")
 async def add_record_with_summary(request: AddRecordRequest):
     """Add record to notebook and stream generated summary."""
     return StreamingResponse(
@@ -374,7 +383,7 @@ async def add_record_with_summary(request: AddRecordRequest):
     )
 
 
-@router.delete("/{notebook_id}/records/{record_id}")
+@router.delete("/notebooks/{notebook_id}/records/{record_id}")
 async def remove_record(notebook_id: str, record_id: str):
     """
     Remove record from notebook
@@ -399,7 +408,7 @@ async def remove_record(notebook_id: str, record_id: str):
         _raise_notebook_error(e)
 
 
-@router.put("/{notebook_id}/records/{record_id}")
+@router.put("/notebooks/{notebook_id}/records/{record_id}")
 async def update_record(notebook_id: str, record_id: str, request: UpdateRecordRequest):
     """Update an existing notebook record in place."""
     try:
@@ -427,7 +436,7 @@ async def update_record(notebook_id: str, record_id: str, request: UpdateRecordR
         _raise_notebook_error(e)
 
 
-@router.post("/{notebook_id}/records/{record_id}/copy")
+@router.post("/notebooks/{notebook_id}/records/{record_id}/actions/copy")
 async def copy_record(notebook_id: str, record_id: str, request: MoveRecordRequest):
     """Duplicate a record into another notebook under a fresh id."""
     try:
@@ -443,7 +452,7 @@ async def copy_record(notebook_id: str, record_id: str, request: MoveRecordReque
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/{notebook_id}/records/{record_id}/move")
+@router.post("/notebooks/{notebook_id}/records/{record_id}/actions/move")
 async def move_record(notebook_id: str, record_id: str, request: MoveRecordRequest):
     """Move a record from this notebook into another one."""
     try:
@@ -459,7 +468,7 @@ async def move_record(notebook_id: str, record_id: str, request: MoveRecordReque
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/{notebook_id}/export", response_class=PlainTextResponse)
+@router.get("/notebooks/{notebook_id}/export", response_class=PlainTextResponse)
 async def export_notebook(notebook_id: str):
     """Render the whole notebook as a single Markdown document."""
     try:

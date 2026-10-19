@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncGenerator, Mapping
 import contextlib
-import json
 from types import SimpleNamespace
 from typing import Any, TypedDict
 
@@ -14,6 +13,7 @@ from deeptutor.services.keypool import primary_api_key
 from deeptutor.services.provider_registry import (
     PROVIDERS,
     canonical_provider_name,
+    effective_backend,
     find_by_model,
     find_by_name,
     find_gateway,
@@ -23,8 +23,9 @@ from .capabilities import supports_response_format, supports_vision
 from .config import LLMConfig, get_llm_config
 from .error_mapping import map_error
 from .multimodal import prepare_multimodal_messages
-from .provider_factory import get_runtime_provider
-from .usage_estimation import estimate_prompt_tokens
+from .provider_core.base import LLMProvider
+from .provider_factory import build_isolated_provider, get_runtime_provider
+from .types import StreamOutcome
 from .utils import is_local_llm_server
 
 DEFAULT_MAX_RETRIES = settings.retry.max_retries
@@ -160,7 +161,6 @@ def _resolve_call_config(
     base_url: str | None,
     api_version: str | None,
     binding: str | None,
-    source: str | None,
     extra_headers: dict[str, str] | None,
     reasoning_effort: str | None,
 ) -> tuple[LLMConfig, Any]:
@@ -206,14 +206,8 @@ def _resolve_call_config(
             api_version=api_version,
             extra_headers=merged_headers,
             wire_api=current.wire_api if current is not None else "auto",
+            api_format=current.api_format if current is not None else "auto",
             reasoning_effort=resolved_reasoning_effort,
-            source=(
-                "byok"
-                if source == "byok"
-                else getattr(current, "source", "platform")
-                if current is not None
-                else "platform"
-            ),
         )
         return config, provider_spec
 
@@ -251,19 +245,17 @@ def _resolve_call_config(
             "api_version": resolved_api_version,
             "extra_headers": merged_headers,
             "wire_api": current.wire_api,
+            "api_format": current.api_format,
             "reasoning_effort": (
                 reasoning_effort if reasoning_effort is not None else current.reasoning_effort
             ),
-            "source": "byok" if source == "byok" else getattr(current, "source", "platform"),
         }
     )
     return config, provider_spec
 
 
 def _capability_binding(config: LLMConfig, provider_spec: Any) -> str:
-    backend = (
-        getattr(provider_spec, "backend", "openai_compat") if provider_spec else "openai_compat"
-    )
+    backend = effective_backend(provider_spec, config.api_format)
     if backend == "anthropic":
         return "anthropic"
     if backend == "azure_openai":
@@ -284,195 +276,6 @@ def _build_messages(
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": prompt},
     ]
-
-
-def _estimate_factory_request_tokens(
-    messages: list[dict[str, Any]],
-    *,
-    max_tokens: int,
-) -> tuple[int, int]:
-    """Return conservative total and prompt estimates shared by both ledgers."""
-    prompt_estimate = max(1, estimate_prompt_tokens(messages))
-    return prompt_estimate + max(1, int(max_tokens)), prompt_estimate
-
-
-def _commercial_factory_request_tokens(
-    messages: list[dict[str, Any]],
-    *,
-    max_tokens: int,
-    request_options: Mapping[str, Any] | None = None,
-) -> int:
-    """Use serialized UTF-8 bytes as a tokenizer-independent request bound.
-
-    Tool and response schemas are billed input on several providers.  Keeping
-    the complete sanitized request options in the bound prevents a caller from
-    bypassing the reservation with a tiny message and a very large schema.
-    """
-
-    try:
-        serialized = json.dumps(
-            {"messages": messages, "options": dict(request_options or {})},
-            ensure_ascii=False,
-            default=str,
-            separators=(",", ":"),
-        )
-    except (TypeError, ValueError):
-        serialized = str((messages, request_options))
-    return max(1, len(serialized.encode("utf-8"))) + max(1, int(max_tokens))
-
-
-async def _reserve_factory_commercial(
-    config: LLMConfig,
-    messages: list[dict[str, Any]],
-    *,
-    max_tokens: int,
-    request_options: Mapping[str, Any] | None = None,
-    request_id: str | None = None,
-) -> tuple[Any, int]:
-    from deeptutor.commercial.metering import (
-        CommercialUsageLimitExceeded,
-        CommercialUsageUnavailable,
-        reserve_commercial_usage,
-    )
-
-    from .exceptions import LLMProviderError, LLMRateLimitError
-
-    requested = _commercial_factory_request_tokens(
-        messages,
-        max_tokens=max_tokens,
-        request_options=request_options,
-    )
-    try:
-        lease = await reserve_commercial_usage(
-            meter="llm_tokens",
-            quantity=requested,
-            source=getattr(config, "source", "platform"),
-            provider=config.provider_name or config.binding,
-            model=config.model,
-            request_id=request_id,
-        )
-    except CommercialUsageLimitExceeded as exc:
-        raise LLMRateLimitError(str(exc), provider="deeptutor") from exc
-    except CommercialUsageUnavailable as exc:
-        raise LLMProviderError(str(exc), provider="deeptutor") from exc
-    return lease, requested
-
-
-async def _finalize_factory_commercial(
-    lease: Any,
-    usage: Any,
-    *,
-    requested: int,
-) -> None:
-    if lease is None:
-        return
-    from deeptutor.commercial.metering import (
-        CommercialUsageUnavailable,
-        measurement_from_usage,
-    )
-
-    from .exceptions import LLMProviderError
-
-    measurement = measurement_from_usage(
-        usage,
-        fallback_quantity=requested,
-        meter="llm_tokens",
-    )
-    try:
-        await lease.finalize(
-            measurement.quantity,
-            usage_units=measurement.units,
-            is_estimated=measurement.is_estimated,
-        )
-    except CommercialUsageUnavailable as exc:
-        raise LLMProviderError(str(exc), provider="deeptutor") from exc
-
-
-def _reserve_factory_quota(
-    config: LLMConfig,
-    messages: list[dict[str, Any]],
-    *,
-    max_tokens: int,
-) -> tuple[Any, int]:
-    """Reserve a bounded user's tokens for the services-layer factory path."""
-    if getattr(config, "source", "platform") != "platform":
-        return None, 0
-    from deeptutor.multi_user.token_quota import (
-        TokenQuotaExceeded,
-        TokenQuotaUnavailable,
-        reserve_current_user_tokens,
-    )
-
-    from .exceptions import LLMProviderError, LLMRateLimitError
-
-    requested, prompt_estimate = _estimate_factory_request_tokens(messages, max_tokens=max_tokens)
-    output_estimate = requested - prompt_estimate
-    try:
-        lease = reserve_current_user_tokens(
-            requested_tokens=requested,
-            prompt_tokens_estimate=prompt_estimate,
-            output_tokens_estimate=output_estimate,
-        )
-    except TokenQuotaExceeded as exc:
-        raise LLMRateLimitError(str(exc), provider="deeptutor") from exc
-    except TokenQuotaUnavailable as exc:
-        raise LLMProviderError(str(exc), provider="deeptutor") from exc
-    return lease, requested
-
-
-def _start_byok_factory_usage(
-    config: LLMConfig,
-    messages: list[dict[str, Any]],
-    *,
-    max_tokens: int,
-) -> tuple[Any, int]:
-    """Apply BYOK safety limits without entering the platform quota ledger."""
-    from deeptutor.multi_user.execution_source import get_execution_source
-
-    if getattr(config, "source", "platform") == "platform":
-        return None, 0
-    from deeptutor.multi_user.byok_usage import (
-        ByokUsageLimitExceeded,
-        ByokUsageUnavailable,
-        start_byok_usage,
-    )
-
-    from .exceptions import LLMProviderError, LLMRateLimitError
-
-    requested, _prompt_estimate = _estimate_factory_request_tokens(messages, max_tokens=max_tokens)
-    source = get_execution_source()
-    if source is None:
-        from deeptutor.multi_user.context import get_current_user
-
-        user_id = get_current_user().id
-        profile_id = "unknown"
-    else:
-        user_id = source.user_id
-        profile_id = source.profile_id or "unknown"
-    try:
-        lease = start_byok_usage(
-            service="llm",
-            user_id=user_id,
-            profile_id=profile_id,
-            provider=config.provider_name or config.binding or "openai-compatible",
-            model=config.model,
-            estimated_units=requested,
-        )
-    except ByokUsageLimitExceeded as exc:
-        raise LLMRateLimitError(str(exc), provider="deeptutor") from exc
-    except ByokUsageUnavailable as exc:
-        raise LLMProviderError(str(exc), provider="deeptutor") from exc
-    return lease, requested
-
-
-def _configured_max_tokens(config: LLMConfig, extra_kwargs: dict[str, Any]) -> int:
-    raw = extra_kwargs.get("max_completion_tokens", extra_kwargs.get("max_tokens"))
-    if raw is None:
-        raw = getattr(config, "max_tokens", 4096)
-    try:
-        return max(1, int(raw))
-    except (TypeError, ValueError):
-        return 4096
 
 
 def _coerce_stream_coalesce_chars(value: Any) -> int:
@@ -527,8 +330,12 @@ def _sanitize_call_kwargs(
         "base_url",
         "api_version",
         "binding",
+        "effective_url",
         "extra_headers",
+        "provider_mode",
+        "provider_name",
         "reasoning_effort",
+        "wire_api",
     ):
         extra_kwargs.pop(key, None)
 
@@ -537,42 +344,25 @@ def _sanitize_call_kwargs(
     return extra_kwargs
 
 
-async def complete(
+async def _complete_with_resolved_config(
+    config: LLMConfig,
+    provider_spec: Any,
+    *,
     prompt: str,
-    system_prompt: str = "You are a helpful assistant.",
-    model: str | None = None,
-    api_key: str | list[str] | None = None,
-    base_url: str | None = None,
-    api_version: str | None = None,
-    binding: str | None = None,
-    source: str | None = None,
-    messages: list[dict[str, Any]] | None = None,
-    max_retries: int = DEFAULT_MAX_RETRIES,
-    retry_delay: float = DEFAULT_RETRY_DELAY,
-    exponential_backoff: bool = DEFAULT_EXPONENTIAL_BACKOFF,
-    allow_image_fallback: bool | None = None,
-    **kwargs: Any,
+    system_prompt: str,
+    messages: list[dict[str, Any]] | None,
+    max_retries: int,
+    retry_delay: float,
+    exponential_backoff: bool,
+    allow_image_fallback: bool | None,
+    image_data: str | None,
+    image_mime_type: str,
+    image_filename: str,
+    kwargs: dict[str, Any],
+    provider: LLMProvider | None = None,
 ) -> str:
-    # DeepTutor-only idempotency metadata. Pop it before request sanitization
-    # so it neither changes the usage bound nor reaches provider kwargs.
-    commercial_request_id = kwargs.pop("_commercial_request_id", None)
-    caller_extra_headers = kwargs.pop("extra_headers", None)
-    reasoning_effort = kwargs.pop("reasoning_effort", None)
-    image_data = kwargs.pop("image_data", None)
-    image_mime_type = kwargs.pop("image_mime_type", "image/png")
-    image_filename = kwargs.pop("image_filename", "image.png")
-
-    config, provider_spec = _resolve_call_config(
-        model=model,
-        api_key=api_key,
-        base_url=base_url,
-        api_version=api_version,
-        binding=binding,
-        source=source,
-        extra_headers=caller_extra_headers,
-        reasoning_effort=reasoning_effort,
-    )
-    provider = get_runtime_provider(config)
+    """Execute one completion from an already resolved configuration."""
+    provider = provider or get_runtime_provider(config)
     capability_binding = _capability_binding(config, provider_spec)
     request_messages = _build_messages(prompt, system_prompt, messages)
     request_messages = _apply_inline_image_data(
@@ -587,30 +377,6 @@ async def complete(
     extra_kwargs = _sanitize_call_kwargs(
         binding=capability_binding, model=config.model, kwargs=kwargs
     )
-    configured_max_tokens = _configured_max_tokens(config, extra_kwargs)
-    commercial_lease, commercial_reservation = await _reserve_factory_commercial(
-        config,
-        request_messages,
-        max_tokens=configured_max_tokens,
-        request_options=extra_kwargs,
-        request_id=commercial_request_id,
-    )
-    try:
-        quota_lease, quota_reservation = _reserve_factory_quota(
-            config,
-            request_messages,
-            max_tokens=configured_max_tokens,
-        )
-        byok_lease, byok_reservation = _start_byok_factory_usage(
-            config,
-            request_messages,
-            max_tokens=configured_max_tokens,
-        )
-    except BaseException:
-        if commercial_lease is not None:
-            await commercial_lease.release()
-        raise
-
     image_fallback_enabled = (
         not supports_vision(capability_binding, config.model)
         if allow_image_fallback is None
@@ -626,44 +392,128 @@ async def complete(
             allow_image_fallback=image_fallback_enabled,
             **extra_kwargs,
         )
-    except BaseException as exc:
-        if quota_lease is not None:
-            quota_lease.release()
-        if byok_lease is not None:
-            byok_lease.release()
-        if commercial_lease is not None:
-            await commercial_lease.release()
-        if not isinstance(exc, Exception):
-            raise
+    except Exception as exc:
         raise map_error(exc, provider=config.provider_name) from exc
-
-    # Every ledger owns an independent durable reservation.  A telemetry
-    # failure in the legacy SQLite quota must never strand the PostgreSQL
-    # reservation (or vice versa), so all three settlement attempts run.
-    try:
-        try:
-            if quota_lease is not None:
-                actual = int((response.usage or {}).get("total_tokens") or 0)
-                quota_lease.finalize(actual or quota_reservation)
-        finally:
-            if byok_lease is not None:
-                actual = int((response.usage or {}).get("total_tokens") or 0)
-                byok_lease.finalize(
-                    actual or byok_reservation,
-                    status="failed" if response.finish_reason == "error" else "success",
-                )
-    finally:
-        await _finalize_factory_commercial(
-            commercial_lease,
-            response.usage,
-            requested=commercial_reservation,
-        )
 
     if response.finish_reason == "error":
         raise map_error(
             RuntimeError(response.content or "LLM request failed"), provider=config.provider_name
         )
+    # Provider adapters keep hidden reasoning in ``reasoning_content``.  A
+    # few gateways duplicate that field into ``content`` when no visible
+    # answer is present; never let that duplicate become user-facing text.
+    if response.content and response.reasoning_content:
+        if response.content == response.reasoning_content:
+            return ""
     return response.content or ""
+
+
+async def complete(
+    prompt: str,
+    system_prompt: str = "You are a helpful assistant.",
+    model: str | None = None,
+    api_key: str | list[str] | None = None,
+    base_url: str | None = None,
+    api_version: str | None = None,
+    binding: str | None = None,
+    messages: list[dict[str, Any]] | None = None,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    retry_delay: float = DEFAULT_RETRY_DELAY,
+    exponential_backoff: bool = DEFAULT_EXPONENTIAL_BACKOFF,
+    allow_image_fallback: bool | None = None,
+    **kwargs: Any,
+) -> str:
+    caller_extra_headers = kwargs.pop("extra_headers", None)
+    reasoning_effort = kwargs.pop("reasoning_effort", None)
+    image_data = kwargs.pop("image_data", None)
+    image_mime_type = kwargs.pop("image_mime_type", "image/png")
+    image_filename = kwargs.pop("image_filename", "image.png")
+
+    config, provider_spec = _resolve_call_config(
+        model=model,
+        api_key=api_key,
+        base_url=base_url,
+        api_version=api_version,
+        binding=binding,
+        extra_headers=caller_extra_headers,
+        reasoning_effort=reasoning_effort,
+    )
+    return await _complete_with_resolved_config(
+        config,
+        provider_spec,
+        prompt=prompt,
+        system_prompt=system_prompt,
+        messages=messages,
+        max_retries=max_retries,
+        retry_delay=retry_delay,
+        exponential_backoff=exponential_backoff,
+        allow_image_fallback=allow_image_fallback,
+        image_data=image_data,
+        image_mime_type=str(image_mime_type or "image/png"),
+        image_filename=str(image_filename or "image.png"),
+        kwargs=kwargs,
+    )
+
+
+async def complete_with_config(
+    config: LLMConfig,
+    prompt: str,
+    system_prompt: str = "You are a helpful assistant.",
+    messages: list[dict[str, Any]] | None = None,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    retry_delay: float = DEFAULT_RETRY_DELAY,
+    exponential_backoff: bool = DEFAULT_EXPONENTIAL_BACKOFF,
+    allow_image_fallback: bool | None = None,
+    **kwargs: Any,
+) -> str:
+    """Complete using only the supplied, fully resolved configuration."""
+    forbidden = {
+        "model",
+        "api_key",
+        "base_url",
+        "api_version",
+        "binding",
+        "effective_url",
+        "extra_headers",
+        "provider_mode",
+        "provider_name",
+        "reasoning_effort",
+        "wire_api",
+    }.intersection(kwargs)
+    if forbidden:
+        names = ", ".join(sorted(forbidden))
+        raise TypeError(f"complete_with_config does not accept config overrides: {names}")
+
+    image_data = kwargs.pop("image_data", None)
+    image_mime_type = kwargs.pop("image_mime_type", "image/png")
+    image_filename = kwargs.pop("image_filename", "image.png")
+    provider_spec = _resolve_provider_spec(
+        binding=config.provider_name or config.binding,
+        model=config.model,
+        api_key=config.api_key,
+        base_url=config.effective_url or config.base_url,
+        fallback=config.provider_name or config.binding,
+    )
+    provider = build_isolated_provider(config)
+    try:
+        return await _complete_with_resolved_config(
+            config,
+            provider_spec,
+            prompt=prompt,
+            system_prompt=system_prompt,
+            messages=messages,
+            max_retries=max_retries,
+            retry_delay=retry_delay,
+            exponential_backoff=exponential_backoff,
+            allow_image_fallback=allow_image_fallback,
+            image_data=image_data,
+            image_mime_type=str(image_mime_type or "image/png"),
+            image_filename=str(image_filename or "image.png"),
+            kwargs=kwargs,
+            provider=provider,
+        )
+    finally:
+        await provider.aclose()
 
 
 async def stream(
@@ -674,17 +524,20 @@ async def stream(
     base_url: str | None = None,
     api_version: str | None = None,
     binding: str | None = None,
-    source: str | None = None,
     messages: list[dict[str, Any]] | None = None,
     max_retries: int = DEFAULT_MAX_RETRIES,
     retry_delay: float = DEFAULT_RETRY_DELAY,
     exponential_backoff: bool = DEFAULT_EXPONENTIAL_BACKOFF,
     allow_image_fallback: bool | None = None,
+    outcome: StreamOutcome | None = None,
     **kwargs: Any,
 ) -> AsyncGenerator[str, None]:
-    # One stable id is shared by reservation and all internal provider retry
-    # attempts, but remains private to DeepTutor's accounting boundary.
-    commercial_request_id = kwargs.pop("_commercial_request_id", None)
+    """Stream a completion as text chunks.
+
+    ``outcome``, when given, is filled with the provider's terminal reason and
+    usage once the stream ends. A caller that parses the streamed text needs it
+    to tell a complete response from one cut off at ``max_tokens`` (#1545).
+    """
     caller_extra_headers = kwargs.pop("extra_headers", None)
     reasoning_effort = kwargs.pop("reasoning_effort", None)
     image_data = kwargs.pop("image_data", None)
@@ -703,7 +556,6 @@ async def stream(
         base_url=base_url,
         api_version=api_version,
         binding=binding,
-        source=source,
         extra_headers=caller_extra_headers,
         reasoning_effort=reasoning_effort,
     )
@@ -722,30 +574,6 @@ async def stream(
     extra_kwargs = _sanitize_call_kwargs(
         binding=capability_binding, model=config.model, kwargs=kwargs
     )
-    configured_max_tokens = _configured_max_tokens(config, extra_kwargs)
-    commercial_lease, commercial_reservation = await _reserve_factory_commercial(
-        config,
-        request_messages,
-        max_tokens=configured_max_tokens,
-        request_options=extra_kwargs,
-        request_id=commercial_request_id,
-    )
-    try:
-        quota_lease, quota_reservation = _reserve_factory_quota(
-            config,
-            request_messages,
-            max_tokens=configured_max_tokens,
-        )
-        byok_lease, byok_reservation = _start_byok_factory_usage(
-            config,
-            request_messages,
-            max_tokens=configured_max_tokens,
-        )
-    except BaseException:
-        if commercial_lease is not None:
-            await commercial_lease.release()
-        raise
-
     image_fallback_enabled = (
         not supports_vision(capability_binding, config.model)
         if allow_image_fallback is None
@@ -779,10 +607,7 @@ async def stream(
         await queue.put(chunk)
 
     async def _runner() -> None:
-        nonlocal in_think_block, saw_output
-        response = None
-        runner_status = "success"
-        provider_error: BaseException | None = None
+        nonlocal saw_output, in_think_block
         try:
             response = await provider.chat_stream_with_retry(
                 messages=request_messages,
@@ -794,6 +619,9 @@ async def stream(
                 allow_image_fallback=image_fallback_enabled,
                 **extra_kwargs,
             )
+            if outcome is not None:
+                outcome.finish_reason = str(response.finish_reason or "")
+                outcome.usage = dict(response.usage or {})
             if in_think_block:
                 in_think_block = False
                 await queue.put("</think>")
@@ -816,78 +644,9 @@ async def stream(
                         provider=config.provider_name,
                     )
                 )
-        except asyncio.CancelledError:
-            runner_status = "cancelled"
-            if not saw_output:
-                if quota_lease is not None:
-                    quota_lease.release()
-                if byok_lease is not None:
-                    byok_lease.release(status="cancelled")
-            raise
         except Exception as exc:
-            runner_status = "failed"
-            provider_error = map_error(exc, provider=config.provider_name)
-            if not saw_output:
-                if quota_lease is not None:
-                    quota_lease.release()
-                if byok_lease is not None:
-                    byok_lease.release(status="failed")
+            await queue.put(map_error(exc, provider=config.provider_name))
         finally:
-            settlement_error: BaseException | None = None
-            usage = getattr(response, "usage", None) or {}
-            usage_total = int(usage.get("total_tokens") or 0)
-            try:
-                if quota_lease is not None:
-                    quota_lease.finalize(usage_total or quota_reservation)
-            except Exception as exc:
-                settlement_error = map_error(exc, provider=config.provider_name)
-            try:
-                if byok_lease is not None:
-                    byok_lease.finalize(
-                        usage_total or byok_reservation,
-                        status=(
-                            "failed"
-                            if response is not None and response.finish_reason == "error"
-                            else runner_status
-                        ),
-                    )
-            except Exception as exc:
-                if settlement_error is None:
-                    settlement_error = map_error(exc, provider=config.provider_name)
-            try:
-                if commercial_lease is not None:
-                    usage = getattr(response, "usage", None) if response is not None else None
-                    has_reported_usage = bool(
-                        isinstance(usage, Mapping)
-                        and any(
-                            isinstance(value, (int, float))
-                            and not isinstance(value, bool)
-                            and value > 0
-                            for value in usage.values()
-                        )
-                    )
-                    if response is None and not saw_output:
-                        await commercial_lease.release()
-                    elif (
-                        response is not None
-                        and response.finish_reason == "error"
-                        and not saw_output
-                        and not has_reported_usage
-                    ):
-                        await commercial_lease.release()
-                    else:
-                        await _finalize_factory_commercial(
-                            commercial_lease,
-                            usage,
-                            requested=commercial_reservation,
-                        )
-            except Exception as exc:
-                if settlement_error is None:
-                    settlement_error = map_error(exc, provider=config.provider_name)
-            if provider_error is not None:
-                await queue.put(provider_error)
-            if settlement_error is not None:
-                await queue.put(settlement_error)
             await queue.put(None)
 
     task = asyncio.create_task(_runner())
@@ -968,7 +727,13 @@ async def fetch_models(
     binding: str,
     base_url: str = "",
     api_key: str | None = None,
+    api_format: str = "auto",
 ) -> list[str]:
+    if canonical_provider_name(binding) == "github_copilot":
+        from deeptutor.services.github_copilot_auth import list_github_copilot_models
+
+        return await list_github_copilot_models()
+
     if canonical_provider_name(binding) == "codebuddy":
         from .provider_core.codebuddy_models import fetch_codebuddy_models
 
@@ -981,7 +746,7 @@ async def fetch_models(
 
     from . import cloud_provider
 
-    return await cloud_provider.fetch_models(base_url, api_key, binding)
+    return await cloud_provider.fetch_models(base_url, api_key, binding, api_format=api_format)
 
 
 def _build_api_provider_presets() -> dict[str, ApiProviderPreset]:

@@ -8,6 +8,7 @@ used by ``unified_ws``.
 
 from __future__ import annotations
 
+import asyncio
 import base64 as _b64
 import logging
 from typing import Any
@@ -47,7 +48,36 @@ _JUDGE_SYSTEM_PROMPTS = {
         "- Speak directly to the learner's submission — do not give a generic lecture.\n"
         "- Reply in English."
     ),
+    "de": (
+        "Du bist eine gründliche, aber ermutigende Lehrkraft und bewertest die Antwort "
+        "einer lernenden Person auf eine Quizfrage. Stütze dich auf Frage, Musterlösung "
+        "und Erklärung.\n\n"
+        "Anforderungen:\n"
+        "- Beginne mit einer Zeile, die das Ergebnis nennt: ✅ Richtig / ⚠️ Teilweise richtig "
+        "/ ❌ Falsch, und kurz den entscheidenden Grund.\n"
+        "- Liste danach auf: was richtig ist, was falsch ist oder fehlt und wie es sich verbessern lässt.\n"
+        "- Wenn mehrere sinnvolle Antworten möglich sind, erkenne an, was gut gelöst ist.\n"
+        "- Sprich direkt über diese Antwort, ohne allgemeinen Vortrag.\n"
+        "- Antworte auf Deutsch und duze die lernende Person."
+    ),
+    "uk": (
+        "Ти вимогливий, але доброзичливий асистент учителя, який перевіряє відповідь учня "
+        "на тестове завдання. Спирайся на умову, еталонну відповідь і пояснення.\n\n"
+        "Вимоги до відповіді:\n"
+        "- Почни одним рядком із вердиктом: ✅ Правильно / ⚠️ Частково правильно / ❌ Неправильно "
+        "і коротко назви головну підставу.\n"
+        "- Далі по пунктах: що учень зробив правильно, де помилка або чого бракує, як це виправити.\n"
+        "- Якщо можливі кілька слушних відповідей, визнай те, що учень зробив добре.\n"
+        "- Звертайся саме до цієї відповіді, без загальних лекцій.\n"
+        "- Відповідай українською."
+    ),
 }
+
+# The set of languages the judge can speak IS the set of system prompts it has.
+# Deriving it here means adding a language is one edit (add a prompt), not three
+# — the previous ("zh", "en") literals were repeated in the whitelist, the
+# fallback and the frontend, and a Ukrainian UI silently got English feedback.
+SUPPORTED_JUDGE_LANGUAGES: frozenset[str] = frozenset(_JUDGE_SYSTEM_PROMPTS)
 
 
 def _build_judge_user_prompt(
@@ -138,7 +168,7 @@ async def _build_multimodal_user_content(
 
     For ``url``-only records we resolve local AttachmentStore paths to
     base64 here (most providers can fetch external URLs themselves, but
-    locally-hosted ``/api/attachments/...`` is only reachable from the
+    locally-hosted ``/files/attachments/...`` is only reachable from the
     browser). Falls back to passing the URL through when resolution is
     not possible.
     """
@@ -160,8 +190,12 @@ async def _build_multimodal_user_content(
             try:
                 parsed = urlparse(url)
                 parts = (parsed.path or url).strip("/").split("/")
-                # Expected shape: api/attachments/{sid}/{aid}/{name}
-                if len(parts) >= 5 and parts[0] == "api" and parts[1] == "attachments":
+                # Current store URLs use files/attachments; keep older saved
+                # api/attachments references readable as well.
+                if len(parts) >= 5 and parts[:2] in (
+                    ["files", "attachments"],
+                    ["api", "attachments"],
+                ):
                     sid = unquote(parts[2])
                     aid = unquote(parts[3])
                     name = unquote("/".join(parts[4:]))
@@ -193,7 +227,7 @@ def _guess_image_mime(filename: str | None) -> str:
     }.get(ext, "image/png")
 
 
-@router.websocket("/question/judge")
+@router.websocket("/questions/judge")
 async def websocket_quiz_judge(websocket: WebSocket):
     """Stream an AI judgment for a single quiz answer.
 
@@ -218,7 +252,7 @@ async def websocket_quiz_judge(websocket: WebSocket):
             ] | null,
             "user_answer_image": str | null,  # legacy single-image form
             "image_filename": str | null,     # legacy filename for the above
-            "language": "zh" | "en",
+            "language": "zh" | "en" | "de" | "uk",
         }
 
     Server → Client (streaming):
@@ -227,19 +261,11 @@ async def websocket_quiz_judge(websocket: WebSocket):
         {"type": "done"}
         {"type": "error", "content": "..."}
     """
-    from deeptutor.api.routers.auth import (
-        ws_auth_failed,
-        ws_authorize_message,
-        ws_require_auth,
-        ws_require_capability_access,
-    )
+    from deeptutor.api.routers.auth import ws_auth_failed, ws_require_auth
     from deeptutor.multi_user.context import reset_current_user
 
     user_token = await ws_require_auth(websocket)
     if user_token is ws_auth_failed:
-        return
-    if not await ws_require_capability_access(websocket):
-        reset_current_user(user_token)
         return
 
     await websocket.accept()
@@ -268,10 +294,6 @@ async def websocket_quiz_judge(websocket: WebSocket):
                 pass
         return
 
-    if not await ws_authorize_message(websocket):
-        reset_current_user(user_token)
-        return
-
     question_text = (data.get("question") or "").strip()
     if not question_text:
         await safe_send({"type": "error", "content": "Question is required"})
@@ -287,11 +309,11 @@ async def websocket_quiz_judge(websocket: WebSocket):
         return
 
     requested_language = (data.get("language") or "").strip().lower()
-    if requested_language not in ("zh", "en"):
+    if requested_language not in SUPPORTED_JUDGE_LANGUAGES:
         requested_language = get_response_language(
             default=_config.get("system", {}).get("language", "en")
         )
-        if requested_language not in ("zh", "en"):
+        if requested_language not in SUPPORTED_JUDGE_LANGUAGES:
             requested_language = "en"
 
     user_answer = data.get("user_answer") or ""
@@ -378,62 +400,59 @@ async def websocket_quiz_judge(websocket: WebSocket):
                 pass
         return
 
-    lease = None
+    await safe_send({"type": "started"})
+
+    # Build a multimodal user message when ≥1 image was attached. We pass
+    # the full ``messages`` array to ``factory.stream`` so it forwards the
+    # content-parts unchanged (the single-image ``image_data`` kwarg only
+    # supports one image).
+    stream_kwargs: dict[str, Any] = {}
+    if has_image:
+        from deeptutor.services.llm import config as _llm_config_mod
+        from deeptutor.services.llm.capabilities import supports_vision
+
+        llm_cfg = _llm_config_mod.get_llm_config()
+        binding = getattr(llm_cfg, "binding", "openai") or "openai"
+        model = getattr(llm_cfg, "model", "") or ""
+        if supports_vision(binding, model):
+            user_content = await _build_multimodal_user_content(
+                text=user_prompt,
+                image_records=image_records,
+            )
+            stream_kwargs["messages"] = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ]
+        else:
+            # Vision-incapable model — fall back to text-only judge so the
+            # learner still gets feedback on their typed answer.
+            logger.info(
+                "Judge: %s/%s does not support vision; dropping %d image(s)",
+                binding,
+                model,
+                len(image_records),
+            )
+
     try:
-        from deeptutor.commercial.concurrency import acquire_commercial_turn_lease
-
-        lease = await acquire_commercial_turn_lease()
-        await safe_send({"type": "started"})
-
-        # Build a multimodal user message when ≥1 image was attached. We pass
-        # the full ``messages`` array to ``factory.stream`` so it forwards the
-        # content-parts unchanged (the single-image ``image_data`` kwarg only
-        # supports one image).
-        stream_kwargs: dict[str, Any] = {}
-        if has_image:
-            from deeptutor.services.llm import config as _llm_config_mod
-            from deeptutor.services.llm.capabilities import supports_vision
-
-            llm_cfg = _llm_config_mod.get_llm_config()
-            binding = getattr(llm_cfg, "binding", "openai") or "openai"
-            model = getattr(llm_cfg, "model", "") or ""
-            if supports_vision(binding, model):
-                user_content = await _build_multimodal_user_content(
-                    text=user_prompt,
-                    image_records=image_records,
-                )
-                stream_kwargs["messages"] = [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_content},
-                ]
-            else:
-                # Vision-incapable model — fall back to text-only judge so the
-                # learner still gets feedback on their typed answer.
-                logger.info(
-                    "Judge: %s/%s does not support vision; dropping %d image(s)",
-                    binding,
-                    model,
-                    len(image_records),
-                )
-
-        async for chunk in llm_stream(
-            prompt=user_prompt,
-            system_prompt=system_prompt,
-            **stream_kwargs,
-        ):
-            if not chunk:
-                continue
-            if not await safe_send({"type": "text", "content": chunk}):
-                break
+        async with asyncio.timeout(2 * 60):
+            async for chunk in llm_stream(
+                prompt=user_prompt,
+                system_prompt=system_prompt,
+                **stream_kwargs,
+            ):
+                if not chunk:
+                    continue
+                if not await safe_send({"type": "text", "content": chunk}):
+                    break
         await safe_send({"type": "done"})
+    except TimeoutError:
+        await safe_send({"type": "error", "content": "AI judge timed out. Please try again."})
     except WebSocketDisconnect:
         logger.debug("AI judge client disconnected mid-stream")
     except Exception as exc:
         logger.exception("AI judge stream failed")
         await safe_send({"type": "error", "content": format_exception_message(exc)})
     finally:
-        if lease is not None:
-            await lease.release()
         try:
             await websocket.close()
         except Exception:

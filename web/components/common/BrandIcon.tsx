@@ -16,7 +16,7 @@ import {
  * store does not tell a vendor that this person is looking at their service.
  *
  * Monochrome (`currentColor`) rather than the brand's own hex, for two reasons:
- * a dozen brand colours in one grid reads as noise next to DeepTutor's own
+ * a dozen brand colours in one grid reads as noise next to LearnLeader's own
  * restrained palette, and several brand hexes fail contrast against one of the
  * two themes. The hex is kept in the generated data if an accent is ever wanted.
  */
@@ -45,7 +45,6 @@ export default function BrandIcon({
       // The name is already adjacent in every current caller, so the mark is
       // decorative and announcing it again would just double every row.
       aria-hidden
-      title={icon ? icon.title : name}
       className={`flex shrink-0 items-center justify-center rounded-lg border border-[var(--border)]/60 bg-[var(--background)] font-semibold tracking-tight text-[var(--muted-foreground)] ${box} ${className}`}
     >
       {icon ? (

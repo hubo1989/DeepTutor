@@ -6,6 +6,9 @@ import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import sys
+from typing import TextIO
+
+from deeptutor.utils.secret_files import ensure_private_directory, ensure_private_file
 
 from .config import LoggingConfig, load_logging_config
 from .formatters import ConsoleFormatter, ContextFilter, JsonlFormatter
@@ -34,7 +37,9 @@ def _remove_managed_handlers(root: logging.Logger) -> None:
             handler.close()
 
 
-def configure_logging(force: bool = False) -> LoggingConfig:
+def configure_logging(
+    force: bool = False, *, console_stream: TextIO | None = None
+) -> LoggingConfig:
     """Configure stdlib logging once for the whole process."""
     global _CONFIGURED
 
@@ -50,22 +55,26 @@ def configure_logging(force: bool = False) -> LoggingConfig:
     root.setLevel(logging.DEBUG)
 
     if config.console_output:
-        console = _managed(logging.StreamHandler(sys.stdout))
+        console = _managed(
+            logging.StreamHandler(console_stream if console_stream is not None else sys.stdout)
+        )
         console.setLevel(level)
         console.setFormatter(ConsoleFormatter())
         root.addHandler(console)
 
     if config.file_output:
         log_dir = Path(config.log_dir) if config.log_dir else Path("data/user/logs")
-        log_dir.mkdir(parents=True, exist_ok=True)
+        ensure_private_directory(log_dir)
+        log_path = log_dir / "deeptutor.jsonl"
         file_handler = _managed(
             RotatingFileHandler(
-                log_dir / "deeptutor.jsonl",
+                log_path,
                 maxBytes=config.max_bytes,
                 backupCount=config.backup_count,
                 encoding="utf-8",
             )
         )
+        ensure_private_file(log_path)
         file_handler.setLevel(level)
         file_handler.setFormatter(JsonlFormatter())
         root.addHandler(file_handler)

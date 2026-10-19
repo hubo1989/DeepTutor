@@ -29,10 +29,10 @@ uploaded twice in the same session.
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import logging
 import os
 from pathlib import Path
+import shutil
 from typing import Protocol, runtime_checkable
 from urllib.parse import quote
 
@@ -43,9 +43,10 @@ from deeptutor.services.path_service import get_path_service
 logger = logging.getLogger(__name__)
 
 
-_DEFAULT_SUBPATH = ("workspace", "chat", "attachments")
+_LEGACY_SUBPATH = ("workspace", "chat", "attachments")
+_VISIBLE_SUBPATH = ("chat", "attachments")
 # Public route prefix served by deeptutor.api.routers.attachments
-_PUBLIC_URL_PREFIX = "/api/attachments"
+_PUBLIC_URL_PREFIX = "/files/attachments"
 
 
 def _coerce_filename(filename: str) -> str:
@@ -82,7 +83,7 @@ class AttachmentStore(Protocol):
         """Persist *data* and return a public URL the frontend can fetch.
 
         The returned URL is relative to the API origin (e.g.
-        ``"/api/attachments/<sid>/<aid>/<name>"``). Raising on failure is
+        ``"/files/attachments/<sid>/<aid>/<name>"``). Raising on failure is
         fine — callers log the error and proceed without ``url``.
         """
 
@@ -104,15 +105,16 @@ class AttachmentStore(Protocol):
 class LocalDiskAttachmentStore:
     """Default :class:`AttachmentStore` backend writing to local disk.
 
-    The root directory defaults to ``data/user/workspace/chat/attachments``
-    under the project root (matching :class:`PathService`'s public outputs).
-    Override via ``data/user/settings/system.json`` ``chat_attachment_dir``.
+    New uploads live in the selected content workspace's ``chat/attachments``
+    directory so workspace tools can discover them. Older uploads remain
+    readable from the previous application-data location until materialized.
     """
 
-    def __init__(self, root: Path | None = None) -> None:
+    def __init__(self, root: Path | None = None, *, legacy_root: Path | None = None) -> None:
         if root is None:
             root = _attachment_root()
         self._root = root
+        self._legacy_root = legacy_root if legacy_root != root else None
 
     @property
     def root(self) -> Path:
@@ -123,16 +125,19 @@ class LocalDiskAttachmentStore:
 
     def _session_dir(self, session_id: str) -> Path:
         sid = _coerce_filename(session_id)
-        return (self._root / sid).resolve()
+        return self._root / sid
 
     def _safe_join(self, session_id: str, name: str) -> Path | None:
         """Join *name* under the session dir and confirm the result stays
         inside ``self._root``. Returns ``None`` if traversal is detected.
         """
         session_dir = self._session_dir(session_id)
+        raw_candidate = session_dir / name
+        if session_dir.is_symlink() or raw_candidate.is_symlink():
+            return None
         # Resolve the candidate even if it doesn't exist yet — prevents a
         # symlink-based attack that would point outside the root once created.
-        candidate = (session_dir / name).resolve()
+        candidate = raw_candidate.resolve()
         try:
             candidate.relative_to(self._root.resolve())
         except ValueError:
@@ -154,19 +159,8 @@ class LocalDiskAttachmentStore:
         if target is None:
             raise ValueError(f"refusing to write attachment outside storage root: {stored!r}")
 
-        from deeptutor.commercial.storage_limits import (
-            atomic_write_bytes_with_storage_limits,
-            commercial_owner_resource_lock,
-        )
-
-        async with commercial_owner_resource_lock():
-            await asyncio.to_thread(
-                atomic_write_bytes_with_storage_limits,
-                target,
-                data,
-                enforce_upload_limit=True,
-                additional_roots=(self._root,),
-            )
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._write_sync, target, data)
 
         # The router uses the same _coerce_filename rules to look up the file,
         # so the public URL must use the sanitised pieces. Each path segment
@@ -175,26 +169,47 @@ class LocalDiskAttachmentStore:
         sid = quote(_coerce_filename(session_id), safe="")
         aid = quote(attachment_id, safe="")
         name = quote(_coerce_filename(filename), safe="")
-        return f"{_PUBLIC_URL_PREFIX}/{sid}/{aid}/{name}"
+        from deeptutor.services.workspace.context import workspace_url
+
+        return workspace_url(f"{_PUBLIC_URL_PREFIX}/{sid}/{aid}/{name}")
+
+    @staticmethod
+    def _write_sync(target: Path, data: bytes) -> None:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        # Atomic-ish write: write to .tmp then rename. Avoids exposing a
+        # half-written file via the static handler.
+        tmp = target.with_suffix(target.suffix + ".tmp")
+        try:
+            with tmp.open("wb") as fh:
+                fh.write(data)
+            os.replace(tmp, target)
+        finally:
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
 
     async def delete_session(self, session_id: str) -> None:
-        session_dir = self._session_dir(session_id)
-        if not session_dir.exists():
-            return
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._rmtree_sync, session_dir)
+        roots = (self._root, self._legacy_root) if self._legacy_root else (self._root,)
+        for root in roots:
+            session_dir = LocalDiskAttachmentStore(root)._session_dir(session_id)
+            if session_dir.exists() and not session_dir.is_symlink():
+                await loop.run_in_executor(None, self._rmtree_sync, session_dir)
 
     async def delete_attachment(self, session_id: str, attachment_id: str) -> None:
-        session_dir = self._session_dir(session_id)
-        if not session_dir.exists():
-            return
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._delete_attachment_sync, session_dir, attachment_id)
+        roots = (self._root, self._legacy_root) if self._legacy_root else (self._root,)
+        for root in roots:
+            session_dir = LocalDiskAttachmentStore(root)._session_dir(session_id)
+            if session_dir.exists() and not session_dir.is_symlink():
+                await loop.run_in_executor(
+                    None, self._delete_attachment_sync, session_dir, attachment_id
+                )
 
     @staticmethod
     def _rmtree_sync(path: Path) -> None:
-        import shutil
-
         try:
             shutil.rmtree(path)
         except OSError as exc:
@@ -218,12 +233,50 @@ class LocalDiskAttachmentStore:
     def resolve_path(self, *, session_id: str, attachment_id: str, filename: str) -> Path | None:
         stored = self._stored_filename(attachment_id, filename)
         target = self._safe_join(session_id, stored)
-        if target is None or not target.is_file():
+        if target is not None and target.is_file():
+            return target
+        if self._legacy_root is None:
             return None
-        return target
+        legacy = LocalDiskAttachmentStore(self._legacy_root)
+        target = legacy._safe_join(session_id, stored)
+        return target if target is not None and target.is_file() else None
+
+    async def materialize_session(self, session_id: str) -> None:
+        """Move earlier uploads into the selected workspace before tool discovery."""
+        if self._legacy_root is None:
+            return
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._materialize_session_sync, session_id)
+
+    def _materialize_session_sync(self, session_id: str) -> None:
+        legacy = LocalDiskAttachmentStore(self._legacy_root)
+        source_dir = legacy._session_dir(session_id)
+        if not source_dir.is_dir() or source_dir.is_symlink():
+            return
+        destination_dir = self._session_dir(session_id)
+        for source in source_dir.iterdir():
+            if source.is_symlink() or not source.is_file():
+                continue
+            destination = self._safe_join(session_id, source.name)
+            if destination is None or destination.exists():
+                continue
+            destination_dir.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(source), str(destination))
+        try:
+            source_dir.rmdir()
+        except OSError:
+            pass
+
+    def materialize_all_sessions(self) -> None:
+        """Bring legacy uploads into this workspace before data migration."""
+        if self._legacy_root is None or not self._legacy_root.is_dir():
+            return
+        for entry in self._legacy_root.iterdir():
+            if entry.is_dir() and not entry.is_symlink():
+                self._materialize_session_sync(entry.name)
 
 
-_stores: dict[str, AttachmentStore] = {}
+_stores: dict[tuple[str, str], AttachmentStore] = {}
 
 
 def get_attachment_store() -> AttachmentStore:
@@ -233,54 +286,38 @@ def get_attachment_store() -> AttachmentStore:
     backends can be selected here based on an env var.
     """
     root = _attachment_root()
-    key = str(root)
+    legacy_root = _legacy_attachment_root()
+    key = (str(root), str(legacy_root))
     if key not in _stores:
-        _stores[key] = LocalDiskAttachmentStore(root=root)
+        _stores[key] = LocalDiskAttachmentStore(root=root, legacy_root=legacy_root)
     return _stores[key]
 
 
 def _attachment_root() -> Path:
-    from deeptutor.multi_user.context import get_current_user_or_none
-    from deeptutor.multi_user.paths import get_current_path_service
-
-    user = get_current_user_or_none()
-    override = str(load_system_settings().get("chat_attachment_dir") or "").strip()
-    if override:
-        configured_root = Path(override).expanduser().resolve()
-        if user is None or user.scope.kind == "admin":
-            return configured_root
-        owner_root = external_attachment_root_for_owner(user.scope.user_id)
-        if owner_root is None:  # pragma: no cover - override was just resolved
-            raise RuntimeError("external attachment root could not be resolved")
-        return owner_root
-
-    # Preserve local/CLI behavior when there is no identity context. Inside
-    # authenticated HTTP/WS work, resolve directly so an unexpected scoping
-    # failure cannot silently fall back to the administrator's PathService.
-    service = get_current_path_service() if user is not None else get_path_service()
-    return service.get_user_root().joinpath(*_DEFAULT_SUBPATH).resolve()
-
-
-def external_attachment_root_for_owner(owner_id: str) -> Path | None:
-    """Resolve one owner's namespace under a deployment-level override.
-
-    This context-free form lets account export/deletion cover attachments
-    after the request's CurrentUser context has been torn down.  ``None``
-    means attachments already live inside the ordinary per-user root.
-    """
+    from deeptutor.services.workspace.context import current_workspace_id, get_workspace_scope
 
     override = str(load_system_settings().get("chat_attachment_dir") or "").strip()
-    if not override:
-        return None
-    raw_owner = str(owner_id or "").strip()
-    if not raw_owner:
-        raise ValueError("attachment owner id is required")
-    configured_root = Path(override).expanduser().resolve()
-    safe_owner = _coerce_filename(raw_owner)[:48]
-    digest = hashlib.sha256(raw_owner.encode("utf-8")).hexdigest()[:12]
-    owner_root = (configured_root / "users" / f"{safe_owner}-{digest}").resolve()
-    owner_root.relative_to(configured_root)
-    return owner_root
+    if override and not current_workspace_id():
+        return Path(override).expanduser().resolve()
+    scope = get_workspace_scope()
+    if scope is not None and scope.workspace_id:
+        content_root = scope.content_root
+    else:
+        from deeptutor.services.workspace import get_content_workspace_service
+
+        content_root = get_content_workspace_service().general_binding().root
+    from deeptutor.services.workspace.models import WorkspaceError
+
+    directory = content_root
+    for component in _VISIBLE_SUBPATH:
+        directory = directory / component
+        if directory.is_symlink():
+            raise WorkspaceError("Chat attachment directories cannot be symbolic links.")
+    return directory.resolve()
+
+
+def _legacy_attachment_root() -> Path:
+    return get_path_service().get_user_root().joinpath(*_LEGACY_SUBPATH).resolve()
 
 
 def reset_attachment_store() -> None:

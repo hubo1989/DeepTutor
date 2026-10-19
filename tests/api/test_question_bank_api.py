@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 from pathlib import Path
+from typing import get_args
 
 import pytest
 
@@ -16,7 +17,7 @@ notebook_router = importlib.import_module("deeptutor.api.routers.question_notebo
 
 from deeptutor.services.session.sqlite_store import SQLiteSessionStore
 
-PREFIX = "/api/v1/question-notebook"
+PREFIX = "/api/question-notebook"
 
 
 @pytest.fixture
@@ -68,7 +69,92 @@ def _seed(client) -> list[int]:
 def test_stats_reports_the_triage_counts(client):
     _seed(client)
     body = client.get(f"{PREFIX}/stats").json()
-    assert body == {"total": 2, "wrong": 1, "bookmarked": 0, "uncategorized": 2}
+    assert body == {
+        "total": 2,
+        "wrong": 1,
+        "unresolved": 1,
+        "bookmarked": 0,
+        "uncategorized": 2,
+    }
+
+
+@pytest.mark.parametrize(
+    "source",
+    get_args(importlib.import_module("deeptutor.api.routers.question_notebook").AssessmentSource),
+)
+def test_every_assessment_source_can_be_saved_and_filtered(client, source):
+    _seed(client)
+    session_id = asyncio.run(client.store.create_session(title="Source filter"))["id"]
+    saved = client.post(
+        f"{PREFIX}/entries/upsert",
+        json={
+            "session_id": session_id,
+            "question_id": "source-question",
+            "question": "Which source?",
+            "source": source,
+        },
+    )
+    assert saved.status_code == 200
+    response = client.get(f"{PREFIX}/entries", params={"source": source})
+    assert response.status_code == 200
+    items = response.json()["items"]
+    assert saved.json()["id"] in {item["id"] for item in items}
+    assert all(item["source"] == source for item in items)
+
+
+def test_unknown_assessment_source_is_rejected(client):
+    response = client.get(f"{PREFIX}/entries", params={"source": "unknown"})
+    assert response.status_code == 422
+
+
+def test_document_entry_without_session_is_idempotent_and_lookupable(client):
+    payload = {
+        "origin_type": "document_analysis",
+        "origin_ref": "book:linear-algebra:section-2",
+        "question_id": "focus-1",
+        "question": "What is the rank?",
+        "source": "book",
+        "material_id": "linear-algebra",
+        "material_title": "Linear Algebra",
+        "section_title": "Rank",
+    }
+    first = client.post(f"{PREFIX}/entries/upsert", json=payload)
+    second = client.post(
+        f"{PREFIX}/entries/upsert",
+        json={**payload, "user_answer": "2"},
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["id"] == second.json()["id"]
+    assert second.json()["session_id"] == ""
+    assert second.json()["origin_type"] == "document_analysis"
+    assert second.json()["origin_ref"] == payload["origin_ref"]
+    assert second.json()["user_answer"] == "2"
+
+    lookup = client.get(
+        f"{PREFIX}/entries/lookup/by-question",
+        params={
+            "origin_type": "document_analysis",
+            "origin_ref": payload["origin_ref"],
+            "question_id": payload["question_id"],
+        },
+    )
+    assert lookup.status_code == 200
+    assert lookup.json()["id"] == first.json()["id"]
+    assert client.get(f"{PREFIX}/entries").json()["total"] == 1
+
+
+def test_independent_entry_requires_a_stable_origin_reference(client):
+    response = client.post(
+        f"{PREFIX}/entries/upsert",
+        json={
+            "origin_type": "external_import",
+            "question_id": "q-1",
+            "question": "Imported?",
+        },
+    )
+    assert response.status_code == 422
 
 
 def test_listing_carries_each_entry_categories(client):
@@ -90,6 +176,61 @@ def test_search_treats_wildcards_literally(client):
 
     underscore = client.get(f"{PREFIX}/entries", params={"search": "a_b"}).json()
     assert underscore["total"] == 1
+
+
+def test_review_provenance_filters_resolution_and_materials(client):
+    store: SQLiteSessionStore = client.store
+
+    async def run() -> None:
+        session_id = (await store.create_session(title="Sources"))["id"]
+        await store.upsert_notebook_entries(
+            session_id,
+            [
+                {
+                    "turn_id": "t1",
+                    "question_id": "q1",
+                    "question": "Mastery?",
+                    "is_correct": False,
+                    "source": "mastery_path",
+                    "material_id": "path-1",
+                    "material_title": "Algebra",
+                    "section_id": "kp-1",
+                },
+                {
+                    "turn_id": "t1",
+                    "question_id": "q2",
+                    "question": "Reading?",
+                    "is_correct": True,
+                    "source": "immersive_reading",
+                    "material_id": "book-1",
+                    "material_title": "EPUB",
+                },
+            ],
+        )
+
+    asyncio.run(run())
+
+    mastery = client.get(
+        f"{PREFIX}/entries",
+        params={"source": "mastery_path", "material_id": "path-1", "resolved": "false"},
+    ).json()
+    assert [item["question_id"] for item in mastery["items"]] == ["q1"]
+
+    materials = client.get(f"{PREFIX}/materials").json()
+    assert [(item["material_id"], item["unresolved_count"]) for item in materials] == [
+        ("path-1", 1),
+        ("book-1", 0),
+    ]
+
+    entry_id = mastery["items"][0]["id"]
+    patched = client.patch(f"{PREFIX}/entries/{entry_id}", json={"resolved": True})
+    assert patched.status_code == 200
+    reopened = client.patch(f"{PREFIX}/entries/{entry_id}", json={"resolved": False})
+    assert reopened.status_code == 200
+    unresolved = client.get(
+        f"{PREFIX}/entries", params={"is_correct": "false", "resolved": "false"}
+    ).json()
+    assert [item["id"] for item in unresolved["items"]] == [entry_id]
 
 
 def test_uncategorized_filter_is_the_inbox(client):

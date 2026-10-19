@@ -6,12 +6,16 @@ import { Ear, Loader2 } from "lucide-react";
 import WhisperComposer from "@/components/whisper/WhisperComposer";
 import WhisperMessageList from "@/components/whisper/WhisperMessageList";
 import WhisperRoomChip from "@/components/whisper/WhisperRoomChip";
-import { useCapabilityFilter } from "@/lib/capabilities-api";
+import { useCapabilityFilter } from "@/features/capabilities/useCapabilityCatalog";
 import {
-  UnifiedWSClient,
-  type StartTurnMessage,
-  type StreamEvent,
-} from "@/lib/unified-ws";
+  SUBMIT_CONNECT_RETRY_INTERVAL_MS,
+  SUBMIT_CONNECT_RETRY_LIMIT,
+} from "@/lib/send-retry";
+import type {
+  StartTurnMessage,
+  StreamEvent,
+} from "@/features/chat/model/protocol";
+import { UnifiedTurnClient } from "@/features/chat/transport/UnifiedTurnClient";
 import {
   filterMessagesForSeat,
   looksLikeCrisisRedirect,
@@ -21,12 +25,7 @@ import {
   type WhisperSeat,
 } from "@/lib/whisper-transcript";
 
-function newMessageId(): string {
-  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
-    return crypto.randomUUID();
-  }
-  return `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-}
+import { randomUuid } from "@/lib/random-uuid";
 
 function looksLikeRoomEnded(text: string): boolean {
   const t = (text || "").toLowerCase();
@@ -50,7 +49,7 @@ export default function WhisperPage() {
   const [connected, setConnected] = useState(false);
   const [everConnected, setEverConnected] = useState(false);
 
-  const clientRef = useRef<UnifiedWSClient | null>(null);
+  const clientRef = useRef<UnifiedTurnClient | null>(null);
   const seatRef = useRef<WhisperSeat>(seat);
   const roomIdRef = useRef<string | null>(roomId);
   const sessionBySeatRef = useRef<Record<WhisperSeat, string | null>>({
@@ -95,7 +94,7 @@ export default function WhisperPage() {
       setMessages((prev) => [
         ...prev,
         {
-          id: newMessageId(),
+          id: randomUuid(),
           role: "system",
           text,
           stage: event.stage,
@@ -112,7 +111,7 @@ export default function WhisperPage() {
     setMessages((prev) => [
       ...prev,
       {
-        id: newMessageId(),
+        id: randomUuid(),
         role: "assistant",
         text,
         stage: event.stage || undefined,
@@ -137,7 +136,7 @@ export default function WhisperPage() {
   }, []);
 
   useEffect(() => {
-    const client = new UnifiedWSClient(handleEvent, () => {
+    const client = new UnifiedTurnClient(handleEvent, () => {
       setBusy(false);
       setConnected(false);
     });
@@ -147,7 +146,7 @@ export default function WhisperPage() {
     // cascaded a render.
     client.connect();
 
-    // Poll readyState until open (UnifiedWSClient has no onOpen hook).
+    // Poll the adapter state until the validated v2 runtime is connected.
     const poll = window.setInterval(() => {
       if (client.connected) {
         setConnected(true);
@@ -194,12 +193,12 @@ export default function WhisperPage() {
       setEverConnected(true);
       return;
     }
-    if (attempt >= 10) {
+    if (attempt >= SUBMIT_CONNECT_RETRY_LIMIT) {
       setBusy(false);
       setMessages((prev) => [
         ...prev,
         {
-          id: newMessageId(),
+          id: randomUuid(),
           role: "system",
           text: "Connection failed. Please try again.",
         },
@@ -209,7 +208,7 @@ export default function WhisperPage() {
     const timer = setTimeout(() => {
       retryTimersRef.current.delete(timer);
       sendWithRetry(payload, attempt + 1);
-    }, 200);
+    }, SUBMIT_CONNECT_RETRY_INTERVAL_MS);
     retryTimersRef.current.add(timer);
   }
 
@@ -221,7 +220,7 @@ export default function WhisperPage() {
       setMessages((prev) => [
         ...prev,
         {
-          id: newMessageId(),
+          id: randomUuid(),
           role: "user",
           text,
           localSeat: seat,

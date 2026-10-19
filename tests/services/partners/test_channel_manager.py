@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -19,10 +20,12 @@ def test_empty_allow_list_skips_only_misconfigured_channel(monkeypatch):
 
         def __init__(self, config, _bus):
             self.config = SimpleNamespace(allow_from=config["allow_from"])
+            self.is_running = False
+            self.setup_state = {}
 
     monkeypatch.setattr(
-        "deeptutor.partners.channels.registry.discover_all",
-        lambda: {"invalid": _Channel, "valid": _Channel},
+        "deeptutor.partners.channels.registry.discover_all_with_errors",
+        lambda: ({"invalid": _Channel, "valid": _Channel}, {}),
     )
     config = ChannelsConfig(
         invalid={"enabled": True, "allow_from": []},
@@ -32,6 +35,28 @@ def test_empty_allow_list_skips_only_misconfigured_channel(monkeypatch):
     manager = ChannelManager(config, _MultiShotBus([]))  # type: ignore[arg-type]
 
     assert list(manager.channels) == ["valid"]
+    assert manager.get_status()["invalid"]["setup"]["status"] == "action_required"
+
+
+def test_unavailable_configured_channel_remains_visible(monkeypatch):
+    monkeypatch.setattr(
+        "deeptutor.partners.channels.registry.discover_all_with_errors",
+        lambda: ({}, {"telegram": "optional package missing"}),
+    )
+    manager = ChannelManager(
+        ChannelsConfig(telegram={"enabled": True, "allow_from": ["*"]}),
+        _MultiShotBus([]),  # type: ignore[arg-type]
+    )
+
+    assert manager.channels == {}
+    assert manager.get_status()["telegram"] == {
+        "enabled": True,
+        "running": False,
+        "setup": {
+            "status": "unavailable",
+            "message": "optional package missing",
+        },
+    }
 
 
 class _OneShotBus:
@@ -123,8 +148,8 @@ def test_partner_id_is_available_while_the_channel_is_constructed(partners_root,
             pass
 
     monkeypatch.setattr(
-        "deeptutor.partners.channels.registry.discover_all",
-        lambda: {"telegram": _EagerChannel},
+        "deeptutor.partners.channels.registry.discover_all_with_errors",
+        lambda: ({"telegram": _EagerChannel}, {}),
     )
     manager = ChannelManager(
         ChannelsConfig(telegram={"enabled": True}),
@@ -134,6 +159,60 @@ def test_partner_id_is_available_while_the_channel_is_constructed(partners_root,
 
     channel = manager.channels["telegram"]
     assert channel.resolved_at_init == partners_root / "ada" / "channels" / "telegram"
+
+
+@pytest.mark.asyncio
+async def test_start_failure_is_sanitized_into_runtime_status():
+    from deeptutor.partners.bus.queue import MessageBus
+    from deeptutor.partners.channels.base import BaseChannel
+
+    class _FailingChannel(BaseChannel):
+        name = "telegram"
+
+        async def start(self):
+            raise RuntimeError("secret-token-must-not-leak")
+
+        async def stop(self):
+            self._running = False
+
+        async def send(self, msg):
+            pass
+
+    channel = _FailingChannel({}, MessageBus())
+    manager = ChannelManager(ChannelsConfig(), MessageBus())
+
+    await manager._start_channel("telegram", channel)
+
+    assert channel.is_running is False
+    assert channel.setup_state == {
+        "status": "error",
+        "message": "Channel startup failed (RuntimeError).",
+    }
+
+
+@pytest.mark.asyncio
+async def test_start_return_without_listener_requests_configuration():
+    from deeptutor.partners.bus.queue import MessageBus
+    from deeptutor.partners.channels.base import BaseChannel
+
+    class _UnconfiguredChannel(BaseChannel):
+        name = "telegram"
+
+        async def start(self):
+            return
+
+        async def stop(self):
+            self._running = False
+
+        async def send(self, msg):
+            pass
+
+    channel = _UnconfiguredChannel({}, MessageBus())
+    manager = ChannelManager(ChannelsConfig(), MessageBus())
+
+    await manager._start_channel("telegram", channel)
+
+    assert channel.setup_state["status"] == "action_required"
 
 
 async def _dispatch_one(
@@ -237,6 +316,73 @@ class TestSendRetry:
         await manager._send_with_retry(channel, msg)  # type: ignore[arg-type]
 
         assert channel.send.await_count == 2
+
+
+class TestDispatchTimeoutSemantics:
+    """_dispatch_outbound's TimeoutError handler is an idle-poll timeout.
+
+    ``except asyncio.TimeoutError: continue`` only observes the 1s poll
+    timeout of ``wait_for(consume_outbound(), 1.0)``. No message is in
+    hand when it fires: a cancelled ``Queue.get()`` pops nothing, and a
+    consume that finishes despite the timeout has its result returned by
+    ``wait_for``. Channel send timeouts are ``Exception`` subclasses and
+    are retried inside ``_send_with_retry`` instead.
+    """
+
+    @pytest.mark.asyncio
+    async def test_idle_poll_timeout_does_not_skip_later_message(self):
+        from deeptutor.partners.bus.queue import MessageBus
+
+        msg = OutboundMessage(channel="zulip", chat_id="1", content="hi")
+        channel = _DummyChannel()
+        bus = MessageBus()
+        manager = ChannelManager(ChannelsConfig(), bus)
+        manager.channels = {msg.channel: channel}  # type: ignore[dict-item]
+
+        task = asyncio.create_task(manager._dispatch_outbound())
+        # Cross at least one 1.0s poll timeout with an empty queue.
+        await asyncio.sleep(1.3)
+        await bus.publish_outbound(msg)
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 2.0
+        while channel.send.await_count == 0 and loop.time() < deadline:
+            await asyncio.sleep(0.05)
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+        channel.send.assert_awaited_once_with(msg)
+
+    @pytest.mark.asyncio
+    async def test_channel_send_timeout_is_retried_by_dispatcher(self, monkeypatch):
+        monkeypatch.setattr("deeptutor.partners.channels.manager._SEND_RETRY_DELAYS", (0, 0, 0))
+        msg = OutboundMessage(channel="zulip", chat_id="1", content="hi")
+        channel = _DummyChannel()
+        channel.send.side_effect = [asyncio.TimeoutError(), None]
+        manager = ChannelManager(ChannelsConfig(), _OneShotBus(msg))  # type: ignore[arg-type]
+        manager.channels = {msg.channel: channel}  # type: ignore[dict-item]
+
+        await manager._dispatch_outbound()
+
+        assert channel.send.await_count == 2
+        channel.send.assert_awaited_with(msg)
+
+    @pytest.mark.asyncio
+    async def test_channel_send_timeout_exhausts_retries(self, monkeypatch):
+        monkeypatch.setattr("deeptutor.partners.channels.manager._SEND_RETRY_DELAYS", (0, 0, 0))
+        msg = OutboundMessage(channel="zulip", chat_id="1", content="hi")
+        channel = _DummyChannel()
+        channel.send.side_effect = asyncio.TimeoutError
+        manager = ChannelManager(
+            ChannelsConfig(send_max_retries=3),
+            _OneShotBus(msg),  # type: ignore[arg-type]
+        )
+        manager.channels = {msg.channel: channel}  # type: ignore[dict-item]
+
+        await manager._dispatch_outbound()
+
+        assert channel.send.await_count == 3
 
 
 class TestDuplicateSuppression:

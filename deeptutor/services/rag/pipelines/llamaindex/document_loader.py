@@ -22,16 +22,17 @@ from typing import Any, Callable, Iterable
 from llama_index.core import Document
 from llama_index.core.schema import ImageNode
 
+from deeptutor.services.config.runtime_settings import DOCUMENT_PARSING_ENGINE_LITEPARSE
 from deeptutor.services.embedding import get_embedding_client
+from deeptutor.services.llm.image_caption_batch import ImageCaptionBatcher
+from deeptutor.services.llm.image_caption_cache import complete_image_caption
 from deeptutor.services.llm.image_description import get_image_description_client
 from deeptutor.services.rag.file_routing import FileTypeRouter
-from deeptutor.services.rag.visual_assets import (
-    VisualAssetCandidate,
-    collect_visual_assets,
-)
+from deeptutor.services.rag.source_pages import SourcePageError
+from deeptutor.services.rag.visual_assets import VisualAssetCandidate, collect_visual_assets
 from deeptutor.utils.document_validator import DocumentValidator
 
-from .config import image_description_limits
+from .config import image_description_batch_size, image_description_limits
 
 IMAGE_DESCRIPTION_SYSTEM_PROMPT = (
     "You describe images for a retrieval-augmented knowledge base. "
@@ -44,6 +45,10 @@ IMAGE_DESCRIPTION_PROMPT = (
     "and cite it later. Include visible text/OCR if present, the main subject, "
     "and any educational or technical meaning. Keep the answer under 180 words."
 )
+
+# LiteParse is the only automatic fallback candidate: it performs local OCR,
+# has no model download, and can run without changing the user's global parser.
+_PDF_OCR_FALLBACK_ENGINE = DOCUMENT_PARSING_ENGINE_LITEPARSE
 
 
 @dataclass(frozen=True)
@@ -58,7 +63,7 @@ class _ImageSource:
 
     path: Path
     origin: Path
-    visual: dict[str, Any] | None = None
+    visual: VisualAssetCandidate | None = None
 
 
 class LlamaIndexDocumentLoader:
@@ -67,11 +72,13 @@ class LlamaIndexDocumentLoader:
     def __init__(self, logger=None, image_concurrency: int = 6) -> None:
         self.logger = logger or logging.getLogger(__name__)
         self.image_concurrency = max(1, int(image_concurrency))
+        self._pdf_documents: dict[str, list[Any]] = {}
 
     async def load(
         self,
         file_paths: Iterable[str],
         image_progress_callback: Callable[[int, int], None] | None = None,
+        *,
         kb_dir: Path | None = None,
         visual_candidates: list[VisualAssetCandidate] | None = None,
     ) -> list[Any]:
@@ -86,37 +93,56 @@ class LlamaIndexDocumentLoader:
             # archive download) on a synchronous httpx.Client — running it on
             # the event loop stalls every other request for the whole PDF
             # (same class of bug as upstream #761/#777). Hand it to a thread.
-            parsed_sink: list[Any] = []
-            text, extracted_images, page_texts, page_image_paths = await asyncio.to_thread(
-                self._parse_document, file_path, parsed_sink=parsed_sink
-            )
-            if kb_dir is not None and visual_candidates is not None and parsed_sink:
-                visual_candidates.extend(collect_visual_assets(parsed_sink[-1], file_path, kb_dir))
-            if page_texts:
-                for page_label, page_text in page_texts:
+            try:
+                text, extracted_images, parse_engine = await asyncio.to_thread(
+                    self._parse_document, file_path, kb_dir=kb_dir
+                )
+                scanned_pdf_needs_ocr = (
+                    file_path.suffix.lower() == ".pdf"
+                    and not text.strip()
+                    and parse_engine != _PDF_OCR_FALLBACK_ENGINE
+                )
+                if scanned_pdf_needs_ocr:
+                    fallback = await asyncio.to_thread(
+                        self._parse_document,
+                        file_path,
+                        None,
+                        _PDF_OCR_FALLBACK_ENGINE,
+                        kb_dir=kb_dir,
+                    )
+                    if fallback[0].strip() or fallback[1]:
+                        text, extracted_images, parse_engine = fallback
+                        scanned_pdf_needs_ocr = False
+                    else:
+                        self._log_scanned_pdf_without_ocr(
+                            file_path,
+                            parse_engine,
+                            len(extracted_images),
+                        )
+            except SourcePageError as exc:
+                # Parsing can succeed while the original PDF is unreadable.
+                # Keep that document's failure isolated and visible (#1982).
+                from deeptutor.knowledge.indexing_run import current_run
+
+                self._pdf_documents.pop(str(file_path), None)
+                self.logger.warning("Skipped %s: %s", file_path.name, exc)
+                if run := current_run():
+                    run.document(file_path, "failed", reason="invalid_source", detail=str(exc))
+                continue
+            if not scanned_pdf_needs_ocr:
+                page_documents = self._pdf_documents.pop(str(file_path), [])
+                if page_documents:
+                    documents.extend(page_documents)
+                else:
                     self._append_if_nonempty(
                         documents,
                         file_path,
-                        page_text,
-                        extra_metadata={
-                            "page_label": page_label,
-                            "page": page_label,
-                            "image_paths": page_image_paths.get(page_label, []),
-                        },
+                        text,
+                        parse_engine=parse_engine,
+                        extracted_image_count=len(extracted_images),
                     )
-            else:
-                self._append_if_nonempty(
-                    documents,
-                    file_path,
-                    text,
-                    extra_metadata={
-                        "image_paths": [str(source.path) for source in extracted_images],
-                    },
-                )
-            image_sources.extend(extracted_images)
-            self._attach_visual_page_metadata(documents, visual_candidates)
-            self._attach_visual_records(extracted_images, visual_candidates)
-            self._append_visual_documents(documents, extracted_images, visual_candidates)
+                image_sources.extend(extracted_images)
+                self._append_visual_documents(documents, extracted_images, visual_candidates)
 
         for file_path_str in classification.text_files:
             file_path = Path(file_path_str)
@@ -126,9 +152,34 @@ class LlamaIndexDocumentLoader:
 
         for file_path_str in classification.image_files:
             path = Path(file_path_str)
-            image_sources.append(_ImageSource(path=path, origin=path))
+            from deeptutor.services.parsing import get_parse_service
 
-        if legacy_image_sources := [source for source in image_sources if source.visual is None]:
+            parse_service = get_parse_service()
+            supports = getattr(parse_service, "supports", lambda _path: False)
+            if supports(path):
+                self.logger.info(f"Parsing image with active document parser: {path.name}")
+                text, extracted_images, parse_engine = await asyncio.to_thread(
+                    self._parse_document, path, parse_service, kb_dir=kb_dir
+                )
+                if text.strip() or extracted_images:
+                    self._append_if_nonempty(
+                        documents,
+                        path,
+                        text,
+                        parse_engine=parse_engine,
+                        extracted_image_count=len(extracted_images),
+                    )
+                    image_sources.extend(extracted_images)
+                    self._append_visual_documents(documents, extracted_images, visual_candidates)
+                else:
+                    # Preserve the pre-parser behavior when an image-capable
+                    # engine fails or yields no usable IR.
+                    image_sources.append(_ImageSource(path=path, origin=path))
+            else:
+                image_sources.append(_ImageSource(path=path, origin=path))
+
+        legacy_image_sources = [source for source in image_sources if source.visual is None]
+        if legacy_image_sources:
             documents.extend(
                 await self._load_image_nodes(
                     legacy_image_sources, image_progress_callback=image_progress_callback
@@ -138,20 +189,43 @@ class LlamaIndexDocumentLoader:
         for file_path_str in classification.unsupported:
             self.logger.warning(f"Skipped unsupported file: {Path(file_path_str).name}")
 
+        from deeptutor.knowledge.indexing_run import current_run
+
+        if run := current_run():
+            accepted = {
+                str(Path(doc.metadata["file_path"]).resolve())
+                for doc in documents
+                if isinstance(getattr(doc, "metadata", None), dict)
+                and doc.metadata.get("file_path")
+            }
+            for name in (
+                classification.parser_files + classification.text_files + classification.image_files
+            ):
+                source = Path(name)
+                if str(source.resolve()) in accepted:
+                    run.document(source, "embedding")
+                elif (
+                    run.data["documents"].get(run.source_key(source), {}).get("status") != "failed"
+                ):
+                    run.document(
+                        source,
+                        "failed",
+                        reason="invalid_output",
+                        detail="No usable document content.",
+                    )
         return documents
 
     def _parse_document(
         self,
         file_path: Path,
+        parse_service=None,  # noqa: ANN001
+        engine: str | None = None,
         *,
-        parsed_sink: list[Any] | None = None,
-    ) -> tuple[str, list[_ImageSource], list[tuple[str, str]], dict[str, list[str]]]:
+        kb_dir: Path | None = None,
+    ) -> tuple[str, list[_ImageSource], str]:
         """Parse a document through the shared, engine-pluggable parse layer.
 
-        Returns ``(text, extracted_images, page_texts, page_image_paths)``. ``page_texts`` is
-        populated when the parser emits structured blocks with zero-based
-        ``page_idx`` values, allowing retrieval results to retain page-level
-        citation metadata. A parse failure (engine
+        Returns ``(text, extracted_images, engine)``. A parse failure (engine
         unavailable, unsupported format for the active engine, or models not
         ready) is logged and the file is skipped — matching the sibling
         LightRAG/GraphRAG pipelines — rather than aborting the whole batch.
@@ -159,75 +233,101 @@ class LlamaIndexDocumentLoader:
         from deeptutor.services.parsing import ParserError, get_parse_service
 
         try:
-            parsed = get_parse_service().parse(file_path)
+            parsed = (parse_service or get_parse_service()).parse(file_path, engine=engine)
         except ParserError as exc:
-            self.logger.warning(
-                f"Skipped {file_path.name}: the active document-parsing engine could "
-                f"not handle it ({exc}). Change the engine in Settings → Document Parsing."
-            )
-            return "", [], [], {}
-        if parsed_sink is not None:
-            parsed_sink.append(parsed)
+            if engine:
+                self.logger.warning(
+                    "Automatic OCR fallback failed for %s with the %s engine: %s",
+                    file_path.name,
+                    engine,
+                    exc,
+                )
+            else:
+                self.logger.warning(
+                    f"Skipped {file_path.name}: the active document-parsing engine could "
+                    f"not handle it ({exc}). Change the engine in Settings → Document Parsing."
+                )
+            return "", [], ""
 
         text = parsed.markdown.strip() or self._text_from_blocks(parsed.blocks)
-        page_texts = self._page_texts_from_blocks(parsed.blocks)
+        if kb_dir is not None and file_path.suffix.lower() == ".pdf":
+            import pymupdf
+
+            from deeptutor.services.rag.source_pages import build_pdf_documents
+
+            try:
+                self._pdf_documents[str(file_path)] = build_pdf_documents(file_path, parsed, kb_dir)
+            except (pymupdf.FileDataError, OSError) as exc:
+                raise SourcePageError(f"Cannot read PDF page evidence: {exc}") from exc
         images = self._collect_asset_images(parsed.asset_dir, origin=file_path)
-        page_image_paths = self._page_image_paths_from_blocks(parsed.blocks, parsed.asset_dir)
-        return text, images, page_texts, page_image_paths
+        if kb_dir is not None:
+            from deeptutor.services.rag.visual_coverage import record_coverage
+
+            candidates = collect_visual_assets(parsed, file_path, kb_dir)
+            record_coverage(parsed, file_path, kb_dir, candidates)
+            by_path = {candidate.path.resolve(): candidate for candidate in candidates}
+            images = [
+                _ImageSource(
+                    path=image.path, origin=image.origin, visual=by_path[image.path.resolve()]
+                )
+                for image in images
+                if image.path.resolve() in by_path
+            ]
+        return text, images, str(parsed.engine or "")
 
     @staticmethod
-    def _page_image_paths_from_blocks(
-        blocks: list[dict] | None,
-        asset_dir: Path | None,
-    ) -> dict[str, list[str]]:
-        """Map parser image blocks to safe, real asset paths by source page.
+    def _append_visual_documents(
+        documents: list[Any],
+        images: list[_ImageSource],
+        candidates: list[VisualAssetCandidate] | None,
+    ) -> None:
+        for image in images:
+            if image.visual is None:
+                continue
+            record = image.visual.record
+            if candidates is not None:
+                candidates.append(image.visual)
+            caption = record["caption"] or "Source figure"
+            context = record["context"]
+            text = f"[Source visual] {image.origin.name}: {caption}"
+            if context:
+                text += f"\nContext: {context}"
+            if record.get("table_html"):
+                text += f"\nStructured table: {record['table_html']}"
+            if record.get("section"):
+                text += f"\nSection: {record['section']}"
+            documents.append(
+                Document(
+                    text=text,
+                    metadata={
+                        "file_name": image.origin.name,
+                        "file_path": str(image.origin),
+                        "content_type": "source_visual",
+                        "visual_asset_id": record["asset_id"],
+                        "source_document_id": record["source_document_id"],
+                        "page": record["page_number"] or "",
+                        "bbox": record["bbox"],
+                        "caption": record["caption"],
+                        "source_locator": record["source_locator"],
+                    },
+                )
+            )
 
-        MinerU stores ``img_path`` as a relative path such as
-        ``images/figure-1.jpg``. The RAG index only needs the local path as
-        provenance; the bytes are loaded later, when a Vision-capable answer
-        is actually requested. Paths are constrained to ``asset_dir`` so a
-        malformed parser block cannot make the chat layer read an arbitrary
-        file.
-        """
-        if not blocks or not asset_dir or not Path(asset_dir).is_dir():
-            return {}
-
-        root = Path(asset_dir).resolve()
-        grouped: dict[str, list[str]] = {}
-        for block in blocks:
-            if not isinstance(block, dict):
-                continue
-            raw_img_path = str(block.get("img_path") or "").strip()
-            if not raw_img_path:
-                continue
-            try:
-                page_idx = int(block.get("page_idx"))
-            except (TypeError, ValueError):
-                continue
-            if page_idx < 0:
-                continue
-
-            candidate = Path(raw_img_path)
-            if not candidate.is_absolute():
-                candidate = root / candidate.name
-            try:
-                resolved = candidate.resolve()
-                if not resolved.is_relative_to(root):
-                    continue
-            except OSError:
-                continue
-            if (
-                not resolved.is_file()
-                or resolved.suffix.lower() not in FileTypeRouter.IMAGE_EXTENSIONS
-            ):
-                continue
-
-            page_label = str(page_idx + 1)
-            paths = grouped.setdefault(page_label, [])
-            value = str(resolved)
-            if value not in paths:
-                paths.append(value)
-        return grouped
+    def _log_scanned_pdf_without_ocr(
+        self,
+        file_path: Path,
+        parse_engine: str,
+        extracted_image_count: int,
+    ) -> None:
+        engine_label = parse_engine or "the active parser"
+        self.logger.warning(
+            "Skipped scanned PDF: %s. The %s engine extracted %d image(s) but no text, "
+            "and no usable local OCR fallback was available. Install LiteParse under "
+            "Settings, Document Parsing, or switch to an OCR-capable engine with OCR enabled.",
+            file_path.name,
+            engine_label,
+            extracted_image_count,
+        )
 
     @staticmethod
     def _text_from_blocks(blocks: list[dict] | None) -> str:
@@ -235,100 +335,11 @@ class LlamaIndexDocumentLoader:
         if not blocks:
             return ""
         parts = [
-            LlamaIndexDocumentLoader._block_text(block)
+            str(block.get("text") or block.get("content") or "").strip()
             for block in blocks
             if isinstance(block, dict)
         ]
         return "\n\n".join(part for part in parts if part)
-
-    @staticmethod
-    def _block_text(block: dict) -> str:
-        """Return indexable Markdown for one structured parser block."""
-        parts: list[str] = []
-        seen: set[str] = set()
-
-        def append_values(value: Any) -> None:
-            values = value if isinstance(value, list) else [value]
-            for item in values:
-                text = str(item or "").strip()
-                if text and text not in seen:
-                    parts.append(text)
-                    seen.add(text)
-
-        append_values(block.get("text"))
-        append_values(block.get("content"))
-
-        block_type = str(block.get("type") or "").lower()
-        img_path = str(block.get("img_path") or "").strip()
-        if block_type == "table":
-            append_values(block.get("table_caption"))
-            append_values(block.get("table_body"))
-            if not block.get("table_body") and img_path:
-                append_values(f"[Table image on source page: {Path(img_path).name}]")
-            append_values(block.get("table_footnote"))
-        elif block_type == "image":
-            # Preserve the fact that a source page contains a visual even when
-            # the active text-only models cannot describe or embed it.
-            if img_path:
-                append_values(f"[Image on source page: {Path(img_path).name}]")
-            append_values(block.get("image_caption"))
-            append_values(block.get("image_footnote"))
-        else:
-            # Keep parser-added captions even if a future engine attaches them
-            # to a non-standard block type.
-            append_values(block.get("image_caption"))
-            append_values(block.get("image_footnote"))
-            append_values(block.get("table_caption"))
-            append_values(block.get("table_body"))
-            append_values(block.get("table_footnote"))
-
-        return "\n\n".join(parts)
-
-    @staticmethod
-    def _page_texts_from_blocks(blocks: list[dict] | None) -> list[tuple[str, str]]:
-        """Group structured parser text into one document per source page.
-
-        MinerU emits zero-based ``page_idx`` values on content-list blocks.
-        If any meaningful text block lacks a valid page index, return an empty
-        list so callers safely fall back to the parser's complete markdown.
-        Repeated headers, footers, and printed page numbers are omitted because
-        they add retrieval noise without useful teaching content.
-        """
-        if not blocks:
-            return []
-
-        grouped: dict[int, list[str]] = {}
-        noise_types = {"header", "footer", "page_number"}
-        saw_indexable_content = False
-
-        for block in blocks:
-            if not isinstance(block, dict):
-                continue
-            if str(block.get("type") or "").lower() in noise_types:
-                continue
-
-            part = LlamaIndexDocumentLoader._block_text(block)
-            if not part:
-                continue
-            saw_indexable_content = True
-
-            raw_page_idx = block.get("page_idx")
-            try:
-                page_idx = int(raw_page_idx)
-            except (TypeError, ValueError):
-                return []
-            if page_idx < 0:
-                return []
-            grouped.setdefault(page_idx, []).append(part)
-
-        if not saw_indexable_content:
-            return []
-
-        return [
-            (str(page_idx + 1), "\n\n".join(parts))
-            for page_idx, parts in sorted(grouped.items())
-            if parts
-        ]
 
     def _collect_asset_images(self, asset_dir: Path | None, *, origin: Path) -> list[_ImageSource]:
         """Gather images the parse engine extracted into ``asset_dir``.
@@ -446,13 +457,75 @@ class LlamaIndexDocumentLoader:
                 if image_progress_callback:
                     try:
                         image_progress_callback(completed, total)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        self.logger.warning(
+                            "Image progress callback failed (completed=%s, total=%s): %s",
+                            completed,
+                            total,
+                            exc,
+                        )
             return result
 
         # gather preserves input order, so embedded/descriptions/contents stay
         # aligned regardless of completion order.
-        results = await asyncio.gather(*(_describe_one(source) for source in sources))
+        batch_size = image_description_batch_size()
+        if batch_size == 1:
+            results = await asyncio.gather(*(_describe_one(source) for source in sources))
+        else:
+            batcher = ImageCaptionBatcher(
+                llm_client,
+                prompt=IMAGE_DESCRIPTION_PROMPT,
+                system_prompt=IMAGE_DESCRIPTION_SYSTEM_PROMPT,
+            )
+
+            async def _describe_group(group: list[_ImageSource]):
+                nonlocal completed
+                prepared = []
+                try:
+                    async with semaphore:
+                        if batcher.halted:
+                            return []
+                        for source in group:
+                            try:
+                                payload = await asyncio.to_thread(
+                                    self._load_image_payload, source.path
+                                )
+                            except OSError:
+                                self.logger.warning(
+                                    "Failed to read caption image: %s", source.path.name
+                                )
+                                continue
+                            prepared.append((source, {**payload, "filename": source.path.name}))
+                        descriptions = await asyncio.wait_for(
+                            batcher.describe([payload for _, payload in prepared]),
+                            timeout=timeout_seconds,
+                        )
+                        return [
+                            (source, caption, {"image": payload["data_uri"]})
+                            for (source, payload), caption in zip(prepared, descriptions)
+                            if caption
+                        ]
+                except asyncio.TimeoutError:
+                    self.logger.warning(
+                        "Image caption batch exceeded its %ss deadline", timeout_seconds
+                    )
+                    return []
+                finally:
+                    for _ in group:
+                        completed += 1
+                        if image_progress_callback:
+                            try:
+                                image_progress_callback(completed, total)
+                            except Exception:
+                                pass
+
+            groups = await asyncio.gather(
+                *(
+                    _describe_group(sources[start : start + batch_size])
+                    for start in range(0, len(sources), batch_size)
+                )
+            )
+            results = [result for group in groups for result in group]
         for result in results:
             if result is None:
                 continue
@@ -494,106 +567,6 @@ class LlamaIndexDocumentLoader:
             self.logger.info(f"Loaded image: {source.path.name} ({len(embedding)}D vector)")
         return nodes
 
-    @staticmethod
-    def _attach_visual_page_metadata(
-        documents: list[Any], candidates: list[VisualAssetCandidate] | None
-    ) -> None:
-        """Let a retrieved page document carry the figure provenance it contains."""
-        if not candidates:
-            return
-        by_page: dict[tuple[str, int], VisualAssetCandidate] = {}
-        for candidate in candidates:
-            record = candidate.record
-            page = record.get("page_number")
-            source_path = str(record.get("source_path") or "")
-            if isinstance(page, int):
-                by_page.setdefault((source_path, page), candidate)
-        for document in documents:
-            metadata = getattr(document, "metadata", None)
-            if not isinstance(metadata, dict) or metadata.get("visual_asset_id"):
-                continue
-            source_path = str(Path(str(metadata.get("file_path") or "")).name)
-            try:
-                page = int(metadata.get("page_label") or metadata.get("page") or 0)
-            except (TypeError, ValueError):
-                continue
-            candidate = by_page.get((source_path, page))
-            if not candidate:
-                continue
-            record = candidate.record
-            metadata.update(
-                {
-                    "visual_asset_id": record["asset_id"],
-                    "source_document_id": record.get("source_document_id", ""),
-                    "caption": record.get("caption", ""),
-                    "page": page,
-                    **({"bbox": record["bbox"]} if record.get("bbox") else {}),
-                    **(
-                        {"source_locator": record["source_locator"]}
-                        if record.get("source_locator")
-                        else {}
-                    ),
-                }
-            )
-
-    @staticmethod
-    def _attach_visual_records(
-        sources: list[_ImageSource],
-        candidates: list[VisualAssetCandidate] | None,
-    ) -> None:
-        if not candidates:
-            return
-        by_path = {candidate.path.resolve(): candidate.record for candidate in candidates}
-        for index, source in enumerate(sources):
-            record = by_path.get(source.path.resolve())
-            if record:
-                sources[index] = _ImageSource(path=source.path, origin=source.origin, visual=record)
-
-    @staticmethod
-    def _append_visual_documents(
-        documents: list[Any],
-        sources: list[_ImageSource],
-        candidates: list[VisualAssetCandidate] | None,
-    ) -> None:
-        if not candidates:
-            return
-        by_path = {candidate.path.resolve(): candidate.record for candidate in candidates}
-        seen: set[str] = set()
-        for source in sources:
-            record = by_path.get(source.path.resolve())
-            if not record or record["asset_id"] in seen:
-                continue
-            seen.add(record["asset_id"])
-            caption = str(record.get("caption") or "Source figure")
-            context = str(record.get("context") or "")
-            documents.append(
-                Document(
-                    text="\n\n".join(part for part in (caption, context) if part),
-                    metadata={
-                        "file_name": source.origin.name,
-                        "file_path": str(source.origin),
-                        "content_type": "source_visual",
-                        "visual_asset_id": record["asset_id"],
-                        "source_document_id": record.get("source_document_id", ""),
-                        "caption": caption,
-                        **(
-                            {
-                                "page": record["page_number"],
-                                "page_label": str(record["page_number"]),
-                            }
-                            if record.get("page_number") is not None
-                            else {}
-                        ),
-                        **({"bbox": record["bbox"]} if record.get("bbox") else {}),
-                        **(
-                            {"source_locator": record["source_locator"]}
-                            if record.get("source_locator")
-                            else {}
-                        ),
-                    },
-                )
-            )
-
     def _log_skipped_images(self, sources: list[_ImageSource], reason: str) -> None:
         for source in sources:
             self.logger.warning(
@@ -604,8 +577,6 @@ class LlamaIndexDocumentLoader:
     async def _describe_image(
         self, llm_client: Any, file_path: Path, image_base64: str, mimetype: str
     ) -> str:
-        from deeptutor.services.llm.image_caption_cache import complete_image_caption
-
         response = await complete_image_caption(
             llm_client,
             IMAGE_DESCRIPTION_PROMPT,
@@ -637,29 +608,31 @@ class LlamaIndexDocumentLoader:
         file_path: Path,
         text: str,
         *,
-        extra_metadata: dict[str, Any] | None = None,
+        parse_engine: str = "",
+        extracted_image_count: int = 0,
     ) -> None:
         if text.strip():
-            metadata = {
-                "file_name": file_path.name,
-                "file_path": str(file_path),
-            }
-            if extra_metadata:
-                metadata.update(extra_metadata)
-            excluded_metadata_keys = []
-            if metadata.get("image_paths"):
-                # Keep paths available for post-retrieval Vision attachments,
-                # but do not serialize long cache paths into the text used by
-                # LlamaIndex's embed/LLM metadata token budget.
-                excluded_metadata_keys.append("image_paths")
             documents.append(
                 Document(
                     text=text,
-                    metadata=metadata,
-                    excluded_embed_metadata_keys=excluded_metadata_keys,
-                    excluded_llm_metadata_keys=excluded_metadata_keys,
+                    metadata={
+                        "file_name": file_path.name,
+                        "file_path": str(file_path),
+                    },
                 )
             )
             self.logger.info(f"Loaded: {file_path.name} ({len(text)} chars)")
         else:
-            self.logger.warning(f"Skipped empty document: {file_path.name}")
+            if file_path.suffix.lower() == ".pdf" and extracted_image_count:
+                engine_label = parse_engine or "the active parser"
+                self.logger.warning(
+                    "Skipped empty document: %s. The %s engine extracted %d image(s) "
+                    "but no text. This is usually a scanned PDF; use an OCR-capable "
+                    "parsing engine such as MinerU or Docling with OCR enabled. "
+                    "Change the engine in Settings, Document Parsing.",
+                    file_path.name,
+                    engine_label,
+                    extracted_image_count,
+                )
+            else:
+                self.logger.warning(f"Skipped empty document: {file_path.name}")

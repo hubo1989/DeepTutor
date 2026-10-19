@@ -1,4 +1,5 @@
-import asyncio
+import multiprocessing
+from pathlib import Path
 
 from fastapi import HTTPException
 import pytest
@@ -7,6 +8,22 @@ from deeptutor.api.routers import settings as settings_router
 from deeptutor.multi_user.context import reset_current_user, set_current_user
 from deeptutor.multi_user.grants import save_grant
 from deeptutor.multi_user.models import CurrentUser, UserScope
+
+
+def _hold_grant_file_lock(path: str, ready, release) -> None:
+    from deeptutor.multi_user.grants import _grant_write_lock
+
+    with _grant_write_lock(Path(path)):
+        ready.set()
+        assert release.wait(10)
+
+
+def _wait_for_grant_file_lock(path: str, attempting, acquired) -> None:
+    from deeptutor.multi_user.grants import _grant_write_lock
+
+    attempting.set()
+    with _grant_write_lock(Path(path)):
+        acquired.set()
 
 
 def make_user(tmp_path, role="user"):
@@ -50,58 +67,84 @@ def test_grants_reject_admin_users(tmp_path, monkeypatch):
         save_grant("u_admin", {"knowledge_bases": [{"resource_id": "admin:kb:demo"}]})
 
 
-def test_put_user_grants_merges_partial_payload_without_resetting_permissions(monkeypatch):
-    from deeptutor.multi_user import router as multi_user_router
-    from deeptutor.multi_user.grants import normalize_grant
+def test_failed_atomic_grant_replace_preserves_prior_file(mu_isolated_root, seed_user, monkeypatch):
+    from deeptutor.multi_user.grants import grant_path, load_grant
+    from deeptutor.services import file_io
 
-    current = normalize_grant(
-        "u_alice",
-        {
-            "version": 3,
-            "platform": {
-                "embedding": {"enabled": True},
-                "mineru": {"enabled": False},
-            },
-            "byok": {
-                "llm": {"enabled": False},
-                "embedding": {"enabled": True},
-                "mineru": {"enabled": False},
-            },
-            "models": {"llm": [{"profile_id": "p1", "model_ids": ["m1"]}]},
-        },
-    )
-    saved: list[dict] = []
+    seed_user("bootstrap-admin")
+    learner = seed_user("student-standard")
+    user_id = learner["id"]
+    save_grant(user_id, {"enabled_tools": []})
+    path = grant_path(user_id)
+    previous = path.read_bytes()
+    previous_files = set(path.parent.iterdir())
 
-    monkeypatch.setattr(multi_user_router, "_require_assignable_user", lambda _user_id: None)
-    monkeypatch.setattr(multi_user_router, "load_grant", lambda _user_id: current)
-    monkeypatch.setattr(multi_user_router, "log_admin_action", lambda *_args, **_kwargs: None)
+    def fail_replace(_source, _target):
+        raise OSError("replace failed")
 
-    def save(user_id, payload):
-        assert user_id == "u_alice"
-        saved.append(payload)
-        return payload
+    monkeypatch.setattr(file_io, "_atomic_replace", fail_replace)
+    with pytest.raises(OSError, match="replace failed"):
+        save_grant(user_id, {"enabled_tools": ["reason"]})
 
-    monkeypatch.setattr(multi_user_router, "save_grant", save)
-    payload = multi_user_router.GrantPayload(
-        grant={
-            "version": 2,
-            "user_id": "another-user",
-            "byok": {"llm": {"enabled": True}},
-        }
-    )
+    assert path.read_bytes() == previous
+    assert set(path.parent.iterdir()) == previous_files
+    assert load_grant(user_id)["enabled_tools"] == []
 
-    result = asyncio.run(multi_user_router.put_user_grants("u_alice", payload, object()))
 
-    assert result["grant"] == saved[0]
-    assert saved[0]["version"] == 3
-    assert saved[0]["user_id"] == "u_alice"
-    assert saved[0]["byok"] == {
-        "llm": {"enabled": True},
-        "embedding": {"enabled": True},
-        "mineru": {"enabled": False},
-    }
-    assert saved[0]["platform"] == current["platform"]
-    assert saved[0]["models"] == current["models"]
+@pytest.mark.parametrize(
+    "contents",
+    [
+        "{broken",
+        "[]",
+        '{"enabled_tools": "reason"}',
+        '{"learning_policy": {}}',
+        '{"learning_policy": {"reading": {"allow_upload": "false"}}}',
+    ],
+)
+def test_existing_invalid_grant_fails_closed(mu_isolated_root, seed_user, contents):
+    from deeptutor.multi_user.grants import GrantStorageError, grant_path, load_grant
+    from deeptutor.multi_user.learning_access import learning_policy_for_user
+
+    seed_user("bootstrap-admin")
+    learner = seed_user("student-standard")
+    path = grant_path(learner["id"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(contents, encoding="utf-8")
+
+    with pytest.raises(GrantStorageError):
+        load_grant(learner["id"])
+    with pytest.raises(GrantStorageError):
+        learning_policy_for_user(learner["id"])
+
+
+def test_grant_file_lock_serializes_processes(tmp_path):
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    release = context.Event()
+    attempting = context.Event()
+    acquired = context.Event()
+    path = str(tmp_path / "grant.json")
+    holder = context.Process(target=_hold_grant_file_lock, args=(path, ready, release))
+    contender = context.Process(target=_wait_for_grant_file_lock, args=(path, attempting, acquired))
+    try:
+        holder.start()
+        assert ready.wait(10)
+        contender.start()
+        assert attempting.wait(10)
+        assert not acquired.wait(0.2)
+        release.set()
+        assert acquired.wait(10)
+    finally:
+        release.set()
+        for process in (holder, contender):
+            if process.pid is None:
+                continue
+            process.join(timeout=10)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=10)
+    assert holder.exitcode == 0
+    assert contender.exitcode == 0
 
 
 def test_non_admin_settings_catalog_is_forbidden(tmp_path):
@@ -114,86 +157,49 @@ def test_non_admin_settings_catalog_is_forbidden(tmp_path):
         reset_current_user(token)
 
 
-def test_new_user_gets_a_create_time_default_quota_snapshot(mu_isolated_root, monkeypatch):
-    from deeptutor.multi_user import grants, token_quota
-    from deeptutor.multi_user.identity import get_user
-    from deeptutor.services import auth
+@pytest.mark.asyncio
+async def test_personal_settings_drafts_are_private_and_do_not_grant_catalog_access(
+    tmp_path, monkeypatch
+):
+    from types import SimpleNamespace
 
-    monkeypatch.setattr(auth, "hash_password", lambda _password: "hashed")
+    from deeptutor.services.config.settings_draft import get_settings_draft_service
+
     monkeypatch.setattr(
-        token_quota,
-        "default_quota",
-        lambda: {
-            "llm": {"daily_tokens": 12_000, "monthly_tokens": 34_000},
-            "embedding": {"daily_tokens": 1_000_000, "monthly_tokens": 10_000_000},
-            "mineru": {
-                "daily_pages": 50,
-                "monthly_pages": 500,
-                "max_pages_per_file": 50,
-            },
-        },
+        settings_router, "get_model_catalog_service", lambda: SimpleNamespace(load=lambda: {})
     )
-
-    # Every public/admin-created role=user account receives its own grant
-    # snapshot; no first-account role promotion is involved.
-    auth.add_user("alice@example.com", "password1234")
-    record = get_user("alice@example.com")
-    assert record is not None
-    assert grants.load_grant(record["id"])["token_quota"] == {
-        "daily_tokens": 12_000,
-        "monthly_tokens": 34_000,
-    }
-    assert grants.load_grant(record["id"])["quota"]["llm"] == {
-        "daily_tokens": 12_000,
-        "monthly_tokens": 34_000,
-    }
-
-    # Retrying an existing account must not replace a grant an admin has
-    # already edited, even if the deployment default changes later.
-    monkeypatch.setattr(
-        token_quota,
-        "default_quota",
-        lambda: {
-            "llm": {"daily_tokens": 56_000, "monthly_tokens": 78_000},
-            "embedding": {"daily_tokens": 2_000_000, "monthly_tokens": 20_000_000},
-            "mineru": {
-                "daily_pages": 60,
-                "monthly_pages": 600,
-                "max_pages_per_file": 60,
-            },
-        },
-    )
-    auth.add_user("alice@example.com", "new-password")
-    assert grants.load_grant(record["id"])["token_quota"] == {
-        "daily_tokens": 12_000,
-        "monthly_tokens": 34_000,
-    }
-
-
-def test_admin_default_quota_api_normalizes_and_persists(tmp_path, monkeypatch):
-    from deeptutor.multi_user import router as multi_user_router
-    from deeptutor.services.config.runtime_settings import RuntimeSettingsService
-
-    service = RuntimeSettingsService(tmp_path / "settings", process_env={})
-    monkeypatch.setattr(multi_user_router, "get_runtime_settings_service", lambda: service)
-    monkeypatch.setattr(multi_user_router, "log_admin_action", lambda *args, **kwargs: None)
-
-    payload = multi_user_router.DefaultTokenQuotaPayload(
-        default_token_quota={
-            "daily_tokens": -1,
-            "monthly_tokens": 20_000_000_000,
-        }
-    )
-    saved = asyncio.run(multi_user_router.put_default_token_quota(payload, object()))
-    assert saved["default_token_quota"] == {
-        "daily_tokens": 0,
-        "monthly_tokens": 10_000_000_000,
-    }
-    assert saved["default_quota"]["llm"] == {
-        "daily_tokens": 0,
-        "monthly_tokens": 10_000_000_000,
-    }
-    assert service.load_auth(include_process_overrides=False)["default_quota"]["llm"] == {
-        "daily_tokens": 0,
-        "monthly_tokens": 10_000_000_000,
-    }
+    user = make_user(tmp_path, role="user")
+    admin = make_user(tmp_path, role="admin")
+    token = set_current_user(admin)
+    try:
+        get_settings_draft_service().save(
+            {"extensions": {"mineru": {"api_token": "admin-draft-secret"}}}
+        )
+    finally:
+        reset_current_user(token)
+    token = set_current_user(user)
+    try:
+        assert await settings_router.get_settings_draft() == {"draft": None}
+        payload = settings_router.SettingsDraftPayload(extensions={"ui": {"theme": "dark"}})
+        saved = await settings_router.update_settings_draft(payload)
+        assert saved["draft"]["extensions"] == {"ui": {"theme": "dark"}}
+        assert (await settings_router.get_settings_draft())["draft"][
+            "extensions"
+        ] == payload.extensions
+        with pytest.raises(HTTPException) as exc:
+            await settings_router.update_settings_draft(
+                settings_router.SettingsDraftPayload(catalog={"version": 1})
+            )
+        assert exc.value.status_code == 403
+        await settings_router.discard_settings_draft()
+        assert await settings_router.get_settings_draft() == {"draft": None}
+    finally:
+        reset_current_user(token)
+    token = set_current_user(admin)
+    try:
+        assert (
+            get_settings_draft_service().load()["extensions"]["mineru"]["api_token"]
+            == "admin-draft-secret"
+        )
+    finally:
+        reset_current_user(token)

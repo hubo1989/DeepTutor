@@ -1,3 +1,4 @@
+import { toolResultMetadata } from "@/lib/tool-event";
 /**
  * Locator citations in assistant prose: `[p.12]`, `[p.12,17]`, `[p.12-14]`.
  *
@@ -15,7 +16,7 @@
  *
  * ## Why code spans are excluded first
  *
- * A bracketed token inside code is code, not a citation. DeepTutor has already
+ * A bracketed token inside code is code, not a citation. LearnLeader has already
  * shipped the bug where `[0]` in a snippet was linkified into a citation anchor
  * (issue #468), so this parser masks fenced blocks and inline code *before*
  * matching rather than hoping the pattern is narrow enough.
@@ -27,6 +28,8 @@ export interface LocatorCitation {
   raw: string;
   /** Locators in ascending order, de-duplicated. */
   locators: number[];
+  /** Raw comma/dash body inside the citation, e.g. `"12,17"`. */
+  body?: string;
   /** Character offsets of `raw` within the input. */
   start: number;
   end: number;
@@ -34,13 +37,31 @@ export interface LocatorCitation {
 
 /** Anchor prefix the reader listens for. */
 export const LOCATOR_HREF_PREFIX = "#dt-locator-";
+const MATERIAL_LOCATOR_HREF_PREFIX = "#dt-material-";
+const READING_EVIDENCE_TOOLS = new Set([
+  "search_material",
+  "read_material",
+  "reader_goto",
+]);
+
+export interface ReadingCitationTarget {
+  materialId?: string;
+  materialRevision?: number;
+  locator: number;
+}
+
+interface ReadingEvidenceEvent {
+  type?: string;
+  metadata?: unknown;
+}
 
 /** Largest locator span a single `[p.a-b]` may expand to. */
 const MAX_RANGE_SPAN = 40;
 
 // `[p.` then digits with , - – separators, then `]` — but not when followed by
-// `(`, which would mean it is already a Markdown link's label.
-const CITATION = /\[p\.\s*(\d[\d\s,–—-]*)\]/gi;
+// `(`, which would mean it is already a Markdown link's label. Optionally wrapped
+// in balanced backticks (e.g. `[p.12]`) from prompt formatting artifacts.
+const CITATION = /(`?\[p\.\s*(\d[\d\s,–—-]*)\]`?)/gi;
 
 /**
  * Character ranges occupied by fenced blocks or inline code.
@@ -64,6 +85,12 @@ export function codeRanges(text: string): Array<[number, number]> {
   const inline = /(`+)(?:[^`]|(?!\1)`)*?\1/g;
   while ((match = inline.exec(text)) !== null) {
     if (!inFence(match.index)) {
+      // Standalone locator citations wrapped in backticks (e.g. `[p.12]`)
+      // are formatting artifacts from prompts rather than code snippets.
+      // Do not treat them as protected code so they can be linkified.
+      if (/^`[ \t]*\[p\.\s*\d[\d\s,–—-]*(?:\])[ \t]*`$/i.test(match[0])) {
+        continue;
+      }
       ranges.push([match.index, match.index + match[0].length]);
     }
   }
@@ -180,17 +207,20 @@ export function findLocatorCitations(text: string): LocatorCitation[] {
   CITATION.lastIndex = 0;
   let match: RegExpExecArray | null;
   while ((match = CITATION.exec(text)) !== null) {
+    const raw = match[1];
+    if (raw.startsWith("`") !== raw.endsWith("`")) continue;
     const start = match.index;
     if (masked(start)) continue;
     // Already a Markdown link label — leave it alone.
-    if (text[start + match[0].length] === "(") continue;
-    const locators = parseLocatorList(match[1]);
+    if (text[start + raw.length] === "(") continue;
+    const locators = parseLocatorList(match[2]);
     if (!locators.length) continue;
     out.push({
-      raw: match[0],
+      raw,
       locators,
+      body: match[2],
       start,
-      end: start + match[0].length,
+      end: start + raw.length,
     });
   }
   return out;
@@ -205,16 +235,29 @@ export function findLocatorCitations(text: string): LocatorCitation[] {
  */
 export function linkifyLocatorCitations(
   text: string,
-  options: { maxLocator?: number } = {},
+  options: {
+    maxLocator?: number;
+    materialId?: string;
+    materialRevision?: number;
+    allowedLocators?: Iterable<number>;
+  } = {},
 ): string {
   const citations = findLocatorCitations(text);
   if (!citations.length) return text;
-  const { maxLocator } = options;
+  const { maxLocator, materialId, materialRevision } = options;
+  const allowed = options.allowedLocators
+    ? new Set(options.allowedLocators)
+    : null;
 
   const skip = codeRanges(text);
   let out = "";
   let cursor = 0;
   for (const citation of citations) {
+    if (allowed && citation.locators.some((locator) => !allowed.has(locator))) {
+      out += text.slice(cursor, citation.end);
+      cursor = citation.end;
+      continue;
+    }
     const locators =
       typeof maxLocator === "number" && maxLocator > 0
         ? citation.locators.filter((n) => n <= maxLocator)
@@ -225,7 +268,16 @@ export function linkifyLocatorCitations(
       continue;
     }
 
-    const href = `${LOCATOR_HREF_PREFIX}${locators[0]}`;
+    const buildLocatorHref = (locator: number) => {
+      const revisionAddress =
+        Number.isSafeInteger(materialRevision) && Number(materialRevision) >= 1
+          ? `-revision-${materialRevision}`
+          : "";
+      return materialId
+        ? `${MATERIAL_LOCATOR_HREF_PREFIX}${encodeURIComponent(materialId)}${revisionAddress}-locator-${locator}`
+        : `${LOCATOR_HREF_PREFIX}${locator}`;
+    };
+
     const absorbed =
       locators.length === citation.locators.length
         ? findAbsorbablePhrase(text, citation, skip)
@@ -236,7 +288,7 @@ export function linkifyLocatorCitations(
       // so the sentence closes cleanly: "…located on [page 3](…) of the
       // document." rather than "…of the document ."
       out += text.slice(cursor, absorbed.start);
-      out += `[${absorbed.label}](${href})`;
+      out += `[${absorbed.label}](${buildLocatorHref(locators[0])})`;
       const between = text.slice(absorbed.end, citation.start);
       out += between.replace(/\s+$/, "");
       cursor = citation.end;
@@ -244,7 +296,41 @@ export function linkifyLocatorCitations(
     }
 
     out += text.slice(cursor, citation.start);
-    out += `[p.${locators.join(",")}](${href})`;
+    if (citation.body && citation.body.includes(",")) {
+      const chunks = citation.body.split(",");
+      const parts: string[] = [];
+      for (let i = 0; i < chunks.length; i += 1) {
+        const piece = chunks[i].trim();
+        if (!piece) continue;
+        const rangeMatch = /^(\d+)\s*[–—-]\s*(\d+)$/.exec(piece);
+        let target = 0;
+        if (rangeMatch) {
+          target = Math.min(Number(rangeMatch[1]), Number(rangeMatch[2]));
+        } else {
+          const singleMatch = /^(\d+)$/.exec(piece);
+          if (singleMatch) target = Number(singleMatch[1]);
+        }
+        if (!target) continue;
+        if (
+          typeof maxLocator === "number" &&
+          maxLocator > 0 &&
+          target > maxLocator
+        ) {
+          continue;
+        }
+        const label = parts.length === 0 ? `p.${piece}` : piece;
+        parts.push(`[${label}](${buildLocatorHref(target)})`);
+      }
+      out +=
+        parts.length > 0
+          ? parts.join(", ")
+          : `[p.${locators.join(",")}](${buildLocatorHref(locators[0])})`;
+    } else {
+      const label = citation.body?.trim()
+        ? `p.${citation.body.trim()}`
+        : `p.${locators.join(",")}`;
+      out += `[${label}](${buildLocatorHref(locators[0])})`;
+    }
     cursor = citation.end;
   }
   return out + text.slice(cursor);
@@ -254,9 +340,92 @@ export function linkifyLocatorCitations(
 export function locatorFromHref(
   href: string | null | undefined,
 ): number | null {
-  if (!href || !href.startsWith(LOCATOR_HREF_PREFIX)) return null;
-  const parsed = Number(href.slice(LOCATOR_HREF_PREFIX.length));
-  return Number.isInteger(parsed) && parsed >= 1 ? parsed : null;
+  return citationTargetFromHref(href)?.locator ?? null;
+}
+
+/** Material-aware reader address, with support for legacy locator-only links. */
+/** The anchor `citationTargetFromHref` reads back: this unit of this material. */
+export function readingPassageHref(
+  materialId: string,
+  locator: number,
+  materialRevision?: number,
+): string {
+  const revision = materialRevision ? `-revision-${materialRevision}` : "";
+  return `${MATERIAL_LOCATOR_HREF_PREFIX}${materialId}${revision}-locator-${locator}`;
+}
+
+export function citationTargetFromHref(
+  href: string | null | undefined,
+): ReadingCitationTarget | null {
+  if (!href) return null;
+  if (href.startsWith(LOCATOR_HREF_PREFIX)) {
+    const locator = Number(href.slice(LOCATOR_HREF_PREFIX.length));
+    return Number.isInteger(locator) && locator >= 1 ? { locator } : null;
+  }
+  if (!href.startsWith(MATERIAL_LOCATOR_HREF_PREFIX)) return null;
+  // Material ids are content hashes or catalog-minted rm_ ids, matching the
+  // id shape the server-side citation generator can emit.
+  const match =
+    /^#dt-material-((?:[0-9a-f]{8,64}|rm_[0-9a-f]{12}))(?:-revision-(\d+))?-locator-(\d+)$/i.exec(
+      href,
+    );
+  if (!match) return null;
+  const materialRevision = match[2] ? Number(match[2]) : undefined;
+  const locator = Number(match[3]);
+  const materialId = match[1];
+  if (!Number.isSafeInteger(locator) || locator < 1) return null;
+  if (
+    materialRevision !== undefined &&
+    (!Number.isSafeInteger(materialRevision) || materialRevision < 1)
+  ) {
+    return null;
+  }
+  return {
+    materialId: materialId.toLowerCase(),
+    ...(materialRevision !== undefined ? { materialRevision } : {}),
+    locator,
+  };
+}
+
+/** Locators grounded by successful reading-tool results for one turn. */
+export function verifiedReadingLocators(
+  events: ReadingEvidenceEvent[] | null | undefined,
+  materialId: string | null | undefined,
+  materialRevision?: number | null,
+): Set<number> {
+  const verified = new Set<number>();
+  if (!materialId) return verified;
+  const expected = materialId.toLowerCase();
+  for (const event of events ?? []) {
+    if (event.type !== "tool_result" || !event.metadata) continue;
+    const outer = event.metadata as Record<string, unknown>;
+    const tool = String(outer.tool ?? outer.tool_name ?? "");
+    if (!READING_EVIDENCE_TOOLS.has(tool)) {
+      continue;
+    }
+    const metadata = toolResultMetadata(outer);
+    if (!metadata) continue;
+    if (String(metadata.material_id ?? "").toLowerCase() !== expected) continue;
+    if (materialRevision) {
+      const evidenceRevision = Number(metadata.material_revision);
+      if (evidenceRevision !== materialRevision) continue;
+    }
+    const add = (value: unknown) => {
+      const locator = Number(value);
+      if (Number.isInteger(locator) && locator >= 1) verified.add(locator);
+    };
+    if (Array.isArray(metadata.locators)) metadata.locators.forEach(add);
+    if (Array.isArray(metadata.hits)) {
+      metadata.hits.forEach((hit) => {
+        if (hit && typeof hit === "object") {
+          add((hit as Record<string, unknown>).locator);
+        }
+      });
+    }
+    add(metadata.locator);
+    add(metadata.found_locator);
+  }
+  return verified;
 }
 
 /** Human label for a locator, using the material's own unit word. */

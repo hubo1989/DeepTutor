@@ -54,7 +54,7 @@ def _cache_path(client: Any, request: dict[str, str]) -> Path | None:
             # The legacy facade inherits protocol/header defaults from the
             # current runtime config. Isolated clients own their full config.
             configs.append(get_llm_config())
-        identity = [{key: getattr(item, key, None) for key in _CONFIG_FIELDS} for item in configs]
+        identity = [{key: getattr(item, key) for key in _CONFIG_FIELDS} for item in configs]
         request_identity = {key: value for key, value in request.items() if key != "image_data"}
         request_identity["image_sha256"] = hashlib.sha256(
             request["image_data"].encode("ascii")

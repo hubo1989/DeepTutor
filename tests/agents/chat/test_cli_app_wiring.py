@@ -1,7 +1,7 @@
 """The pipeline's half of a CLI app call: where it runs, and where its files land.
 
 A CLI app is given its working directory by the pipeline, exactly as ``exec`` is.
-That is not a stylistic choice — the directory has to be one ``/api/outputs`` will
+That is not a stylistic choice — the directory has to be one ``/files/outputs`` will
 serve from, so the file an app produced becomes a link the reader can open. These
 tests pin that the injection happens for a ``cli_*`` name and that the directory
 it picks is one the path policy actually publishes.
@@ -35,7 +35,7 @@ def test_a_cli_app_call_is_given_a_workdir_and_a_writable_mount(
     kwargs = _augment("cli_blender", monkeypatch, tmp_path)
 
     workdir = kwargs["_sandbox_workdir"]
-    assert workdir.endswith("/cli")
+    assert Path(workdir).as_posix().endswith("/cli")
     assert Path(workdir).is_dir(), "the app cannot write into a directory nobody created"
     assert kwargs["_sandbox_user_id"] == "u_ada"
     mount = kwargs["_sandbox_mounts"][0]

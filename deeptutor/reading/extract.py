@@ -14,7 +14,9 @@ Per-format strategy, and why:
   raw view.
 * **PPTX** — the shared extractor already emits ``--- Slide N ---`` separators,
   so we split on those instead of re-implementing python-pptx handling.
-* **everything else** (EPUB, DOCX, XLSX, TXT, MD, code, …) — the shared
+* **Markdown** — the shared extractor's text, cut at usable ATX headings and
+  then at paragraph boundaries for long sections.
+* **everything else** (EPUB, DOCX, XLSX, TXT, code, …) — the shared
   extractor's plain text, cut into fixed-size *sections* on paragraph
   boundaries.
 
@@ -33,11 +35,13 @@ import logging
 from pathlib import Path
 import re
 
-from deeptutor.reading.models import OutlineEntry, ReadingError, UnitKind
+from deeptutor.reading.models import OutlineEntry, ReadingError, RenderMode, UnitKind, UnitReference
 from deeptutor.utils.document_images import (
     EmbeddedImage,
     build_marker,
+    extract_docx_rich,
     extract_pdf_images,
+    extract_pptx_rich,
     find_markers,
     reading_image_budget,
 )
@@ -54,12 +58,23 @@ SECTION_HARD_CHARS = 4200
 
 _SLIDE_SEPARATOR = re.compile(r"^--- Slide \d+ ---$", re.MULTILINE)
 # Title candidates: a markdown heading, or the first non-trivial line.
-_MD_HEADING = re.compile(r"^\s{0,3}#{1,6}\s+(?P<title>.+?)\s*#*\s*$")
+_MD_HEADING = re.compile(r"^\s{0,3}(?P<marks>#{1,6})\s+(?P<title>.+?)\s*#*\s*$")
+_MD_FENCE = re.compile(r"^\s{0,3}(?P<marker>`{3,}|~{3,})(?P<info>.*)$")
 
 # Formats whose original bytes the browser can render faithfully next to the
 # extracted text. Only PDF today; adding one means teaching the reader pane to
 # render it, not changing this engine.
 RAW_VIEW_EXTENSIONS = frozenset({".pdf"})
+
+
+@dataclass(frozen=True, slots=True)
+class MediaItem:
+    """One embedded image pinned to the locator whose text references it."""
+
+    name: str
+    mime_type: str
+    data: bytes
+    locator: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,8 +90,9 @@ class Extraction:
     # Otherwise the outline is synthesised later from unit first lines, so that
     # a material without bookmarks is still navigable by meaning.
     outline: tuple[OutlineEntry, ...] = field(default_factory=tuple)
-    # Locator-pinned embedded pictures. PDF ingestion is best effort: image
-    # extraction failure never fails a readable document.
+    render_mode: RenderMode = "text"
+    unit_refs: tuple[UnitReference, ...] = field(default_factory=tuple)
+    # Embedded pictures (DOCX/PPTX) mapped to the unit that mentions them.
     media: tuple[MediaItem, ...] = field(default_factory=tuple)
 
     @property
@@ -84,21 +100,20 @@ class Extraction:
         return sum(len(u) for u in self.units)
 
 
-@dataclass(frozen=True, slots=True)
-class MediaItem:
-    """One embedded image pinned to the locator whose text references it."""
-
-    name: str
-    mime_type: str
-    data: bytes
-    locator: int
-
-
 def _media_for_units(
     units: tuple[str, ...], images: tuple[EmbeddedImage, ...]
 ) -> tuple[MediaItem, ...]:
-    """Map image markers in unit texts back to locator-pinned bytes."""
+    """Map ``[图片 N]`` markers in unit texts to their image bytes.
+
+    A marker names the image it belongs to, so the mapping needs no position
+    bookkeeping: scan each unit, look the name up, and pin the image to that
+    locator. Repeated markers (the same figure floated into two sections) are
+    kept once per locator; unknown names are skipped silently — the text still
+    stands on its own.
+    """
     by_name = {image.name: image for image in images}
+    if not by_name:
+        return ()
     items: list[MediaItem] = []
     seen: set[tuple[int, str]] = set()
     for locator, unit in enumerate(units, start=1):
@@ -113,12 +128,14 @@ def _media_for_units(
     return tuple(items)
 
 
-def extract_material(path: str | Path) -> Extraction:
+def extract_material(path: str | Path, *, data: bytes | None = None) -> Extraction:
     """Cut *path* into units, dispatching on its extension.
 
     Raises :class:`ReadingError` when the file cannot be read at all, or when
     it yields no text — an image-only scan, for instance, which the reader
-    would otherwise present as an empty document with no explanation.
+    would otherwise present as an empty document with no explanation. For an
+    EPUB, ``data`` may contain already-normalized archive bytes so callers can
+    extract and store exactly what they read.
     """
     source = Path(path)
     if not source.is_file():
@@ -127,8 +144,18 @@ def extract_material(path: str | Path) -> Extraction:
     suffix = source.suffix.lower()
     if suffix == ".pdf":
         extraction = _extract_pdf(source)
+    elif suffix == ".epub":
+        if data is None:
+            try:
+                data = source.read_bytes()
+            except OSError as exc:
+                raise ReadingError(f"{source.name}: could not be read ({exc})") from exc
+        extraction = _extract_epub(data, source.name)
     elif suffix == ".pptx":
         extraction = _extract_slides(source)
+    elif suffix in {".md", ".markdown"}:
+        units, outline = split_markdown_by_headings(_shared_extract(source))
+        extraction = Extraction(units=units, unit="section", extractor="text", outline=outline)
     else:
         extraction = _extract_sections(source)
 
@@ -163,7 +190,11 @@ def _extract_pdf(source: Path) -> Extraction:
     except Exception as exc:
         raise ReadingError(f"{source.name}: failed to read PDF ({exc})") from exc
 
-    units, media = _pdf_media_for_units(units, source)
+    media: tuple[MediaItem, ...] = ()
+    # Every page's figures ride along as locator-pinned media so the reader can
+    # attach what the question is about. Mining them is best-effort: a quirk in
+    # one image must never turn a readable PDF into a failed ingest.
+    units, media = _pdf_pages_with_image_markers(units, source)
 
     return Extraction(
         units=units,
@@ -172,14 +203,27 @@ def _extract_pdf(source: Path) -> Extraction:
         has_raw_view=True,
         title=title,
         outline=outline,
+        render_mode="pdf",
         media=media,
     )
 
 
-def _pdf_media_for_units(
+def _pdf_pages_with_image_markers(
     units: tuple[str, ...], source: Path
 ) -> tuple[tuple[str, ...], tuple[MediaItem, ...]]:
-    """Append figure markers to page tails and return the matching media."""
+    """Append the page's ``[图片 N: name]`` markers to that page's text tail.
+
+    Markers are appended only at the very end of each unit so the character
+    offsets of the page's own prose never move — stored per-character
+    annotations resolve against quotes lifted from this text, and shifting them
+    would silently detach every highlight. The markers name the images, which
+    :func:`_media_for_units` then resolves back into locator-pinned media via
+    the same mapping DOCX/PPTX already use.
+
+    Best-effort by contract: any failure or empty result returns the units and
+    no media untouched, so an image quirk never turns a readable PDF into a
+    failed ingest.
+    """
     try:
         pdf_images = extract_pdf_images(source.read_bytes(), budget=reading_image_budget())
     except Exception:
@@ -187,6 +231,7 @@ def _pdf_media_for_units(
         return units, ()
     if not pdf_images.collection.images:
         return units, ()
+
     marker_by_page: dict[int, list[str]] = {}
     for page_number, indices in pdf_images.page_map:
         marker_by_page[page_number] = [
@@ -197,6 +242,48 @@ def _pdf_media_for_units(
         for i, unit in enumerate(units, 1)
     )
     return targeted, _media_for_units(targeted, pdf_images.collection.images)
+
+
+def _extract_epub(data: bytes, filename: str) -> Extraction:
+    """Preserve EPUB spine order so browser and assistant locators agree."""
+    from deeptutor.utils.document_extractor import DocumentExtractionError, extract_epub_spine
+
+    try:
+        units, navigation = extract_epub_spine(data, filename)
+    except (OSError, DocumentExtractionError) as exc:
+        raise ReadingError(f"{filename}: failed to read EPUB ({exc})") from exc
+
+    refs = tuple(
+        UnitReference(locator=index, source_href=unit.href, title=unit.title)
+        for index, unit in enumerate(units, start=1)
+    )
+    outline = tuple(
+        OutlineEntry(
+            locator=row.locator,
+            title=row.title,
+            level=row.level,
+            source_href=row.source_href,
+            source_anchor=row.source_anchor,
+        )
+        for row in navigation
+    )
+    if not outline:
+        outline = tuple(
+            OutlineEntry(
+                locator=ref.locator,
+                title=ref.title or Path(ref.source_href).stem,
+                synthesised=not bool(ref.title),
+            )
+            for ref in refs
+        )
+    return Extraction(
+        units=tuple(unit.text for unit in units),
+        unit="chapter",
+        extractor="epub-spine",
+        outline=outline,
+        render_mode="epub",
+        unit_refs=refs,
+    )
 
 
 def _pdf_outline(doc: object, *, page_count: int) -> tuple[OutlineEntry, ...]:
@@ -232,14 +319,44 @@ def _pdf_outline(doc: object, *, page_count: int) -> tuple[OutlineEntry, ...]:
 
 
 def _extract_slides(source: Path) -> Extraction:
-    text = _shared_extract(source)
+    text, images = _slides_text_and_images(source)
     parts = [part.strip() for part in _SLIDE_SEPARATOR.split(text)]
     units = tuple(part for part in parts if part)
     if not units:
         # The extractor found text but no slide separators (legacy .ppt via the
         # raw-OOXML fallback). Treat it as flat text rather than losing it.
         return _sections_from_text(text, extractor="pptx-text")
-    return Extraction(units=units, unit="slide", extractor="pptx")
+    return Extraction(
+        units=units,
+        unit="slide",
+        extractor="pptx",
+        media=_media_for_units(units, images),
+    )
+
+
+def _slides_text_and_images(source: Path) -> tuple[str, tuple[EmbeddedImage, ...]]:
+    """Slide text with image markers, preferring the rich extraction.
+
+    Falls back to the shared extractor (text only) when the rich path cannot
+    read the deck, so ingest never fails on a picture quirk. The reading budget
+    keeps slide pictures at source resolution, like the PDF ingest above.
+    """
+    try:
+        rich = extract_pptx_rich(source.read_bytes(), budget=reading_image_budget())
+    except Exception:
+        rich = None
+    if rich is not None and any(slide.strip() for slide in rich.slides):
+        parts = [
+            f"--- Slide {index} ---\n{slide}".rstrip()
+            for index, slide in enumerate(rich.slides, 1)
+            if slide.strip()
+        ]
+        text = "\n\n".join(parts)
+        note = rich.collection.summary_note()
+        if note:
+            text += f"\n\n{note}"
+        return text, rich.collection.images
+    return _shared_extract(source), ()
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +365,31 @@ def _extract_slides(source: Path) -> Extraction:
 
 
 def _extract_sections(source: Path) -> Extraction:
+    """Flat-text formats, cut into sections on paragraph boundaries.
+
+    DOCX goes through the rich extraction first so embedded images survive
+    with their section mapping; every other format (and a failed rich parse)
+    uses the shared text-only extractor. The reading budget keeps those images
+    at source resolution for the reader pane, like the PDF ingest above.
+    """
+    images: tuple[EmbeddedImage, ...] = ()
+    if source.suffix.lower() == ".docx":
+        try:
+            rich = extract_docx_rich(source.read_bytes(), budget=reading_image_budget())
+        except Exception:
+            rich = None
+        if rich is not None and any(paragraph.strip() for paragraph in rich.paragraphs):
+            text = "\n\n".join(rich.paragraphs)
+            note = rich.collection.summary_note()
+            if note:
+                text += f"\n\n{note}"
+            units = split_into_sections(text)
+            return Extraction(
+                units=units,
+                unit="section",
+                extractor="docx",
+                media=_media_for_units(units, rich.collection.images),
+            )
     return _sections_from_text(_shared_extract(source), extractor="text")
 
 
@@ -291,6 +433,83 @@ def split_into_sections(text: str) -> tuple[str, ...]:
                 flush()
     flush()
     return tuple(sections)
+
+
+def split_markdown_by_headings(
+    text: str,
+) -> tuple[tuple[str, ...], tuple[OutlineEntry, ...]]:
+    """Cut article markdown at headings and map every unit to its heading.
+
+    A fetched page normally starts with the synthetic title heading added by
+    the HTML extractor.  That heading alone is not meaningful article
+    structure, so fewer than two usable headings deliberately falls back to
+    :func:`split_into_sections` and returns no outline.  The store can then use
+    its existing first-line outline rather than labelling an entire article as
+    repeated continuations of the page title.
+
+    Each heading-delimited region is still passed through the regular section
+    splitter.  This preserves its hard cap for very long paragraphs, and every
+    continuation gets an outline row pointing at its own locator while keeping
+    the source heading's title and level.
+    """
+    normalised = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not normalised:
+        return (), ()
+
+    boundaries: list[tuple[int, int, str]] = []
+    # The run that opened the current fenced block ("```", "~~~~", ...). As in
+    # CommonMark, only a bare run of the same character that is at least as long
+    # closes it, so a ```` fence can show a ``` example and "```py" inside a
+    # block is content, not a closing fence.
+    fence_marker = ""
+    offset = 0
+    for line in normalised.splitlines(keepends=True):
+        fence = _MD_FENCE.match(line.rstrip("\n"))
+        if fence:
+            marker, info = fence.group("marker"), fence.group("info")
+            if not fence_marker:
+                # A backtick fence's info string cannot contain a backtick.
+                if not (marker[0] == "`" and "`" in info):
+                    fence_marker = marker
+                    offset += len(line)
+                    continue
+            elif (
+                marker[0] == fence_marker[0]
+                and len(marker) >= len(fence_marker)
+                and not info.strip()
+            ):
+                fence_marker = ""
+                offset += len(line)
+                continue
+        if not fence_marker:
+            heading = _MD_HEADING.match(line.rstrip("\n"))
+            if heading:
+                title = _clean_heading_title(heading.group("title"))
+                if title:
+                    boundaries.append((offset, len(heading.group("marks")), title))
+        offset += len(line)
+
+    if len(boundaries) < 2:
+        return split_into_sections(normalised), ()
+
+    units: list[str] = []
+    outline: list[OutlineEntry] = []
+    for index, (start, level, title) in enumerate(boundaries):
+        end = boundaries[index + 1][0] if index + 1 < len(boundaries) else len(normalised)
+        # Keep prose before the first heading instead of dropping it.  In web
+        # extraction this is uncommon (the title is normally first), but hand-
+        # authored pages sometimes place a short deck or byline above it.
+        section_start = 0 if index == 0 else start
+        for piece in split_into_sections(normalised[section_start:end]):
+            units.append(piece)
+            outline.append(OutlineEntry(locator=len(units), title=title, level=level))
+    return tuple(units), tuple(outline)
+
+
+def _clean_heading_title(title: str) -> str:
+    """Remove inline Markdown decoration from a heading used as a UI label."""
+    clean = re.sub(r"\[([^]]*)\]\([^)]*\)", r"\1", title)
+    return re.sub(r"[*`_~]", "", clean).strip()
 
 
 def _hard_split(block: str, limit: int) -> list[str]:
@@ -375,6 +594,7 @@ __all__ = [
     "Extraction",
     "extract_material",
     "first_line_label",
+    "split_markdown_by_headings",
     "split_into_sections",
     "synthesise_outline",
 ]

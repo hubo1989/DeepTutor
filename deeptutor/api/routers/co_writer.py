@@ -1,35 +1,42 @@
+from __future__ import annotations
+
 import asyncio
+from contextlib import contextmanager
 from datetime import datetime
 import json
 import logging
+from pathlib import Path
 import re
 import traceback
-from typing import AsyncGenerator, Literal
+from typing import TYPE_CHECKING, AsyncGenerator, Literal
+import urllib.parse
 import uuid
 
-from fastapi import APIRouter, HTTPException
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi.responses import Response, StreamingResponse
+from pydantic import BaseModel, ConfigDict, Field
 
-from deeptutor.co_writer.edit_agent import (
-    EditAgent,
-    append_history,
-    load_history,
-    print_stats,
-    tool_calls_dir,
+# ``docx_converter`` imports python-docx lazily, so this stays import-cheap.
+from deeptutor.co_writer.docx_converter import (
+    DocxConversionError,
+    docx_to_markdown,
+    markdown_to_docx,
 )
 from deeptutor.co_writer.storage import (
     CoWriterDocument,
     CoWriterDocumentSummary,
     get_co_writer_storage,
 )
-from deeptutor.commercial.entitlement_context import CommercialAccessDenied
-from deeptutor.commercial.storage_limits import CommercialResourceLimitDenied
-from deeptutor.core.stream_bus import StreamBus
+from deeptutor.runtime.stream_bus import StreamBus
 from deeptutor.services.config import PROJECT_ROOT, load_config_with_main
-from deeptutor.services.llm import clean_thinking_tags
-from deeptutor.services.rag.pipelines.pageindex import is_pageindex_kb
+from deeptutor.services.model_selection.runtime import (
+    activate_llm_selection,
+    reset_llm_selection,
+)
 from deeptutor.services.settings.interface_settings import get_response_language
+
+if TYPE_CHECKING:
+    from deeptutor.co_writer.edit_agent import EditAgent
 
 router = APIRouter()
 
@@ -38,16 +45,7 @@ config = load_config_with_main("main.yaml", PROJECT_ROOT)
 log_dir = config.get("paths", {}).get("user_log_dir") or config.get("logging", {}).get("log_dir")
 logger = logging.getLogger(__name__)
 
-_edit_agent: EditAgent | None = None
-
-
-def _raise_storage_denial(
-    exc: CommercialAccessDenied | CommercialResourceLimitDenied,
-) -> None:
-    detail: dict[str, object] = {"code": exc.code, "message": str(exc)}
-    if isinstance(exc, CommercialResourceLimitDenied):
-        detail.update(exc.details)
-    raise HTTPException(status_code=402, detail=detail) from exc
+_edit_agent: "EditAgent | None" = None
 
 
 def _current_language() -> str:
@@ -64,6 +62,8 @@ def get_edit_agent() -> EditAgent:
     2. Latest LLM configuration from Settings is always used
     """
     global _edit_agent
+    from deeptutor.co_writer.edit_agent import EditAgent
+
     lang = _current_language()
     if _edit_agent is None or getattr(_edit_agent, "language", None) != lang:
         _edit_agent = EditAgent(language=lang)
@@ -72,11 +72,93 @@ def get_edit_agent() -> EditAgent:
     return _edit_agent
 
 
+class LLMSelectionPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    profile_id: str
+    model_id: str
+    reasoning_effort: str | None = None
+
+
+def _validated_llm_selection(payload: LLMSelectionPayload | None) -> dict[str, str] | None:
+    """Normalize and authorize a Co-Writer model selection.
+
+    Ordinary users must receive a concrete granted model, mirroring Chat turn
+    admission instead of silently falling back to the deployment's admin LLM.
+    """
+    from deeptutor.multi_user.context import get_current_user
+    from deeptutor.multi_user.model_access import (
+        apply_allowed_llm_selection,
+        has_capability_access,
+        redacted_model_access,
+    )
+    from deeptutor.multi_user.personal_models import merge_personal_llm_profiles
+    from deeptutor.services.config import get_model_catalog_service
+    from deeptutor.services.model_selection import (
+        LLMSelection,
+        apply_llm_selection_to_catalog,
+    )
+
+    raw = payload.model_dump(exclude_none=True) if payload is not None else None
+    try:
+        selection = LLMSelection.from_payload(raw)
+        if selection is None and not get_current_user().is_admin:
+            if not has_capability_access("llm"):
+                raise PermissionError(
+                    "No LLM model is assigned to your account. Please contact an administrator."
+                )
+            assigned = next(
+                (item for item in redacted_model_access().get("llm", []) if item.get("available")),
+                None,
+            )
+            if assigned is None:
+                raise PermissionError(
+                    "No LLM model is assigned to your account. Please contact an administrator."
+                )
+            selection = LLMSelection(
+                profile_id=str(assigned["profile_id"]),
+                model_id=str(assigned["model_id"]),
+            )
+
+        if selection is None:
+            return None
+
+        authorized = apply_allowed_llm_selection(selection.to_dict())
+        catalog = merge_personal_llm_profiles(get_model_catalog_service().load())
+        apply_llm_selection_to_catalog(catalog, LLMSelection.from_payload(authorized))
+        return LLMSelection.from_payload(authorized).to_dict()
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from None
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+
+
+@contextmanager
+def _selected_edit_agent(
+    llm_selection: dict[str, str] | None,
+    *,
+    language: str,
+):
+    """Run one edit with a request-scoped LLM configuration."""
+    from deeptutor.co_writer.edit_agent import EditAgent
+
+    _, token = activate_llm_selection(llm_selection)
+    try:
+        # A selected model gets its own agent so concurrent edits cannot race
+        # through the shared singleton's mutable api_key/model attributes.
+        agent = EditAgent(language=language) if llm_selection else get_edit_agent()
+        yield agent
+    finally:
+        reset_llm_selection(token)
+
+
 # Generous ceilings — they exist to stop runaway payloads (OOM / surprise
 # LLM bills), not to constrain normal documents.
 _MAX_DOC_CHARS = 600_000
 _MAX_SELECTION_CHARS = 120_000
 _MAX_INSTRUCTION_CHARS = 10_000
+_MAX_DOCX_UPLOAD_BYTES = 20 * 1024 * 1024
+_DOCX_UPLOAD_CHUNK = 1024 * 1024
 
 
 class EditRequest(BaseModel):
@@ -85,6 +167,7 @@ class EditRequest(BaseModel):
     action: Literal["rewrite", "shorten", "expand"] = "rewrite"
     source: Literal["rag", "web"] | None = None
     kb_name: str | None = None
+    llm_selection: LLMSelectionPayload | None = None
 
 
 class EditResponse(BaseModel):
@@ -98,6 +181,7 @@ class ReactEditRequest(BaseModel):
     mode: Literal["rewrite", "shorten", "expand", "none"] = "rewrite"
     tools: list[Literal["rag", "web"]] = []
     kb_name: str | None = None
+    llm_selection: LLMSelectionPayload | None = None
 
 
 class ReactEditResponse(BaseModel):
@@ -108,6 +192,7 @@ class ReactEditResponse(BaseModel):
 
 class AutoMarkRequest(BaseModel):
     text: str = Field(max_length=_MAX_DOC_CHARS)
+    llm_selection: LLMSelectionPayload | None = None
 
 
 class AutoMarkResponse(BaseModel):
@@ -193,6 +278,8 @@ def _strip_markdown_fence(text: str) -> str:
 
 
 def _clean_react_edit_output(text: str, *, binding: str | None, model: str | None) -> str:
+    from deeptutor.services.llm import clean_thinking_tags
+
     return _strip_markdown_fence(clean_thinking_tags(text, binding, model))
 
 
@@ -245,170 +332,156 @@ async def _run_react_edit(
     request: ReactEditRequest,
     *,
     language: str,
+    llm_selection: dict[str, str] | None = None,
     stream: StreamBus | None = None,
 ) -> dict[str, object]:
+    from deeptutor.co_writer.edit_agent import append_history, print_stats
+
     selected_text, instruction, tools = _prepare_react_edit_request(request, language)
-    from deeptutor.commercial.concurrency import commercial_turn_lease
-
-    async with commercial_turn_lease():
-        return await _run_react_edit_reserved(
-            request,
-            language=language,
-            stream=stream,
-            selected_text=selected_text,
-            instruction=instruction,
-            tools=tools,
-        )
-
-
-async def _run_react_edit_reserved(
-    request: ReactEditRequest,
-    *,
-    language: str,
-    stream: StreamBus | None,
-    selected_text: str,
-    instruction: str,
-    tools: list[str],
-) -> dict[str, object]:
     operation_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
 
-    agent = get_edit_agent()
+    with _selected_edit_agent(llm_selection, language=language) as agent:
+        # Optional reference retrieval before the edit. Each tool degrades to a
+        # plain edit on failure — retrieval must never block the user's edit.
+        query = instruction or selected_text[:400]
+        context_blocks: list[str] = []
+        tools_used: list[str] = []
+        from deeptutor.services.rag.pipelines.pageindex import is_pageindex_kb
 
-    # Optional reference retrieval before the edit. Each tool degrades to a
-    # plain edit on failure — retrieval must never block the user's edit.
-    query = instruction or selected_text[:400]
-    context_blocks: list[str] = []
-    tools_used: list[str] = []
-    pageindex_source = "rag" in tools and is_pageindex_kb(request.kb_name)
-    for tool in tools:
-        kb_name = request.kb_name if tool == "rag" else None
-        if tool == "rag" and not kb_name:
-            continue
-        if tool == "rag" and pageindex_source:
-            # The edit loop below receives PageIndex tools directly.
-            continue
-        if stream is not None:
-            await stream.tool_call(
-                tool,
-                {"query": query, **({"kb_name": kb_name} if kb_name else {})},
-                source="co_writer_react_edit",
-                stage="exploring",
-            )
-        context, _file = await agent.gather_context(
-            source=tool,
-            query=query,
-            kb_name=kb_name,
-            operation_id=operation_id,
-        )
-        if stream is not None:
-            await stream.tool_result(
-                tool,
-                _trace_preview(context) if context else "(no result)",
-                source="co_writer_react_edit",
-                stage="exploring",
-            )
-        if context:
-            context_blocks.append(context)
-            tools_used.append(tool)
-
-    system_prompt = (
-        "You are an expert markdown editor."
-        if not language.startswith("zh")
-        else "你是一个严格的 Markdown 编辑助手。"
-    )
-    prompt = _build_react_edit_prompt(
-        selected_text=selected_text,
-        instruction=instruction,
-        mode=request.mode,
-        language=language,
-        context="\n\n".join(context_blocks),
-    )
-
-    response_chunks: list[str] = []
-    pageindex_sources: list[dict[str, object]] = []
-
-    async def _consume() -> None:
-        if pageindex_source and request.kb_name:
-            from deeptutor.services.rag.pipelines.pageindex.reasoning import (
-                read_pageindex_with_agent,
-            )
-
-            reading = await read_pageindex_with_agent(
-                kb_name=request.kb_name,
-                system_prompt=system_prompt,
-                user_prompt=prompt,
-                stream=stream,
-                source="co_writer_react_edit",
-                stage="responding",
-            )
-            if reading.text:
-                response_chunks.append(reading.text)
-                pageindex_sources.extend(reading.sources)
-                tools_used.append("rag")
-                if stream is not None:
-                    await stream.content(
-                        reading.text,
-                        source="co_writer_react_edit",
-                        stage="responding",
-                    )
-            return
-        async for chunk in agent.stream_llm(
-            user_prompt=prompt,
-            system_prompt=system_prompt,
-            stage=f"react_edit_{request.mode}",
-        ):
-            if not chunk:
+        pageindex_source = "rag" in tools and is_pageindex_kb(request.kb_name)
+        for tool in tools:
+            kb_name = request.kb_name if tool == "rag" else None
+            if tool == "rag" and not kb_name:
                 continue
-            response_chunks.append(chunk)
+            if tool == "rag" and pageindex_source:
+                # The edit loop below receives PageIndex tools directly.
+                continue
             if stream is not None:
-                await stream.content(
-                    chunk,
+                await stream.tool_call(
+                    tool,
+                    {"query": query, **({"kb_name": kb_name} if kb_name else {})},
+                    source="co_writer_react_edit",
+                    stage="exploring",
+                )
+            context, _file = await agent.gather_context(
+                source=tool,
+                query=query,
+                kb_name=kb_name,
+                operation_id=operation_id,
+            )
+            if stream is not None:
+                await stream.tool_result(
+                    tool,
+                    _trace_preview(context) if context else "(no result)",
+                    source="co_writer_react_edit",
+                    stage="exploring",
+                )
+            if context:
+                context_blocks.append(context)
+                tools_used.append(tool)
+
+        system_prompt = (
+            "You are an expert markdown editor."
+            if not language.startswith("zh")
+            else "你是一个严格的 Markdown 编辑助手。"
+        )
+        prompt = _build_react_edit_prompt(
+            selected_text=selected_text,
+            instruction=instruction,
+            mode=request.mode,
+            language=language,
+            context="\n\n".join(context_blocks),
+        )
+
+        response_chunks: list[str] = []
+        pageindex_sources: list[dict[str, object]] = []
+
+        async def _consume() -> None:
+            if pageindex_source and request.kb_name:
+                from deeptutor.services.rag.pipelines.pageindex.reasoning import (
+                    read_pageindex_with_agent,
+                )
+
+                reading = await read_pageindex_with_agent(
+                    kb_name=request.kb_name,
+                    system_prompt=system_prompt,
+                    user_prompt=prompt,
+                    stream=stream,
                     source="co_writer_react_edit",
                     stage="responding",
                 )
+                if reading.text:
+                    response_chunks.append(reading.text)
+                    pageindex_sources.extend(reading.sources)
+                    tools_used.append("rag")
+                    if stream is not None:
+                        await stream.content(
+                            reading.text,
+                            source="co_writer_react_edit",
+                            stage="responding",
+                        )
+                return
+            async for chunk in agent.stream_llm(
+                user_prompt=prompt,
+                system_prompt=system_prompt,
+                stage=f"react_edit_{request.mode}",
+            ):
+                if not chunk:
+                    continue
+                response_chunks.append(chunk)
+                if stream is not None:
+                    await stream.content(
+                        chunk,
+                        source="co_writer_react_edit",
+                        stage="responding",
+                    )
 
-    if stream is not None:
-        async with stream.stage("responding", source="co_writer_react_edit"):
+        if stream is not None:
+            async with stream.stage("responding", source="co_writer_react_edit"):
+                await _consume()
+        else:
             await _consume()
-    else:
-        await _consume()
 
-    edited_text = _clean_react_edit_output(
-        "".join(response_chunks),
-        binding=agent.binding,
-        model=agent.get_model(),
-    )
+        edited_text = _clean_react_edit_output(
+            "".join(response_chunks),
+            binding=agent.binding,
+            model=agent.get_model(),
+        )
 
-    append_history(
-        {
-            "id": operation_id,
-            "timestamp": datetime.now().isoformat(),
-            "action": "react_edit",
-            "mode": request.mode,
-            "tools": tools_used,
-            "kb_name": request.kb_name,
-            "input": {
-                "selected_text": request.selected_text,
-                "instruction": instruction,
-            },
-            "output": {"edited_text": edited_text},
-            "sources": pageindex_sources,
-            "model": agent.get_model(),
+        append_history(
+            {
+                "id": operation_id,
+                "timestamp": datetime.now().isoformat(),
+                "action": "react_edit",
+                "mode": request.mode,
+                "tools": tools_used,
+                "kb_name": request.kb_name,
+                "input": {
+                    "selected_text": request.selected_text,
+                    "instruction": instruction,
+                },
+                "output": {"edited_text": edited_text},
+                "sources": pageindex_sources,
+                "model": agent.get_model(),
+            }
+        )
+        print_stats()
+
+        result = {
+            "edited_text": edited_text,
+            "operation_id": operation_id,
+            "tools_used": tools_used,
         }
-    )
-    print_stats()
-
-    result = {
-        "edited_text": edited_text,
-        "operation_id": operation_id,
-        "tools_used": tools_used,
-    }
-    if stream is not None:
-        await stream.result(result, source="co_writer_react_edit")
-    return result
+        if stream is not None:
+            await stream.result(result, source="co_writer_react_edit")
+        return result
 
 
-async def _stream_react_edit(request: ReactEditRequest) -> AsyncGenerator[str, None]:
+async def _stream_react_edit(
+    request: ReactEditRequest,
+    *,
+    llm_selection: dict[str, str] | None,
+) -> AsyncGenerator[str, None]:
     language = _current_language()
     bus = StreamBus()
     error_holder: dict[str, str] = {}
@@ -417,7 +490,12 @@ async def _stream_react_edit(request: ReactEditRequest) -> AsyncGenerator[str, N
     async def _run() -> None:
         nonlocal result_holder
         try:
-            result_holder = await _run_react_edit(request, language=language, stream=bus)
+            result_holder = await _run_react_edit(
+                request,
+                language=language,
+                llm_selection=llm_selection,
+                stream=bus,
+            )
         except HTTPException as exc:
             error_holder["detail"] = str(exc.detail)
         except Exception as exc:
@@ -438,21 +516,18 @@ async def _stream_react_edit(request: ReactEditRequest) -> AsyncGenerator[str, N
     finally:
         if not task.done():
             task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
 
 
-@router.post("/edit", response_model=EditResponse)
+@router.post("/documents/actions/edit", response_model=EditResponse)
 async def edit_text(request: EditRequest):
+    from deeptutor.co_writer.edit_agent import print_stats
+
     try:
-        from deeptutor.commercial.concurrency import commercial_turn_lease
-
-        async with commercial_turn_lease():
-            # Get agent with refreshed LLM configuration from Settings
-            agent = get_edit_agent()
-
+        # Get agent with refreshed LLM configuration from Settings
+        with _selected_edit_agent(
+            _validated_llm_selection(request.llm_selection),
+            language=_current_language(),
+        ) as agent:
             result = await agent.process(
                 text=request.text,
                 instruction=request.instruction,
@@ -461,70 +536,76 @@ async def edit_text(request: EditRequest):
                 kb_name=request.kb_name,
             )
 
-            # Print token stats
-            print_stats()
+        # Print token stats
+        print_stats()
 
-            return result
+        return result
 
-    except Exception as e:
-        if isinstance(e, (CommercialAccessDenied, CommercialResourceLimitDenied)):
-            _raise_storage_denial(e)
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.post("/edit_react", response_model=ReactEditResponse)
-async def edit_text_react(request: ReactEditRequest):
-    try:
-        return await _run_react_edit(request, language=_current_language())
     except HTTPException:
         raise
     except Exception as e:
-        if isinstance(e, (CommercialAccessDenied, CommercialResourceLimitDenied)):
-            _raise_storage_denial(e)
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/edit_react/stream")
+@router.post("/documents/actions/edit-react", response_model=ReactEditResponse)
+async def edit_text_react(request: ReactEditRequest):
+    try:
+        return await _run_react_edit(
+            request,
+            language=_current_language(),
+            llm_selection=_validated_llm_selection(request.llm_selection),
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/documents/actions/edit-react/stream")
 async def edit_text_react_stream(request: ReactEditRequest):
     try:
+        llm_selection = _validated_llm_selection(request.llm_selection)
         _prepare_react_edit_request(request, _current_language())
     except HTTPException:
         raise
     return StreamingResponse(
-        _stream_react_edit(request),
+        _stream_react_edit(request, llm_selection=llm_selection),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 
-@router.post("/automark", response_model=AutoMarkResponse)
+@router.post("/documents/actions/automark", response_model=AutoMarkResponse)
 async def auto_mark_text(request: AutoMarkRequest):
     """AI auto-mark text"""
+    from deeptutor.co_writer.edit_agent import print_stats
+
     try:
-        from deeptutor.commercial.concurrency import commercial_turn_lease
-
-        async with commercial_turn_lease():
-            # Get agent with refreshed LLM configuration from Settings
-            agent = get_edit_agent()
-
+        # Get agent with refreshed LLM configuration from Settings
+        with _selected_edit_agent(
+            _validated_llm_selection(request.llm_selection),
+            language=_current_language(),
+        ) as agent:
             result = await agent.auto_mark(text=request.text)
 
-            # Print token stats
-            print_stats()
+        # Print token stats
+        print_stats()
 
-            return result
+        return result
+    except HTTPException:
+        raise
     except Exception as e:
-        if isinstance(e, (CommercialAccessDenied, CommercialResourceLimitDenied)):
-            _raise_storage_denial(e)
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/history")
+@router.get("/documents/history")
 async def get_history():
     """Get all operation history"""
+    from deeptutor.co_writer.edit_agent import load_history
+
     try:
         history = load_history()
         return {"history": history, "total": len(history)}
@@ -532,9 +613,11 @@ async def get_history():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/history/{operation_id}")
+@router.get("/documents/history/{operation_id}")
 async def get_operation(operation_id: str):
     """Get single operation details"""
+    from deeptutor.co_writer.edit_agent import load_history
+
     try:
         history = load_history()
         for op in history:
@@ -547,9 +630,11 @@ async def get_operation(operation_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/tool_calls/{operation_id}")
+@router.get("/documents/tool-calls/{operation_id}")
 async def get_tool_call(operation_id: str):
     """Get tool call details"""
+    from deeptutor.co_writer.edit_agent import tool_calls_dir
+
     try:
         # Find matching file
         for filepath in tool_calls_dir().glob(f"{operation_id}_*.json"):
@@ -643,10 +728,103 @@ async def create_document(request: CreateDocumentRequest) -> DocumentResponse:
         document = storage.create_document(title=request.title, content=request.content)
         return DocumentResponse.from_model(document)
     except Exception as e:
-        if isinstance(e, (CommercialAccessDenied, CommercialResourceLimitDenied)):
-            _raise_storage_denial(e)
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+
+class ExportDocxRequest(BaseModel):
+    title: str = ""
+    content: str = Field(default="", max_length=_MAX_DOC_CHARS)
+
+
+def _docx_download_filename(title: str) -> str:
+    raw = (title or "co-writer").strip() or "co-writer"
+    safe = re.sub(r'[\\/:*?"<>|\x00-\x1f\x7f]', "-", raw).strip(" .")[:80]
+    safe = safe or "co-writer"
+    if not safe.lower().endswith(".docx"):
+        safe = f"{safe}.docx"
+    return safe
+
+
+def _content_disposition(filename: str) -> str:
+    """Build a header that survives non-ASCII titles (RFC 6266 / RFC 5987).
+
+    Header values are latin-1 encoded on the wire, so a CJK or accented title
+    must go in the ``filename*`` parameter with an ASCII ``filename`` fallback.
+    """
+    ascii_name = filename.encode("ascii", "ignore").decode("ascii").strip(" .")
+    if not ascii_name.lower().endswith(".docx"):
+        ascii_name = f"{ascii_name}.docx" if ascii_name else "co-writer.docx"
+    quoted = urllib.parse.quote(filename, safe="")
+    return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quoted}"
+
+
+@router.post("/documents/import/docx", response_model=DocumentResponse)
+async def import_docx(file: UploadFile = File(...)) -> DocumentResponse:
+    filename = (file.filename or "").strip()
+    if not filename:
+        raise HTTPException(status_code=400, detail="The upload has no filename.")
+    ext = Path(filename).suffix.lower()
+    if ext == ".doc":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Legacy .doc files are not supported yet. "
+                "Please save the document as .docx and try again."
+            ),
+        )
+    if ext != ".docx":
+        raise HTTPException(status_code=400, detail="Only .docx files can be imported.")
+
+    chunks: list[bytes] = []
+    written = 0
+    while chunk := await file.read(_DOCX_UPLOAD_CHUNK):
+        written += len(chunk)
+        if written > _MAX_DOCX_UPLOAD_BYTES:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"{filename} exceeds the {_MAX_DOCX_UPLOAD_BYTES // (1024 * 1024)} MB limit."
+                ),
+            )
+        chunks.append(chunk)
+    if written == 0:
+        raise HTTPException(status_code=400, detail=f"{filename} is empty.")
+
+    data = b"".join(chunks)
+    try:
+        markdown = await asyncio.to_thread(docx_to_markdown, data, filename)
+    except DocxConversionError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    title = Path(filename).stem.strip()[:120] or None
+    try:
+        storage = get_co_writer_storage()
+        document = storage.create_document(title=title, content=markdown)
+        return DocumentResponse.from_model(document)
+    except Exception as exc:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/documents/export/docx")
+async def export_docx(request: ExportDocxRequest) -> Response:
+    try:
+        data = await asyncio.to_thread(markdown_to_docx, request.content, request.title)
+    except DocxConversionError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    filename = _docx_download_filename(request.title)
+    return Response(
+        content=data,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": _content_disposition(filename)},
+    )
 
 
 @router.get("/documents/{doc_id}", response_model=DocumentResponse)
@@ -661,8 +839,6 @@ async def get_document(doc_id: str) -> DocumentResponse:
     except HTTPException:
         raise
     except Exception as e:
-        if isinstance(e, (CommercialAccessDenied, CommercialResourceLimitDenied)):
-            _raise_storage_denial(e)
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -681,8 +857,6 @@ async def update_document(doc_id: str, request: UpdateDocumentRequest) -> Docume
     except HTTPException:
         raise
     except Exception as e:
-        if isinstance(e, (CommercialAccessDenied, CommercialResourceLimitDenied)):
-            _raise_storage_denial(e)
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 

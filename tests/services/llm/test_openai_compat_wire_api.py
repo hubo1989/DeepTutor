@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from deeptutor.core.agentic import client as agentic_client
+from deeptutor.runtime.agentic import client as agentic_client
 from deeptutor.services.config.provider_runtime import resolve_llm_runtime_config
 from deeptutor.services.llm import provider_factory
 from deeptutor.services.llm.config import LLMConfig
@@ -11,12 +11,6 @@ from deeptutor.services.llm.provider_core.openai_compat_provider import (
     OpenAICompatProvider,
 )
 from deeptutor.services.provider_registry import find_by_name
-
-
-def _unwrap_accounting(client: object) -> object:
-    """Reveal the routed client beneath the learnleader accounting wrapper."""
-    inner = getattr(client, "_client", None)
-    return inner if inner is not None else client
 
 
 def _catalog(*, wire_api: str = "responses", binding: str = "custom") -> dict:
@@ -106,7 +100,7 @@ def test_agentic_client_routes_forced_responses_through_adapter(monkeypatch) -> 
 def test_agentic_client_does_not_force_responses_for_azure(monkeypatch) -> None:
     class FakeAzureClient:
         def __init__(self, **_kwargs):
-            self.chat = SimpleNamespace(completions=SimpleNamespace())
+            pass
 
     class UnexpectedCompatProvider:
         def __init__(self, **_kwargs):
@@ -130,9 +124,7 @@ def test_agentic_client_does_not_force_responses_for_azure(monkeypatch) -> None:
         disable_ssl_verify=False,
     )
 
-    # LearnLeader wraps generated clients in the platform/BYOK accounting layer;
-    # this test pins the routing decision, so unwrap before asserting.
-    assert isinstance(_unwrap_accounting(client), FakeAzureClient)
+    assert isinstance(client, FakeAzureClient)
 
 
 def test_agentic_client_forced_chat_completions_beats_auto_responses(monkeypatch) -> None:
@@ -153,7 +145,7 @@ def test_agentic_client_forced_chat_completions_beats_auto_responses(monkeypatch
         disable_ssl_verify=False,
     )
 
-    assert isinstance(_unwrap_accounting(client), FakeChatCompletionsClient)
+    assert isinstance(client, FakeChatCompletionsClient)
 
 
 def test_wire_api_participates_in_both_client_cache_keys() -> None:

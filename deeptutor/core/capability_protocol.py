@@ -10,11 +10,24 @@ a deep mode (e.g. Deep Solve, Deep Question).
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Protocol
 
 from .context import UnifiedContext
-from .stream_bus import StreamBus
+from .stream import StreamEvent
+
+
+class CapabilityPrerequisiteError(ValueError):
+    """A required capability precondition failed; never bypass it by forced finish."""
+
+
+class StreamBusProtocol(Protocol):
+    """Minimal output port required by a turn capability."""
+
+    async def emit(self, event: StreamEvent) -> None: ...
+
+    def stage(self, name: str, *, source: str = "") -> AbstractAsyncContextManager[None]: ...
 
 
 @dataclass
@@ -30,7 +43,7 @@ class CapabilityManifest:
     config_defaults: dict[str, Any] = field(default_factory=dict)
 
 
-class BaseCapability(ABC):
+class TurnCapability(ABC):
     """
     Abstract base for all capabilities (deep modes).
 
@@ -38,12 +51,12 @@ class BaseCapability(ABC):
 
     Example::
 
-        class MySolverCapability(BaseCapability):
+        class MySolverCapability(TurnCapability):
             manifest = CapabilityManifest(
                 name="deep_solve",
                 description="Multi-agent problem solving.",
                 stages=["planning", "reasoning", "writing"],
-                tools_used=["rag", "web_search", "code_execution"],
+                tools_used=["rag", "web_search", "exec"],
             )
 
             async def run(self, context, stream):
@@ -55,7 +68,7 @@ class BaseCapability(ABC):
     manifest: CapabilityManifest
 
     @abstractmethod
-    async def run(self, context: UnifiedContext, stream: StreamBus) -> None:
+    async def run(self, context: UnifiedContext, stream: StreamBusProtocol) -> None:
         """Execute the full capability pipeline, emitting events to *stream*."""
         ...
 
@@ -66,3 +79,24 @@ class BaseCapability(ABC):
     @property
     def stages(self) -> list[str]:
         return self.manifest.stages
+
+
+def __getattr__(name: str):
+    if name == "BaseCapability":
+        import warnings
+
+        warnings.warn(
+            "BaseCapability is deprecated; use TurnCapability. It will be removed in v3.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return TurnCapability
+    raise AttributeError(name)
+
+
+__all__ = [
+    "CapabilityPrerequisiteError",
+    "CapabilityManifest",
+    "StreamBusProtocol",
+    "TurnCapability",
+]

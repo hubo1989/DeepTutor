@@ -1,14 +1,26 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { Loader2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
-import { loadPdfjs, type PdfDocument } from "@/lib/pdfjs-loader";
-import type { AnnotationItem, NormalisedRect } from "@/lib/reading-api";
+import { loadPdfjs, pdfjsWasmUrl, type PdfDocument } from "@/lib/pdfjs-loader";
+import type {
+  AnnotationItem,
+  NormalisedRect,
+  ReadingTextSelector,
+} from "@/lib/reading-api";
 import { rawMaterialUrl } from "@/lib/reading-api";
 import { domRangeForQuote } from "@/lib/reading-quote-locator";
 import {
   cleanQuote,
+  selectionTextWithoutLineNumbers,
   locatorOfSelection,
   normaliseRects,
 } from "@/lib/reading-selection";
@@ -22,7 +34,14 @@ const PAGE_GAP = 16;
 export interface SelectionPayload {
   locator: number;
   quote: string;
+  /**
+   * The quote as reading text, when the page put something that is not text
+   * into it (margin line numbers). Questions carry this; marks keep `quote`.
+   */
+  text?: string;
   rects: NormalisedRect[];
+  sourceAnchor?: string;
+  selectors?: ReadingTextSelector[];
   /** Viewport coordinates of the selection, for popover placement. */
   anchor: { x: number; y: number };
 }
@@ -79,6 +98,13 @@ export function PdfDocumentView({
     message: string;
   } | null>(null);
   const [pageWidth, setPageWidth] = useState(0);
+  const committedWidthRef = useRef(0);
+  const resizeAnchorRef = useRef<{
+    doc: PdfDocument;
+    locator: string;
+    fraction: number;
+    viewportOffset: number;
+  } | null>(null);
   const [visibleLocator, setVisibleLocator] = useState(1);
   // Tagged with the jump's nonce for the same reason: a stale flash cannot
   // outlive the request that produced it.
@@ -106,6 +132,9 @@ export function PdfDocumentView({
         const pdfjs = await loadPdfjs();
         const loadingTask = pdfjs.getDocument({
           url: rawMaterialUrl(materialId),
+          // PDF.js loads OpenJPEG/JBIG2/QCMS from these assets when a PDF uses
+          // JPEG2000 or other formats that are not decoded in pure JS.
+          wasmUrl: pdfjsWasmUrl(),
           // The raw route sits behind the session cookie like every other API
           // route; pdf.js does its own fetching, so it needs telling.
           withCredentials: true,
@@ -143,13 +172,61 @@ export function PdfDocumentView({
 
   // -- width ---------------------------------------------------------------
 
+  useLayoutEffect(() => {
+    committedWidthRef.current = pageWidth;
+    const anchor = resizeAnchorRef.current;
+    resizeAnchorRef.current = null;
+    const root = scrollRef.current;
+    if (!root || !anchor || anchor.doc !== doc) return;
+    const page = root.querySelector<HTMLElement>(
+      `[data-reader-unit="${anchor.locator}"]`,
+    );
+    if (!page) return;
+    const rect = page.getBoundingClientRect();
+    // Restore after the new page heights commit, before paint or the visible
+    // locator effect can report the page at the old pixel scroll position.
+    root.scrollTop = Math.max(
+      0,
+      root.scrollTop +
+        rect.top -
+        root.getBoundingClientRect().top +
+        anchor.fraction * rect.height -
+        anchor.viewportOffset,
+    );
+  }, [doc, pageWidth]);
+
   useEffect(() => {
     const element = scrollRef.current;
     if (!element) return;
     const measure = () => {
       // Leave room for the scrollbar gutter and the page's own margin.
       const available = element.clientWidth - 48;
-      setPageWidth(Math.max(240, Math.min(1100, available)));
+      const nextWidth = Math.max(240, Math.min(1100, available));
+      if (nextWidth === committedWidthRef.current) {
+        // A resize can return to the committed width before React renders.
+        // Do not leave an unused anchor to override a later user scroll.
+        resizeAnchorRef.current = null;
+      } else if (doc && !resizeAnchorRef.current) {
+        const rootRect = element.getBoundingClientRect();
+        const pages =
+          element.querySelectorAll<HTMLElement>("[data-reader-unit]");
+        for (const page of pages) {
+          const rect = page.getBoundingClientRect();
+          if (rect.height <= 0 || rect.bottom <= rootRect.top) continue;
+          if (rect.top >= rootRect.bottom) break;
+          // The first visible page anchors the viewport's top edge. Keep the
+          // point in page coordinates, plus any padding/gap above that page.
+          // Coalesced notifications retain this anchor until the width commits.
+          resizeAnchorRef.current = {
+            doc,
+            locator: page.dataset.readerUnit!,
+            fraction: Math.max(0, (rootRect.top - rect.top) / rect.height),
+            viewportOffset: Math.max(0, rect.top - rootRect.top),
+          };
+          break;
+        }
+      }
+      setPageWidth(nextWidth);
     };
     measure();
     const observer = new ResizeObserver(measure);
@@ -377,9 +454,11 @@ export function PdfDocumentView({
       return;
     }
     const last = clientRects[clientRects.length - 1];
+    const text = selectionTextWithoutLineNumbers(range);
     onSelection({
       locator,
       quote,
+      ...(text ? { text } : {}),
       rects,
       anchor: { x: last.left + last.width / 2, y: last.top },
     });
@@ -404,7 +483,12 @@ export function PdfDocumentView({
     <div
       ref={scrollRef}
       onMouseUp={handlePointerUp}
-      className="dt-reader-scroll h-full overflow-y-auto overscroll-contain bg-[var(--muted)]/40 px-6 py-4"
+      // The desk the pages lie on. This was `bg-[var(--muted)]/40`, which
+      // compiles to nothing here — a var() colour has no channels for the
+      // `/NN` modifier to reach into, so the rule was dropped and the desk
+      // rendered the same white as the paper on it. `--secondary` is the
+      // token for exactly this: one step back from the page.
+      className="dt-reader-scroll h-full overflow-y-auto overscroll-contain bg-[var(--secondary)] px-6 py-4"
     >
       {!doc ? (
         <div className="flex h-full items-center justify-center gap-2 text-[12px] text-[var(--muted-foreground)]">

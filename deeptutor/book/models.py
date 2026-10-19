@@ -30,9 +30,9 @@ class BookStatus(str, Enum):
     DRAFT = "draft"  # ideation only, no spine yet
     SPINE_READY = "spine_ready"  # spine confirmed, compilation pending
     COMPILING = "compiling"
-    # Compilation stopped itself after repeated provider-level failures (quota
-    # exhausted, credentials revoked, provider down). Everything generated so
-    # far is intact; ``resume_book`` continues from here.
+    # Compilation was stopped by the user or by the provider-failure breaker.
+    # Everything generated so far is intact; only an explicit ``resume_book``
+    # continues from here.
     PAUSED = "paused"
     READY = "ready"
     ERROR = "error"
@@ -178,6 +178,8 @@ class BookInputs(BaseModel):
 
     model_config = ConfigDict(extra="ignore")
 
+    source_refs: list[dict[str, Any]] = Field(default_factory=list)
+    source_context: str = ""
     user_intent: str = ""
     chat_session_id: str = ""  # legacy single-session shorthand
     chat_selections: list[ChatSelection] = Field(default_factory=list)
@@ -488,6 +490,7 @@ class QuizAttempt(BaseModel):
     # the reader, and folding "not graded" into "wrong" would both understate
     # their score and mark the chapter weak on nothing but a reveal.
     is_correct: bool | None = None
+    submission_id: str = ""
     timestamp: float = Field(default_factory=_now)
 
 
@@ -517,6 +520,10 @@ class Book(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     id: str = Field(default_factory=lambda: _new_id("bk"))
+    # Optimistic collaboration token. API mutations claim the next revision
+    # before touching a canonical shared book, so two editors cannot silently
+    # start from the same snapshot.
+    revision: int = 1
     title: str = ""
     description: str = ""
     status: BookStatus = BookStatus.DRAFT

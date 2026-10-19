@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import io
 import json
 from pathlib import Path
+from types import SimpleNamespace
 import zipfile
 
 import httpx as real_httpx
@@ -122,6 +124,36 @@ def test_parse_pdf_to_workdir_dispatches_cloud(
     assert workdir.name == "clouddir"
 
 
+def test_parse_document_to_workdir_dispatches_office_local(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    docx = tmp_path / "lesson.docx"
+    docx.write_bytes(b"office")
+    out = tmp_path / "out"
+    seen: list[str] = []
+
+    def fake_local(path: str, base: str, **_kwargs) -> LocalParseResult:
+        seen.append(Path(path).name)
+        (Path(base) / Path(path).stem).mkdir(parents=True, exist_ok=True)
+        return LocalParseResult.success()
+
+    monkeypatch.setattr(mineru_backend, "parse_document_with_mineru_result", fake_local)
+
+    workdir = mineru_backend.parse_document_to_workdir(docx, out, config=MinerUConfig(mode="local"))
+
+    assert seen == ["lesson.docx"]
+    assert workdir == out / "lesson"
+
+
+def test_pdf_compatibility_wrapper_rejects_non_pdf(tmp_path: Path) -> None:
+    from deeptutor.services.parsing.engines.mineru import local as local_parser
+
+    docx = tmp_path / "lesson.docx"
+    docx.write_bytes(b"office")
+
+    assert local_parser.parse_pdf_with_mineru(str(docx)) is False
+
+
 # ---------------------------------------------------------------------------
 # Cloud client internals
 # ---------------------------------------------------------------------------
@@ -188,6 +220,33 @@ def test_parse_local_rejects_bad_configured_path(
     assert "not an executable" in str(exc.value)
 
 
+def test_parse_local_explains_legacy_cli_limit_for_office(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "lesson.docx"
+    source.write_bytes(b"office")
+    monkeypatch.setattr(
+        mineru_backend,
+        "local_cli_probe",
+        lambda *_args: {
+            "found": True,
+            "command": "magic-pdf",
+            "path": "/opt/bin/magic-pdf",
+            "source": "path",
+        },
+    )
+    monkeypatch.setattr(
+        mineru_backend,
+        "parse_document_with_mineru_result",
+        lambda *_args, **_kwargs: pytest.fail("legacy CLI must not run"),
+    )
+
+    with pytest.raises(MinerUError, match="legacy magic-pdf"):
+        mineru_backend.parse_document_to_workdir(
+            source, tmp_path / "out", config=MinerUConfig(mode="local")
+        )
+
+
 def test_local_cli_version_rejects_unknown_command() -> None:
     # Whitelist guard: bare names outside the whitelist (and non-executable
     # paths) never reach subprocess.
@@ -201,19 +260,16 @@ def test_pdf_parser_streams_output_lines(tmp_path: Path, monkeypatch: pytest.Mon
     pdf.write_bytes(b"%PDF-1.4")
     out = tmp_path / "out"
 
-    class FakeProcess:
-        def __init__(self, cmd, **kwargs):  # noqa: ANN002, ANN003
-            # Simulate the CLI writing its artifacts under the -o directory.
-            target = Path(cmd[cmd.index("-o") + 1]) / "exam"
-            (target / "auto").mkdir(parents=True, exist_ok=True)
-            (target / "auto" / "exam.md").write_text("# parsed", encoding="utf-8")
-            self.stdout = iter(["downloading model...\n", "\n", "parsing page 1/3\n"])
-
-        def wait(self):
-            return 0
+    @contextmanager
+    def fake_cli_process(cmd, log_path, env):
+        target = Path(cmd[cmd.index("-o") + 1]) / "exam"
+        (target / "auto").mkdir(parents=True, exist_ok=True)
+        (target / "auto" / "exam.md").write_text("# parsed", encoding="utf-8")
+        log_path.write_text("downloading model...\n\nparsing page 1/3\n", encoding="utf-8")
+        yield SimpleNamespace(poll=lambda: 0)
 
     monkeypatch.setattr(pdf_parser, "check_mineru_installed", lambda: "mineru")
-    monkeypatch.setattr(pdf_parser.subprocess, "Popen", FakeProcess)
+    monkeypatch.setattr(pdf_parser, "cli_process", fake_cli_process)
 
     seen: list[str] = []
     ok = pdf_parser.parse_pdf_with_mineru(str(pdf), str(out), on_output=seen.append)
@@ -222,6 +278,50 @@ def test_pdf_parser_streams_output_lines(tmp_path: Path, monkeypatch: pytest.Mon
     # Throttled, but the first line always gets through; blanks are dropped.
     assert seen and seen[0] == "downloading model..."
     assert (out / "exam" / "auto" / "exam.md").exists()
+
+
+def test_document_parser_passes_docx_to_current_mineru_cli(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from deeptutor.services.parsing.engines.mineru import local as local_parser
+
+    source = tmp_path / "lesson.docx"
+    source.write_bytes(b"office")
+    out = tmp_path / "out"
+    captured: dict[str, list[str]] = {}
+
+    @contextmanager
+    def fake_cli_process(cmd, log_path, env):
+        captured["cmd"] = cmd
+        target = Path(cmd[cmd.index("-o") + 1]) / "lesson"
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "lesson.md").write_text("# parsed", encoding="utf-8")
+        log_path.write_text("", encoding="utf-8")
+        yield SimpleNamespace(poll=lambda: 0)
+
+    monkeypatch.setattr(local_parser, "cli_process", fake_cli_process)
+
+    assert local_parser.parse_document_with_mineru(str(source), str(out), cli_command="mineru")
+    assert captured["cmd"][:3] == ["mineru", "-p", str(source.resolve())]
+    assert (out / "lesson" / "lesson.md").exists()
+
+
+def test_document_parser_rejects_legacy_magic_pdf_for_office(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from deeptutor.services.parsing.engines.mineru import local as local_parser
+
+    source = tmp_path / "lesson.docx"
+    source.write_bytes(b"office")
+    monkeypatch.setattr(
+        local_parser.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: pytest.fail("legacy CLI must not be invoked"),
+    )
+
+    assert not local_parser.parse_document_with_mineru(
+        str(source), str(tmp_path / "out"), cli_command="magic-pdf"
+    )
 
 
 def test_parse_cloud_reports_progress(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -397,6 +497,49 @@ def test_parse_cloud_happy_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     assert (workdir / "full.md").exists()
     assert (workdir / "exam_content_list.json").exists()
     assert (workdir / "images" / "fig.png").exists()
+
+
+def test_parse_cloud_preserves_office_filename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "lesson.docx"
+    source.write_bytes(b"office")
+    submitted: dict[str, object] = {}
+
+    def submit(_path, body):  # noqa: ANN001
+        submitted.update(body)
+        return _Resp({"code": 0, "data": {"batch_id": "B", "file_urls": ["https://up"]}})
+
+    _install_fake_httpx(
+        monkeypatch,
+        submit=submit,
+        poll=lambda _path: _Resp(
+            {
+                "code": 0,
+                "data": {
+                    "extract_result": [
+                        {
+                            "file_name": "lesson.docx",
+                            "state": "done",
+                            "full_zip_url": "https://zip",
+                        }
+                    ]
+                },
+            }
+        ),
+        download=lambda _url: _Resp(content=_zip_bytes(), status=200),
+    )
+
+    workdir = mineru_cloud.parse_cloud(
+        source,
+        tmp_path / "out",
+        MinerUConfig(mode="cloud", api_token="tok"),
+        poll_interval=0,
+        timeout=10,
+    )
+
+    assert submitted["files"][0]["name"] == "lesson.docx"
+    assert workdir.name == "lesson"
 
 
 def test_parse_cloud_retries_429_with_next_token(

@@ -13,8 +13,21 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 import threading
+from types import SimpleNamespace
 
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def isolated_caption_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Provider stubs must not read or write a persistent workspace cache."""
+    from deeptutor.services.llm import image_caption_cache
+
+    monkeypatch.setattr(
+        image_caption_cache,
+        "get_path_service",
+        lambda: SimpleNamespace(get_parse_cache_root=lambda: tmp_path / "parse_cache"),
+    )
 
 
 def _install_stub_parse_service(monkeypatch, results: dict[str, "object"]) -> None:
@@ -33,6 +46,27 @@ def _install_stub_parse_service(monkeypatch, results: dict[str, "object"]) -> No
             return outcome
 
     monkeypatch.setattr(parsing, "get_parse_service", lambda: _StubService())
+
+
+def _install_sequential_parse_service(
+    monkeypatch: pytest.MonkeyPatch,
+    outcomes: list["object"],
+) -> list[tuple[str, str | None]]:
+    """Record ``(file_name, engine)`` calls and return one outcome per call."""
+    import deeptutor.services.parsing as parsing
+
+    calls: list[tuple[str, str | None]] = []
+
+    class _SequentialStubService:
+        def parse(self, source_path, engine=None, **_kwargs):  # noqa: ANN001
+            calls.append((Path(source_path).name, engine))
+            outcome = outcomes[len(calls) - 1]
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+    monkeypatch.setattr(parsing, "get_parse_service", lambda: _SequentialStubService())
+    return calls
 
 
 def test_loader_routes_parser_files_through_active_parse_engine(
@@ -69,114 +103,76 @@ def test_loader_routes_parser_files_through_active_parse_engine(
     assert "Block two" in by_name["paper.pdf"]
 
 
-def test_loader_splits_structured_blocks_by_page_for_citations(
+def test_loader_routes_images_through_active_parser_when_supported(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     pytest.importorskip("llama_index.core")
+    import deeptutor.services.parsing as parsing
     from deeptutor.services.parsing.types import ParsedDocument
     from deeptutor.services.rag.pipelines.llamaindex.document_loader import (
         LlamaIndexDocumentLoader,
     )
 
-    pdf_path = tmp_path / "workbook.pdf"
-    pdf_path.write_bytes(b"stub")
-    _install_stub_parse_service(
-        monkeypatch,
-        {
-            "workbook.pdf": ParsedDocument(
-                markdown="Complete document markdown",
-                blocks=[
-                    {"type": "text", "text": "Question on page one", "page_idx": 0},
-                    {"type": "header", "text": "Repeated header", "page_idx": 1},
-                    {
-                        "type": "equation",
-                        "text": "$$\\frac{1}{2}+\\frac{1}{3}$$",
-                        "page_idx": 1,
-                    },
-                    {
-                        "type": "table",
-                        "table_caption": ["Answer key"],
-                        "table_body": "<table><tr><td>Answer</td><td>12</td></tr></table>",
-                        "table_footnote": ["Check the source scan."],
-                        "page_idx": 1,
-                    },
-                    {
-                        "type": "image",
-                        "img_path": "images/figure-1.png",
-                        "image_caption": ["Question 17 diagram"],
-                        "image_footnote": ["Not drawn to scale."],
-                        "page_idx": 1,
-                    },
-                    {
-                        "type": "table",
-                        "table_body": "",
-                        "img_path": "images/visual-table.png",
-                        "page_idx": 1,
-                    },
-                ],
-            )
-        },
-    )
+    image_path = tmp_path / "diagram.png"
+    image_path.write_bytes(b"\x89PNG\r\n")
+    calls: list[Path] = []
 
-    documents = asyncio.run(LlamaIndexDocumentLoader().load([str(pdf_path)]))
+    class _StubService:
+        def supports(self, path: Path) -> bool:
+            return path.suffix == ".png"
 
-    assert [doc.metadata["page_label"] for doc in documents] == ["1", "2"]
-    assert [doc.metadata["page"] for doc in documents] == ["1", "2"]
-    assert all(doc.metadata["file_name"] == "workbook.pdf" for doc in documents)
-    assert documents[0].text == "Question on page one"
-    assert "$$\\frac{1}{2}+\\frac{1}{3}$$" in documents[1].text
-    assert "Answer key" in documents[1].text
-    assert "<td>Answer</td><td>12</td>" in documents[1].text
-    assert "Check the source scan." in documents[1].text
-    assert "[Image on source page: figure-1.png]" in documents[1].text
-    assert "Question 17 diagram" in documents[1].text
-    assert "Not drawn to scale." in documents[1].text
-    assert "[Table image on source page: visual-table.png]" in documents[1].text
-    assert all("Repeated header" not in doc.text for doc in documents)
+        def parse(self, path: Path, **_kwargs):
+            calls.append(path)
+            return ParsedDocument(markdown="OCR and layout from MinerU", engine="mineru")
+
+    service = _StubService()
+    monkeypatch.setattr(parsing, "get_parse_service", lambda: service)
+
+    documents = asyncio.run(LlamaIndexDocumentLoader().load([str(image_path)]))
+
+    assert calls == [image_path]
+    assert len(documents) == 1
+    assert documents[0].text == "OCR and layout from MinerU"
 
 
-def test_loader_keeps_page_image_paths_in_text_document_metadata(
+def test_loader_keeps_event_loop_responsive_while_parser_blocks(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     pytest.importorskip("llama_index.core")
+    import deeptutor.services.parsing as parsing
     from deeptutor.services.parsing.types import ParsedDocument
-    from deeptutor.services.rag.pipelines.llamaindex import document_loader as loader_module
+    from deeptutor.services.rag.pipelines.llamaindex.document_loader import (
+        LlamaIndexDocumentLoader,
+    )
 
-    pdf_path = tmp_path / "geometry.pdf"
+    pdf_path = tmp_path / "slow.pdf"
     pdf_path.write_bytes(b"stub")
-    asset_dir = tmp_path / "assets"
-    asset_dir.mkdir()
-    figure_path = asset_dir / "figure-1.png"
-    figure_path.write_bytes(b"\x89PNG\r\n")
+    parse_started = threading.Event()
+    allow_parse_to_finish = threading.Event()
 
-    _install_stub_parse_service(
-        monkeypatch,
-        {
-            "geometry.pdf": ParsedDocument(
-                markdown="Geometry page",
-                asset_dir=asset_dir,
-                blocks=[
-                    {
-                        "type": "image",
-                        "img_path": "images/figure-1.png",
-                        "page_idx": 0,
-                    }
-                ],
-            )
-        },
-    )
+    class _BlockingService:
+        def parse(self, _source_path, **_kwargs):
+            parse_started.set()
+            assert allow_parse_to_finish.wait(timeout=2)
+            return ParsedDocument(markdown="Parsed without blocking the loop")
 
-    async def _skip_image_nodes(self, _sources, *, image_progress_callback=None):
-        return []
+    monkeypatch.setattr(parsing, "get_parse_service", lambda: _BlockingService())
 
-    monkeypatch.setattr(
-        loader_module.LlamaIndexDocumentLoader, "_load_image_nodes", _skip_image_nodes
-    )
-    documents = asyncio.run(loader_module.LlamaIndexDocumentLoader().load([str(pdf_path)]))
+    async def _exercise() -> list[object]:
+        load_task = asyncio.create_task(LlamaIndexDocumentLoader().load([str(pdf_path)]))
+        deadline = asyncio.get_running_loop().time() + 1
+        while not parse_started.is_set():
+            assert asyncio.get_running_loop().time() < deadline
+            await asyncio.sleep(0.001)
 
-    assert len(documents) == 1
-    assert documents[0].metadata["page_label"] == "1"
-    assert documents[0].metadata["image_paths"] == [str(figure_path.resolve())]
+        # Reaching this line while parse() is still waiting proves that the
+        # parser is not occupying the event-loop thread.
+        assert not load_task.done()
+        allow_parse_to_finish.set()
+        return await asyncio.wait_for(load_task, timeout=1)
+
+    documents = asyncio.run(_exercise())
+    assert [document.text for document in documents] == ["Parsed without blocking the loop"]
 
 
 def test_loader_skips_document_when_active_engine_cannot_parse(
@@ -202,6 +198,264 @@ def test_loader_skips_document_when_active_engine_cannot_parse(
     assert documents == []
     assert "Skipped unsupported.docx" in caplog.text
     assert "Settings" in caplog.text
+
+
+def test_loader_continues_after_mineru_task_failure(tmp_path, monkeypatch):
+    """#1982: a failed CLI document cannot prevent later documents from loading."""
+    pytest.importorskip("llama_index.core")
+    from deeptutor.knowledge.indexing_run import IndexingRun
+    from deeptutor.services.parsing.engines.mineru.config import MinerUError
+    from deeptutor.services.parsing.types import ParsedDocument
+    from deeptutor.services.rag.pipelines.llamaindex.document_loader import LlamaIndexDocumentLoader
+
+    failed = tmp_path / "failed.pdf"
+    good = tmp_path / "next.docx"
+    failed.write_bytes(b"fixture")
+    good.write_bytes(b"fixture")
+    _install_stub_parse_service(
+        monkeypatch,
+        {
+            failed.name: MinerUError(
+                "1 task(s) failed while processing documents: Timed out waiting for result"
+            ),
+            good.name: ParsedDocument(markdown="The next document is still usable."),
+        },
+    )
+    with IndexingRun(tmp_path, [str(failed), str(good)]) as run:
+        documents = asyncio.run(LlamaIndexDocumentLoader().load([str(failed), str(good)]))
+        assert [doc.metadata["file_name"] for doc in documents] == [good.name]
+        assert run.data["documents"][run.source_key(failed)]["status"] == "failed"
+        assert run.data["documents"][run.source_key(good)]["status"] == "embedding"
+
+
+@pytest.mark.parametrize("encrypted", [False, True])
+def test_unusable_pdf_evidence_does_not_abort_other_documents(tmp_path, monkeypatch, encrypted):
+    """A parser success is not a guarantee that the PDF can supply page evidence."""
+    import pymupdf
+
+    from deeptutor.knowledge.indexing_run import IndexingRun
+    from deeptutor.services.parsing.types import ParsedDocument
+    from deeptutor.services.rag.pipelines.llamaindex.document_loader import LlamaIndexDocumentLoader
+
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    bad = raw / "bad.pdf"
+    if encrypted:
+        with pymupdf.open() as pdf:
+            pdf.new_page().insert_text((72, 72), "Private source")
+            pdf.save(
+                bad, encryption=pymupdf.PDF_ENCRYPT_AES_256, owner_pw="owner", user_pw="reader"
+            )
+    else:
+        bad.write_bytes(b"%PDF-1.7\ntruncated")
+    good = raw / "good.docx"
+    good.write_bytes(b"parser fixture")
+    _install_stub_parse_service(
+        monkeypatch,
+        {
+            bad.name: ParsedDocument(markdown="Parser supplied text", engine="mineru"),
+            good.name: ParsedDocument(markdown="Usable next document"),
+        },
+    )
+    with IndexingRun(tmp_path, [str(bad), str(good)]) as run:
+        documents = asyncio.run(
+            LlamaIndexDocumentLoader().load([str(bad), str(good)], kb_dir=tmp_path)
+        )
+        assert [doc.metadata["file_name"] for doc in documents] == [good.name]
+        failure = run.data["documents"][run.source_key(bad)]
+        assert failure["status"] == "failed"
+        assert failure["reason"] == "invalid_source"
+        assert failure["detail"]
+        assert run.data["documents"][run.source_key(good)]["status"] == "embedding"
+
+
+def test_loader_explains_scanned_pdf_when_parser_yields_images_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    pytest.importorskip("llama_index.core")
+    from deeptutor.services.parsing.types import ParsedDocument
+    from deeptutor.services.rag.pipelines.llamaindex import document_loader as loader_module
+    from deeptutor.services.rag.pipelines.llamaindex.document_loader import (
+        LlamaIndexDocumentLoader,
+    )
+
+    pdf_path = tmp_path / "scan.pdf"
+    pdf_path.write_bytes(b"stub")
+    asset_dir = tmp_path / "assets"
+    asset_dir.mkdir()
+    (asset_dir / "page-1.png").write_bytes(b"\x89PNG\r\n")
+
+    _install_stub_parse_service(
+        monkeypatch,
+        {
+            "scan.pdf": ParsedDocument(
+                markdown="",
+                engine="pymupdf4llm",
+                asset_dir=asset_dir,
+            )
+        },
+    )
+
+    class _TextOnlyClient:
+        config = type("Config", (), {"binding": "openai", "model": "text-embedding"})()
+
+        def supports_multimodal_contents(self) -> bool:
+            return False
+
+    monkeypatch.setattr(loader_module, "get_embedding_client", lambda: _TextOnlyClient())
+
+    with caplog.at_level("WARNING"):
+        documents = asyncio.run(LlamaIndexDocumentLoader().load([str(pdf_path)]))
+
+    assert documents == []
+    assert "pymupdf4llm engine extracted 1 image(s) but no text" in caplog.text
+    assert "scanned PDF" in caplog.text
+    assert "OCR-capable" in caplog.text
+    assert "Settings, Document Parsing" in caplog.text
+
+
+def _text_only_embedding_client():
+    class _TextOnlyClient:
+        config = type("Config", (), {"binding": "openai", "model": "text-embedding"})()
+
+        def supports_multimodal_contents(self) -> bool:
+            return False
+
+    return _TextOnlyClient()
+
+
+def test_loader_falls_back_to_installed_liteparse_for_scanned_pdf(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("llama_index.core")
+    from deeptutor.services.parsing.types import ParsedDocument
+    from deeptutor.services.rag.pipelines.llamaindex import document_loader as loader_module
+    from deeptutor.services.rag.pipelines.llamaindex.document_loader import (
+        LlamaIndexDocumentLoader,
+    )
+
+    pdf_path = tmp_path / "scan.pdf"
+    pdf_path.write_bytes(b"stub")
+    asset_dir = tmp_path / "assets"
+    asset_dir.mkdir()
+    (asset_dir / "page-1.png").write_bytes(b"\x89PNG\r\n")
+
+    calls = _install_sequential_parse_service(
+        monkeypatch,
+        [
+            ParsedDocument(markdown="", engine="pymupdf4llm", asset_dir=asset_dir),
+            ParsedDocument(markdown="Recovered scanned text", engine="liteparse"),
+        ],
+    )
+    monkeypatch.setattr(
+        loader_module,
+        "get_embedding_client",
+        lambda: _text_only_embedding_client(),
+    )
+
+    documents = asyncio.run(LlamaIndexDocumentLoader().load([str(pdf_path)]))
+
+    assert calls == [("scan.pdf", None), ("scan.pdf", "liteparse")]
+    assert [document.text for document in documents] == ["Recovered scanned text"]
+
+
+def test_loader_reports_scanned_pdf_when_ocr_fallback_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    pytest.importorskip("llama_index.core")
+    from deeptutor.services.parsing.types import ParsedDocument, ParserError
+    from deeptutor.services.rag.pipelines.llamaindex import document_loader as loader_module
+    from deeptutor.services.rag.pipelines.llamaindex.document_loader import (
+        LlamaIndexDocumentLoader,
+    )
+
+    pdf_path = tmp_path / "scan.pdf"
+    pdf_path.write_bytes(b"stub")
+    asset_dir = tmp_path / "assets"
+    asset_dir.mkdir()
+    (asset_dir / "page-1.png").write_bytes(b"\x89PNG\r\n")
+
+    calls = _install_sequential_parse_service(
+        monkeypatch,
+        [
+            ParsedDocument(markdown="", engine="pymupdf4llm", asset_dir=asset_dir),
+            ParserError("liteparse isn't installed"),
+        ],
+    )
+    monkeypatch.setattr(
+        loader_module,
+        "get_embedding_client",
+        lambda: _text_only_embedding_client(),
+    )
+
+    with caplog.at_level("WARNING"):
+        documents = asyncio.run(LlamaIndexDocumentLoader().load([str(pdf_path)]))
+
+    assert calls == [("scan.pdf", None), ("scan.pdf", "liteparse")]
+    assert documents == []
+    assert "Automatic OCR fallback failed for scan.pdf" in caplog.text
+    assert "Skipped scanned PDF: scan.pdf" in caplog.text
+    assert "Install LiteParse" in caplog.text
+
+
+def test_loader_does_not_fallback_when_liteparse_already_ran(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("llama_index.core")
+    from deeptutor.services.parsing.types import ParsedDocument
+    from deeptutor.services.rag.pipelines.llamaindex import document_loader as loader_module
+    from deeptutor.services.rag.pipelines.llamaindex.document_loader import (
+        LlamaIndexDocumentLoader,
+    )
+
+    pdf_path = tmp_path / "scan.pdf"
+    pdf_path.write_bytes(b"stub")
+    asset_dir = tmp_path / "assets"
+    asset_dir.mkdir()
+    (asset_dir / "page-1.png").write_bytes(b"\x89PNG\r\n")
+
+    calls = _install_sequential_parse_service(
+        monkeypatch,
+        [ParsedDocument(markdown="", engine="liteparse", asset_dir=asset_dir)],
+    )
+    monkeypatch.setattr(
+        loader_module,
+        "get_embedding_client",
+        lambda: _text_only_embedding_client(),
+    )
+
+    documents = asyncio.run(LlamaIndexDocumentLoader().load([str(pdf_path)]))
+
+    assert calls == [("scan.pdf", None)]
+    assert documents == []
+
+
+def test_loader_keeps_generic_empty_warning_for_non_pdf(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    pytest.importorskip("llama_index.core")
+    from deeptutor.services.parsing.types import ParsedDocument
+    from deeptutor.services.rag.pipelines.llamaindex.document_loader import (
+        LlamaIndexDocumentLoader,
+    )
+
+    docx_path = tmp_path / "blank.docx"
+    docx_path.write_bytes(b"stub")
+    _install_stub_parse_service(
+        monkeypatch,
+        {"blank.docx": ParsedDocument(markdown="", engine="markitdown")},
+    )
+
+    with caplog.at_level("WARNING"):
+        documents = asyncio.run(LlamaIndexDocumentLoader().load([str(docx_path)]))
+
+    assert documents == []
+    assert caplog.text.count("Skipped empty document: blank.docx") == 1
+    assert "scanned PDF" not in caplog.text
 
 
 def test_loader_indexes_images_extracted_from_parsed_document(
@@ -295,11 +549,8 @@ def test_loader_embeds_images_with_qwen38_max_vision_capability(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     pytest.importorskip("llama_index.core")
-    from types import SimpleNamespace
-
     from llama_index.core.schema import ImageNode
 
-    from deeptutor.services.llm import image_caption_cache
     from deeptutor.services.llm.client import LLMClient
     from deeptutor.services.llm.config import LLMConfig
     from deeptutor.services.rag.pipelines.llamaindex import document_loader as loader_module
@@ -327,17 +578,12 @@ def test_loader_embeds_images_with_qwen38_max_vision_capability(
         )
     )
 
-    async def _complete(**kwargs: object) -> str:
-        captured["llm_prompt"] = kwargs.get("prompt")
+    async def _complete(prompt: str, **kwargs: object) -> str:
+        captured["llm_prompt"] = prompt
         captured["llm_kwargs"] = kwargs
         return "A logo image with visible HKU text."
 
     monkeypatch.setattr(vision_client, "complete", _complete)
-    monkeypatch.setattr(
-        image_caption_cache,
-        "get_path_service",
-        lambda: SimpleNamespace(get_parse_cache_root=lambda: tmp_path / "caption-cache"),
-    )
 
     monkeypatch.setattr(loader_module, "get_embedding_client", lambda: _MultimodalClient())
     monkeypatch.setattr(loader_module, "get_image_description_client", lambda: vision_client)
@@ -352,6 +598,67 @@ def test_loader_embeds_images_with_qwen38_max_vision_capability(
     assert "A logo image with visible HKU text." in documents[0].text
     assert captured["contents"][0]["image"].startswith("data:image/png;base64,")
     assert captured["llm_kwargs"]["image_mime_type"] == "image/png"
+
+
+def test_loader_logs_and_continues_when_image_progress_callback_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    pytest.importorskip("llama_index.core")
+    from llama_index.core.schema import ImageNode
+
+    from deeptutor.services.rag.pipelines.llamaindex import document_loader as loader_module
+
+    image_paths = []
+    for name in ("photo-1.png", "photo-2.png"):
+        path = tmp_path / name
+        path.write_bytes(b"\x89PNG\r\n")
+        image_paths.append(path)
+
+    class _MultimodalEmbeddingClient:
+        config = type("Config", (), {"binding": "siliconflow", "model": "qwen3-vl"})()
+
+        def supports_multimodal_contents(self) -> bool:
+            return True
+
+        async def embed_contents(self, contents):
+            return [[0.1, 0.2, 0.3] for _ in contents]
+
+    class _VisionClient:
+        config = type("Config", (), {"binding": "openai", "model": "gpt-4o"})()
+
+        def supports_multimodal_images(self) -> bool:
+            return True
+
+        async def complete(self, prompt, **kwargs):
+            return "Stub description."
+
+    monkeypatch.setattr(loader_module, "get_embedding_client", lambda: _MultimodalEmbeddingClient())
+    monkeypatch.setattr(loader_module, "get_image_description_client", lambda: _VisionClient())
+
+    calls: list[tuple[int, int]] = []
+
+    def _flaky_callback(completed: int, total: int) -> None:
+        calls.append((completed, total))
+        if completed == 1:
+            raise RuntimeError("progress sink is down")
+
+    with caplog.at_level("WARNING"):
+        documents = asyncio.run(
+            loader_module.LlamaIndexDocumentLoader().load(
+                [str(path) for path in image_paths],
+                image_progress_callback=_flaky_callback,
+            )
+        )
+
+    # The callback stays invoked for every image even after one failure.
+    assert calls == [(1, 2), (2, 2)]
+    # A failing callback must not abort the batch: both images still load.
+    assert len(documents) == 2
+    assert all(isinstance(doc, ImageNode) for doc in documents)
+    assert "Image progress callback failed" in caplog.text
+    assert "progress sink is down" in caplog.text
 
 
 def test_loader_skips_images_when_llm_is_text_only(
@@ -413,41 +720,27 @@ def test_loader_skips_images_when_llm_client_is_unavailable(
     assert "no LLM configured" in caplog.text
 
 
-def test_loader_keeps_event_loop_responsive_while_parser_blocks(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_loader_falls_back_to_ocr_when_scanned_pdf_has_no_extracted_assets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     pytest.importorskip("llama_index.core")
-    import deeptutor.services.parsing as parsing
     from deeptutor.services.parsing.types import ParsedDocument
-    from deeptutor.services.rag.pipelines.llamaindex.document_loader import (
-        LlamaIndexDocumentLoader,
-    )
+    from deeptutor.services.rag.pipelines.llamaindex import document_loader as loader_module
+    from deeptutor.services.rag.pipelines.llamaindex.document_loader import LlamaIndexDocumentLoader
 
-    pdf_path = tmp_path / "slow.pdf"
+    pdf_path = tmp_path / "scan.pdf"
     pdf_path.write_bytes(b"stub")
-    parse_started = threading.Event()
-    allow_parse_to_finish = threading.Event()
-
-    class _BlockingService:
-        def parse(self, _source_path, **_kwargs):
-            parse_started.set()
-            assert allow_parse_to_finish.wait(timeout=2)
-            return ParsedDocument(markdown="Parsed without blocking the loop")
-
-    monkeypatch.setattr(parsing, "get_parse_service", lambda: _BlockingService())
-
-    async def _exercise() -> list[object]:
-        load_task = asyncio.create_task(LlamaIndexDocumentLoader().load([str(pdf_path)]))
-        deadline = asyncio.get_running_loop().time() + 1
-        while not parse_started.is_set():
-            assert asyncio.get_running_loop().time() < deadline
-            await asyncio.sleep(0.001)
-
-        # Reaching this line while parse() is still waiting proves that the
-        # parser is not occupying the event-loop thread.
-        assert not load_task.done()
-        allow_parse_to_finish.set()
-        return await asyncio.wait_for(load_task, timeout=1)
-
-    documents = asyncio.run(_exercise())
-    assert [document.text for document in documents] == ["Parsed without blocking the loop"]
+    calls = _install_sequential_parse_service(
+        monkeypatch,
+        [
+            ParsedDocument(markdown="", engine="pymupdf4llm"),
+            ParsedDocument(markdown="Recovered scan", engine="liteparse"),
+        ],
+    )
+    monkeypatch.setattr(
+        loader_module, "get_embedding_client", lambda: _text_only_embedding_client()
+    )
+    documents = asyncio.run(LlamaIndexDocumentLoader().load([str(pdf_path)]))
+    assert calls == [("scan.pdf", None), ("scan.pdf", "liteparse")]
+    assert [item.text for item in documents] == ["Recovered scan"]

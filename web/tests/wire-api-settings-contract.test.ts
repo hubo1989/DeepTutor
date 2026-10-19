@@ -9,7 +9,7 @@ const EDITOR = path.resolve(
 );
 const CONTEXT = path.resolve(
   process.cwd(),
-  "components/settings/SettingsContext.tsx",
+  "lib/model-catalog-types.ts",
 );
 const MAIN = path.resolve(
   process.cwd(),
@@ -22,29 +22,32 @@ const TOOLBAR = path.resolve(
 const EN = path.resolve(process.cwd(), "locales/en/app.json");
 const ZH = path.resolve(process.cwd(), "locales/zh/app.json");
 
-test("LLM profiles expose wire API selection only when provider metadata supports it", () => {
+test("LLM-shaped profiles expose API formats supplied by provider metadata", () => {
   const editor = readFileSync(EDITOR, "utf8");
   const context = readFileSync(CONTEXT, "utf8");
 
-  assert.match(context, /supports_wire_api_selection\?: boolean/);
-  assert.match(editor, /providerOption\?\.supports_wire_api_selection/);
-  assert.match(editor, /updateProfileField\(service, "wire_api"/);
-  assert.match(editor, /t\("API protocol"\)/);
-  assert.match(editor, /value="responses"/);
-  assert.match(editor, /value="chat_completions"/);
+  assert.match(context, /api_formats\?: string\[\]/);
+  assert.match(editor, /providerOption\?\.api_formats/);
+  assert.match(editor, /updateProfileField\(service, "api_format"/);
+  assert.match(editor, /t\("API format"\)/);
+  assert.match(editor, /openai_chat: "OpenAI Chat Completions"/);
+  assert.match(editor, /openai_responses: "OpenAI Responses"/);
+  assert.match(editor, /anthropic: "Anthropic Messages"/);
 });
 
-test("wire API settings copy stays in sync across locales", () => {
+test("API format settings copy stays in sync across locales", () => {
   const en = JSON.parse(readFileSync(EN, "utf8")) as Record<string, unknown>;
   const zh = JSON.parse(readFileSync(ZH, "utf8")) as Record<string, unknown>;
   const keys = [
-    "API protocol",
+    "API format",
     "Auto (recommended)",
-    "Responses API",
-    "Chat Completions",
-    "Automatically select the protocol and fall back when supported.",
-    "Require the Responses API. Endpoint errors are returned without falling back.",
-    "Require the Chat Completions API.",
+    "OpenAI Chat Completions",
+    "OpenAI Responses",
+    "Anthropic Messages",
+    "Chat Completions for most endpoints; Responses for OpenAI reasoning models, with fallback.",
+    "Send every request to /v1/chat/completions.",
+    "Send every request to /v1/responses. Endpoint errors are returned without falling back.",
+    "Send every request as Anthropic Messages (/v1/messages).",
   ];
 
   for (const key of keys) {
@@ -57,9 +60,16 @@ test("wire API settings remain usable on narrow viewports", () => {
   const editor = readFileSync(EDITOR, "utf8");
   const main = readFileSync(MAIN, "utf8");
   const toolbar = readFileSync(TOOLBAR, "utf8");
+  const pageLayout = readFileSync(
+    path.resolve(process.cwd(), "components/layout/FeaturePage.tsx"),
+    "utf8",
+  );
 
-  assert.match(editor, /sm:grid-cols-\[200px_minmax\(0,1fr\)\]/);
-  assert.match(editor, /sm:sticky sm:top-4/);
-  assert.match(main, /px-5[^\"]*sm:px-10/);
-  assert.match(toolbar, /flex-col[^\"]*sm:flex-row/);
+  // The 1.6 settings UI uses provider cards and an inline editor instead of the old
+  // sticky profile list. Profile fields stay one-column until the `sm`
+  // breakpoint, and the shell keeps compact horizontal padding on phones.
+  assert.match(editor, /grid gap-4 sm:grid-cols-2/);
+  assert.match(main, /<PageContainer/);
+  assert.match(pageLayout, /min-w-0[^\"]*px-6 md:px-9/);
+  assert.match(toolbar, /flex flex-wrap/);
 });

@@ -57,7 +57,9 @@ test("BYOK profile updates always include the generation token", async () => {
     (globalThis as { fetch: typeof fetch }).fetch = originalFetch;
   }
 
-  assert.equal(requestUrl, "/api/v1/byok/profiles/profile-1");
+  // The shared apiUrl wrapper may append the upstream workspace query param;
+  // the fork BYOK contract only pins the path and the generation token.
+  assert.equal(requestUrl.split("?")[0], "/api/v1/byok/profiles/profile-1");
   assert.equal(requestMethod, "PATCH");
   const body = JSON.parse(requestBody) as { generation?: number | null };
   assert.equal(Object.hasOwn(body, "generation"), true);

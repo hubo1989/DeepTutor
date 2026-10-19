@@ -9,7 +9,7 @@ from typing import Any
 
 from deeptutor.partners.bus.events import OutboundMessage
 from deeptutor.partners.bus.queue import MessageBus
-from deeptutor.partners.channels.base import BaseChannel, constructing_for
+from deeptutor.partners.channels.base import BaseChannel, constructing_for, deliver_outbound
 from deeptutor.partners.config.schema import ChannelsConfig
 
 
@@ -26,6 +26,168 @@ _BOOL_CAMEL_ALIASES: dict[str, str] = {
     "send_progress": "sendProgress",
     "send_tool_hints": "sendToolHints",
 }
+
+
+def _drain_outbound(bus: Any) -> OutboundMessage | None:
+    """Pop one queued outbound message without waiting, or ``None`` when empty.
+
+    Tolerates buses that only expose the blocking ``consume_outbound`` (tests
+    and embedders): those simply never coalesce.
+    """
+    try_consume = getattr(bus, "try_consume_outbound", None)
+    if callable(try_consume):
+        return try_consume()
+    try:
+        return bus.outbound.get_nowait()
+    except (asyncio.QueueEmpty, AttributeError, NotImplementedError):
+        return None
+
+
+def coalesce_stream_deltas(
+    bus: Any, first_msg: OutboundMessage
+) -> tuple[OutboundMessage, list[OutboundMessage]]:
+    """Merge consecutive ``_stream_delta`` messages for the same stream segment.
+
+    Shared by the channel dispatcher and the partner outbound router so both
+    keep the same delivery contract: an LLM that generates faster than the
+    channel can post must not turn every token into its own API call.
+
+    Returns:
+        tuple of (merged_message, list_of_non_matching_messages)
+    """
+    target_key = (first_msg.channel, first_msg.chat_id)
+    target_stream = (first_msg.metadata or {}).get("_stream_id")
+    combined_content = first_msg.content
+    final_metadata = dict(first_msg.metadata or {})
+    non_matching: list[OutboundMessage] = []
+
+    # Only merge consecutive deltas of the same stream segment. As soon
+    # as we hit any other message, stop and hand that boundary back to
+    # the dispatcher via `pending`.
+    while True:
+        next_msg = _drain_outbound(bus)
+        if next_msg is None:
+            break
+
+        next_meta = next_msg.metadata or {}
+        same_target = (next_msg.channel, next_msg.chat_id) == target_key
+        same_stream = next_meta.get("_stream_id") == target_stream
+        is_delta = bool(next_meta.get("_stream_delta"))
+        is_end = bool(next_meta.get("_stream_end"))
+
+        if same_target and same_stream and is_delta:
+            combined_content += next_msg.content
+            if is_end:
+                final_metadata["_stream_end"] = True
+                if next_meta.get("_stream_final"):
+                    final_metadata["_stream_final"] = True
+                break
+        else:
+            # First non-matching message defines the coalescing boundary.
+            non_matching.append(next_msg)
+            break
+
+    merged = OutboundMessage(
+        channel=first_msg.channel,
+        chat_id=first_msg.chat_id,
+        content=combined_content,
+        # Routing hints belong to the segment, not to one delta: keep the first
+        # message's so a merged frame still replies/threads where it started.
+        reply_to=first_msg.reply_to,
+        media=list(first_msg.media),
+        metadata=final_metadata,
+    )
+    return merged, non_matching
+
+
+def coalesce_progress_messages(
+    bus: Any, first_msg: OutboundMessage
+) -> tuple[OutboundMessage, list[OutboundMessage]]:
+    """Merge consecutive progress messages that are already queued together.
+
+    Narration rounds and tool hints become separate messages, which is what a
+    reader wants while the channel keeps up. When the model outruns the channel
+    they instead pile up in the queue, and every one of them costs a blocking
+    API round trip — post the backlog as one message rather than dribbling it
+    out after the turn has already finished. Nothing waits for a merge: only
+    messages already waiting in the queue are combined.
+    """
+    target_key = (first_msg.channel, first_msg.chat_id)
+    is_tool_hint = bool((first_msg.metadata or {}).get("_tool_hint"))
+    joiner = "\n" if is_tool_hint else "\n\n"
+    combined_content = first_msg.content
+    final_metadata = dict(first_msg.metadata or {})
+    non_matching: list[OutboundMessage] = []
+
+    while True:
+        next_msg = _drain_outbound(bus)
+        if next_msg is None:
+            break
+
+        next_meta = next_msg.metadata or {}
+        mergeable = (
+            (next_msg.channel, next_msg.chat_id) == target_key
+            and bool(next_meta.get("_progress"))
+            and not next_meta.get("_stream_delta")
+            and not next_meta.get("_stream_end")
+            # The "thinking…" notice carries its own lifecycle (it is retracted
+            # once output starts), so it must stay a message of its own.
+            and not next_meta.get("_thinking_notice")
+            and not (first_msg.metadata or {}).get("_thinking_notice")
+            and bool(next_meta.get("_tool_hint")) == is_tool_hint
+        )
+        if not mergeable:
+            non_matching.append(next_msg)
+            break
+        combined_content = f"{combined_content}{joiner}{next_msg.content}"
+
+    merged = OutboundMessage(
+        channel=first_msg.channel,
+        chat_id=first_msg.chat_id,
+        content=combined_content,
+        reply_to=first_msg.reply_to,
+        media=list(first_msg.media),
+        metadata=final_metadata,
+    )
+    return merged, non_matching
+
+
+async def send_with_retry(
+    channel: BaseChannel,
+    msg: OutboundMessage,
+    *,
+    max_attempts: int = 3,
+    retry_delays: tuple[float, ...] = _SEND_RETRY_DELAYS,
+) -> None:
+    """Send a message with retry on failure using exponential backoff.
+
+    Note: CancelledError is re-raised to allow graceful shutdown.
+    """
+    attempts = max(max_attempts, 1)
+
+    for attempt in range(attempts):
+        try:
+            await deliver_outbound(channel, msg)
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            if attempt == attempts - 1:
+                _logger().exception("Failed to send to {} after {} attempts", msg.channel, attempts)
+                return
+            delay = retry_delays[min(attempt, len(retry_delays) - 1)]
+            _logger().warning(
+                "Send to {} failed (attempt {}/{}): {}, retrying in {}s",
+                msg.channel,
+                attempt + 1,
+                attempts,
+                type(e).__name__,
+                delay,
+            )
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                raise
 
 
 class ChannelManager:
@@ -51,6 +213,7 @@ class ChannelManager:
         self._groq_api_key = groq_api_key
         self._partner_id = str(partner_id or "")
         self.channels: dict[str, BaseChannel] = {}
+        self._configured_status: dict[str, dict[str, Any]] = {}
         self._dispatch_task: asyncio.Task | None = None
         self._origin_reply_fingerprints: dict[tuple[str, str, str], str] = {}
 
@@ -58,18 +221,32 @@ class ChannelManager:
 
     def _init_channels(self) -> None:
         """Initialize channels discovered via pkgutil scan + entry_points plugins."""
-        from deeptutor.partners.channels.registry import discover_all
+        from deeptutor.partners.channels.registry import discover_all_with_errors
 
-        for name, cls in discover_all().items():
-            section = getattr(self.channels_config, name, None)
-            if section is None:
-                continue
+        discovered, import_errors = discover_all_with_errors()
+        configured = dict(self.channels_config.model_extra or {})
+
+        for name, section in configured.items():
             enabled = (
                 section.get("enabled", False)
                 if isinstance(section, dict)
                 else getattr(section, "enabled", False)
             )
             if not enabled:
+                continue
+            self._configured_status[name] = {
+                "enabled": True,
+                "running": False,
+                "setup": {},
+            }
+
+            cls = discovered.get(name)
+            if cls is None:
+                reason = import_errors.get(name)
+                self._configured_status[name]["setup"] = {
+                    "status": "unavailable",
+                    "message": reason or "Channel implementation is not installed.",
+                }
                 continue
             try:
                 with constructing_for(self._partner_id):
@@ -89,11 +266,19 @@ class ChannelManager:
                         'Skipping channel "{}": allowFrom is empty (denies all)',
                         name,
                     )
+                    self._configured_status[name]["setup"] = {
+                        "status": "action_required",
+                        "message": "Add at least one allowed sender before starting this channel.",
+                    }
                     continue
                 self.channels[name] = channel
                 _logger().info("{} channel enabled", cls.display_name)
             except Exception as e:
                 _logger().warning("{} channel not available: {}", name, e)
+                self._configured_status[name]["setup"] = {
+                    "status": "error",
+                    "message": f"Channel initialization failed ({type(e).__name__}).",
+                }
 
     @staticmethod
     def _resolve_bool_override(section: Any, key: str, *, default: bool) -> bool:
@@ -114,10 +299,46 @@ class ChannelManager:
         return value if isinstance(value, bool) else default
 
     async def _start_channel(self, name: str, channel: BaseChannel) -> None:
+        channel.set_setup_state("connecting")
+        manager_revision = channel.setup_revision
+        start_task = asyncio.create_task(channel.start())
         try:
-            await channel.start()
+            # Most implementations set `_running` synchronously before their
+            # first network await. If the channel did not publish a more
+            # precise state of its own, report that its listener is alive —
+            # not that external authentication has necessarily succeeded.
+            await asyncio.sleep(0)
+            if (
+                channel.is_running
+                and channel.setup_revision == manager_revision
+                and not start_task.done()
+            ):
+                channel.set_setup_state("running")
+                manager_revision = channel.setup_revision
+            await start_task
+            if channel.setup_revision == manager_revision:
+                if channel.is_running:
+                    channel.set_setup_state("running")
+                else:
+                    channel.set_setup_state(
+                        "action_required",
+                        message=(
+                            "The channel did not start. Check its required fields "
+                            "and optional dependencies."
+                        ),
+                    )
+        except asyncio.CancelledError:
+            start_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await start_task
+            raise
         except Exception as e:
             _logger().error("Failed to start channel {}: {}", name, e)
+            channel._running = False
+            channel.set_setup_state(
+                "error",
+                message=f"Channel startup failed ({type(e).__name__}).",
+            )
 
     async def start_all(self) -> None:
         """Start all channels and the outbound dispatcher."""
@@ -146,6 +367,7 @@ class ChannelManager:
         for name, channel in self.channels.items():
             try:
                 await channel.stop()
+                channel.set_setup_state("disconnected")
                 _logger().info("Stopped {} channel", name)
             except Exception as e:
                 _logger().error("Error stopping {}: {}", name, e)
@@ -232,19 +454,13 @@ class ChannelManager:
                 await self._send_with_retry(channel, msg)
 
             except asyncio.TimeoutError:
+                # Idle-poll timeout on an empty queue: the cancelled consume
+                # popped no message (a consume finishing despite the timeout
+                # is returned by wait_for), so nothing is skipped. Channel
+                # send timeouts are retried and logged in _send_with_retry.
                 continue
             except asyncio.CancelledError:
                 break
-
-    @staticmethod
-    async def _send_once(channel: BaseChannel, msg: OutboundMessage) -> None:
-        """Send one outbound message without retry policy."""
-        if msg.metadata.get("_stream_delta") or msg.metadata.get("_stream_end"):
-            await channel.send_delta(msg.chat_id, msg.content, msg.metadata)
-        elif not msg.metadata.get("_streamed"):
-            # ``_streamed`` marks a final reply already delivered live via
-            # send_delta — skip the plain send to avoid a duplicate message.
-            await channel.send(msg)
 
     def _coalesce_stream_deltas(
         self, first_msg: OutboundMessage
@@ -254,86 +470,42 @@ class ChannelManager:
         Returns:
             tuple of (merged_message, list_of_non_matching_messages)
         """
-        target_key = (first_msg.channel, first_msg.chat_id)
-        target_stream = (first_msg.metadata or {}).get("_stream_id")
-        combined_content = first_msg.content
-        final_metadata = dict(first_msg.metadata or {})
-        non_matching: list[OutboundMessage] = []
-
-        # Only merge consecutive deltas of the same stream segment. As soon
-        # as we hit any other message, stop and hand that boundary back to
-        # the dispatcher via `pending`.
-        while True:
-            try:
-                next_msg = self.bus.outbound.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-
-            next_meta = next_msg.metadata or {}
-            same_target = (next_msg.channel, next_msg.chat_id) == target_key
-            same_stream = next_meta.get("_stream_id") == target_stream
-            is_delta = bool(next_meta.get("_stream_delta"))
-            is_end = bool(next_meta.get("_stream_end"))
-
-            if same_target and same_stream and is_delta:
-                combined_content += next_msg.content
-                if is_end:
-                    final_metadata["_stream_end"] = True
-                    break
-            else:
-                # First non-matching message defines the coalescing boundary.
-                non_matching.append(next_msg)
-                break
-
-        merged = OutboundMessage(
-            channel=first_msg.channel,
-            chat_id=first_msg.chat_id,
-            content=combined_content,
-            metadata=final_metadata,
-        )
-        return merged, non_matching
+        return coalesce_stream_deltas(self.bus, first_msg)
 
     async def _send_with_retry(self, channel: BaseChannel, msg: OutboundMessage) -> None:
         """Send a message with retry on failure using exponential backoff.
 
         Note: CancelledError is re-raised to allow graceful shutdown.
         """
-        max_attempts = max(getattr(self.channels_config, "send_max_retries", 3), 1)
-
-        for attempt in range(max_attempts):
-            try:
-                await self._send_once(channel, msg)
-                return
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                if attempt == max_attempts - 1:
-                    _logger().exception(
-                        "Failed to send to {} after {} attempts", msg.channel, max_attempts
-                    )
-                    return
-                delay = _SEND_RETRY_DELAYS[min(attempt, len(_SEND_RETRY_DELAYS) - 1)]
-                _logger().warning(
-                    "Send to {} failed (attempt {}/{}): {}, retrying in {}s",
-                    msg.channel,
-                    attempt + 1,
-                    max_attempts,
-                    type(e).__name__,
-                    delay,
-                )
-                try:
-                    await asyncio.sleep(delay)
-                except asyncio.CancelledError:
-                    raise
+        await send_with_retry(
+            channel,
+            msg,
+            max_attempts=max(getattr(self.channels_config, "send_max_retries", 3), 1),
+        )
 
     def get_channel(self, name: str) -> BaseChannel | None:
         return self.channels.get(name)
 
     def get_status(self) -> dict[str, Any]:
-        return {
-            name: {"enabled": True, "running": channel.is_running}
-            for name, channel in self.channels.items()
+        status = {
+            name: {
+                "enabled": bool(state.get("enabled")),
+                "running": bool(state.get("running")),
+                "setup": dict(state.get("setup") or {}),
+            }
+            for name, state in self._configured_status.items()
         }
+        status.update(
+            {
+                name: {
+                    "enabled": True,
+                    "running": channel.is_running,
+                    "setup": channel.setup_state,
+                }
+                for name, channel in self.channels.items()
+            }
+        )
+        return status
 
     @property
     def enabled_channels(self) -> list[str]:

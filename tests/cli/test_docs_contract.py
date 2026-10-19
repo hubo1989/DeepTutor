@@ -12,6 +12,7 @@ PUBLIC_DOCS = (
     ROOT / "README.md",
     ROOT / "deeptutor_cli" / "README.md",
     ROOT / "SKILL.md",
+    ROOT / "docs-for-user" / "AGENT_SETUP.md",
 )
 
 
@@ -77,6 +78,7 @@ def test_documented_deeptutor_subcommands_exist() -> None:
         "book",
         "chat",
         "config",
+        "doctor",
         "init",
         "kb",
         "memory",
@@ -89,6 +91,8 @@ def test_documented_deeptutor_subcommands_exist() -> None:
         "session",
         "skill",
         "start",
+        "stop",
+        "workspace",
     }
     provider_subcommands = {"login"}
 
@@ -121,4 +125,4 @@ def test_docs_do_not_advertise_removed_cli_forms() -> None:
 
     assert "deeptutor provider logout" not in text
     assert "deeptutor memory show summary" not in text
-    assert "WS /api/v1/turns" not in text
+    assert "WS /api/turns" not in text

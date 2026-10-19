@@ -8,18 +8,20 @@ UI preferences, configuration catalog management, and detailed streamed tests.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterator
+import contextlib
+from copy import deepcopy
 import json
 import logging
 import time
 from typing import Any, List, Literal, Optional
 
-from fastapi import APIRouter, HTTPException, Request, status
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, HTTPException, Query, Request, status
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
-from deeptutor.commercial.runtime import commercial_mode_requested
 from deeptutor.multi_user.context import get_current_user
 from deeptutor.multi_user.model_access import allowed_llm_options
 from deeptutor.services.codebuddy_auth import get_codebuddy_auth_service
@@ -44,17 +46,37 @@ from deeptutor.services.config.runtime_settings import (
     CHAT_ATTACHMENT_MAX_TOTAL_MB_RANGE,
     compute_ws_max_size,
 )
-from deeptutor.services.embedding.client import reset_embedding_client
-from deeptutor.services.llm.client import reset_llm_client
+from deeptutor.services.config.settings_draft import (
+    get_settings_draft_service,
+    is_empty_draft,
+    merge_draft_secrets,
+    redact_draft,
+)
+from deeptutor.services.config.settings_presets import (
+    SETTINGS_PRESETS_SCHEMA_VERSION,
+    get_settings_preset,
+    list_settings_presets,
+)
+from deeptutor.services.config.settings_profile import (
+    SettingsProfileError,
+    export_settings_profile,
+    review_settings_profile_import,
+)
 from deeptutor.services.llm.config import clear_llm_config_cache
 from deeptutor.services.model_selection import list_llm_options
 from deeptutor.services.path_service import get_path_service
+from deeptutor.services.session.usage_statistics import UsageStatistics
 from deeptutor.services.settings.interface_settings import (
     DEFAULT_UI_SETTINGS as INTERFACE_DEFAULTS,
 )
 from deeptutor.services.settings.interface_settings import (
+    UiLanguage,
     atomic_update,
     resolve_languages,
+    sanitize_enabled_tools,
+)
+from deeptutor.services.settings.interface_settings import (
+    get_enabled_optional_tools as _get_enabled_optional_tools,
 )
 from deeptutor.services.settings.starter_settings import (
     TRACE_COUNT_RANGE as STARTER_TRACE_COUNT_RANGE,
@@ -63,7 +85,7 @@ from deeptutor.tools.builtin import USER_TOGGLEABLE_TOOL_NAMES
 
 router = APIRouter()
 # Public UI-settings router. The app shell bootstraps the interface language
-# from GET /api/v1/settings/ui, and auth pages (/register, /login) must be
+# from GET /api/settings/ui, and auth pages (/register, /login) must be
 # able to do the same *before* a session exists — so this one read endpoint
 # is intentionally mounted outside the ``_auth`` dependency (see main.py).
 # It only exposes non-sensitive UI preferences (theme/language), never the
@@ -71,6 +93,31 @@ router = APIRouter()
 public_router = APIRouter()
 
 TOUR_CACHE = None
+
+# Reader-facing model output supports more languages than the interface.
+ResponseLanguage = Literal[
+    "en",
+    "zh",
+    "zh-tw",
+    "ja",
+    "ko",
+    "es",
+    "fr",
+    "de",
+    "ru",
+    "pt",
+    "it",
+    "ar",
+    "pl",
+    "uk",
+    "ms",
+]
+
+
+def get_enabled_optional_tools() -> list[str]:
+    """Compatibility export; the source of truth lives in the service layer."""
+
+    return _get_enabled_optional_tools()
 
 
 def _settings_file():
@@ -84,7 +131,7 @@ def _tour_cache_file():
 
 
 DEFAULT_SIDEBAR_NAV_ORDER = {
-    "start": ["/", "/history", "/knowledge", "/notebook"],
+    "start": ["/", "/history", "/knowledge-bases", "/notebooks"],
     "learnResearch": ["/question", "/solver", "/research", "/co_writer"],
 }
 
@@ -104,6 +151,9 @@ DEFAULT_UI_SETTINGS = {
     # preference (not catalog); the chat surface also keeps a per-session
     # override on top of this global default.
     "voice_autoplay": False,
+    # When true, TTS verbalizes LaTeX into spoken math. When false, formulas
+    # are unwrapped from $ / $$ only. Default true (matches INTERFACE_DEFAULTS).
+    "voice_math_speak": True,
     # Seconds the chat UI waits for any turn event before declaring the
     # connection timed out. Bumped from 60 → 180 so slow tools (image/video
     # generation) don't trip it; user-adjustable in Settings > Network.
@@ -123,8 +173,8 @@ class SidebarNavOrder(BaseModel):
 
 class UISettings(BaseModel):
     theme: Literal["light", "dark", "glass", "snow"] = "snow"
-    language: Literal["zh", "en"] = "en"
-    response_language: Literal["zh", "en"] = "en"
+    language: UiLanguage = "en"
+    response_language: ResponseLanguage = "en"
     sidebar_description: Optional[str] = None
     sidebar_nav_order: Optional[SidebarNavOrder] = None
     code_block_theme: Optional[str] = None
@@ -133,7 +183,7 @@ class UISettings(BaseModel):
 
 
 class UISettingsUpdate(BaseModel):
-    """Partial UI settings for user-initiated PATCH/PUT updates via /api/v1/settings/ui.
+    """Partial UI settings for user-initiated PATCH/PUT updates via /api/settings/ui.
 
     All fields have None defaults so `model_dump(exclude_unset=True)` naturally
     excludes fields not provided in the frontend payload, while explicitly provided
@@ -146,8 +196,8 @@ class UISettingsUpdate(BaseModel):
     # for exclude_unset partial merges, but an explicit value is still validated
     # so PUT /ui cannot persist a theme/language the app can't render.
     theme: Literal["light", "dark", "glass", "snow"] | None = None
-    language: Literal["zh", "en"] | None = None
-    response_language: Literal["zh", "en"] | None = None
+    language: UiLanguage | None = None
+    response_language: ResponseLanguage | None = None
     sidebar_description: str | None = None
     sidebar_nav_order: SidebarNavOrder | None = None
     code_block_theme: str | None = None
@@ -159,6 +209,10 @@ class VoiceAutoplayUpdate(BaseModel):
     voice_autoplay: bool
 
 
+class VoiceMathSpeakUpdate(BaseModel):
+    voice_math_speak: bool
+
+
 class ChatResponseTimeoutUpdate(BaseModel):
     chat_response_timeout: int = Field(ge=CHAT_RESPONSE_TIMEOUT_MIN, le=CHAT_RESPONSE_TIMEOUT_MAX)
 
@@ -168,7 +222,7 @@ class ThemeUpdate(BaseModel):
 
 
 class LanguageUpdate(BaseModel):
-    language: Literal["zh", "en"]
+    language: UiLanguage
 
 
 class SidebarDescriptionUpdate(BaseModel):
@@ -183,8 +237,88 @@ class EnabledToolsUpdate(BaseModel):
     enabled_tools: List[str]
 
 
+class VoicePreviewPayload(BaseModel):
+    catalog: dict[str, Any]
+    profile_id: str
+    model_id: str
+    text: str = Field(min_length=1, max_length=500)
+
+
+class VoiceDiscoveryPayload(BaseModel):
+    catalog: dict[str, Any]
+    profile_id: str
+    model_id: str
+
+
+class ServicePreviewPayload(BaseModel):
+    catalog: dict[str, Any]
+    profile_id: str
+    model_id: str | None = None
+    text: str = Field(default="", max_length=2000)
+    audio: str = Field(default="", max_length=11184812)
+    content_type: str = ""
+
+
 class CatalogPayload(BaseModel):
     catalog: dict[str, Any]
+
+
+class ProviderEditPayload(BaseModel):
+    service: Literal["llm", "task", "embedding", "search", "tts", "stt", "imagegen", "videogen"]
+    profile: dict[str, Any]
+    connection: dict[str, Any] | None = None
+    active_model_id: str | None = None
+    activate: bool = False
+
+
+class RegistryEditPayload(BaseModel):
+    kind: Literal["provider", "model", "default", "task_choice"]
+    task: dict[str, Any] | None = None
+    ref: dict[str, Any] | None = None
+    fields: dict[str, Any] | None = None
+    service: (
+        Literal["llm", "task", "embedding", "search", "tts", "stt", "imagegen", "videogen"] | None
+    ) = None
+    profile_id: str | None = None
+    model_id: str | None = None
+    model: dict[str, Any] | None = None
+    config: dict[str, Any] | None = None
+    delete: bool = False
+
+
+class CatalogServicePayload(BaseModel):
+    """One model-catalog service to promote without touching other drafts."""
+
+    service: Literal[
+        "llm",
+        "task",
+        "embedding",
+        "search",
+        "tts",
+        "stt",
+        "imagegen",
+        "videogen",
+    ]
+    config: dict[str, Any]
+
+
+class SettingsDraftPayload(BaseModel):
+    """The unapplied settings envelope, as the settings UI holds it."""
+
+    catalog: dict[str, Any] | None = None
+    # Opaque per-page state, keyed by the string the page registers with.
+    extensions: dict[str, Any] = Field(default_factory=dict)
+
+
+class SettingsProfileImportPayload(BaseModel):
+    """An exported value-free settings profile submitted for review only."""
+
+    schema_version: str
+    profile: dict[str, Any]
+
+
+class SettingsPresetDraftRequest(SettingsDraftPayload):
+    """The current draft envelope submitted alongside a named preset."""
 
 
 class CodexReasoningEffortUpdate(BaseModel):
@@ -197,6 +331,30 @@ class FetchModelsPayload(BaseModel):
     base_url: str = ""
     api_key: Optional[str] = None
     profile_id: Optional[str] = None
+    # Which LLM-shaped service the profile lives in (for resolving a masked key).
+    service: Literal["llm", "task"] = "llm"
+    # The profile's API format; decides whether /models takes Anthropic headers.
+    api_format: Optional[str] = None
+
+
+class ModelCapabilitiesQuery(BaseModel):
+    binding: str = ""
+    model: str = ""
+
+
+class ProviderProbePayload(BaseModel):
+    binding: str = "openai"
+    base_url: str = ""
+    api_key: str | list[str] | None = None
+    api_format: str = "auto"
+    api_version: str = ""
+    extra_headers: dict[str, str] | str | None = None
+    proxy: str = ""
+    service: Literal["llm", "task", "embedding", "search", "tts", "stt", "imagegen", "videogen"] = (
+        "llm"
+    )
+    profile_id: str | None = None
+    connection_id: str | None = None
 
 
 class NetworkSettingsUpdate(BaseModel):
@@ -239,7 +397,7 @@ class ChatStarterSettingsUpdate(BaseModel):
 
 
 class MinerUSettingsUpdate(BaseModel):
-    """MinerU PDF-parsing backend settings.
+    """MinerU document-parsing backend settings.
 
     ``api_token`` is tri-state: ``None`` keeps the stored token (the UI sends
     None when the user didn't edit the secret field), ``""`` clears it, and a
@@ -285,6 +443,9 @@ class DocumentParsingUpdate(BaseModel):
 
     engine: Optional[str] = None
     engines: Optional[dict[str, dict]] = None
+    # Toggle for vision-model captions of embedded images (None = keep stored).
+    image_caption: Optional[bool] = None
+    # Omit to keep the selection; null restores the main LLM.
     image_description_model: Optional[ImageDescriptionModelSelection] = None
 
 
@@ -316,18 +477,57 @@ class DocumentParsingInstall(BaseModel):
     engine: str
 
 
-def _invalidate_runtime_caches() -> None:
-    """Force runtime clients/config to pick up the latest saved catalog.
+@contextlib.contextmanager
+def _runtime_catalog_write() -> Iterator[None]:
+    """Bracket a write to the model catalog, resetting clients if it landed.
 
-    The LLM and embedding clients are process-wide singletons, so resetting
-    them here will affect any user turn that is mid-flight on another worker.
-    Admins issuing Apply during active sessions accept that trade-off; we log
-    a WARNING so the cause is visible in the audit trail.
+    The LLM and embedding clients are process-wide singletons that resolve
+    from this one file, so resetting them affects any user turn mid-flight on
+    another worker; admins issuing Apply during active sessions accept that,
+    and the WARNING keeps the cause in the audit trail.
+
+    An apply that saved the catalog already on disk changes nothing those
+    clients would read. That is the shape a settings visit re-applying the
+    same configuration takes, and each redundant reset flipped the backend
+    client out from under an in-flight turn and dropped it into the provider
+    retry ladder — the cold start whose first message sat in a loop until a
+    restart (#1421).
+
+    Whether the catalog changed is a property of the file, not of the caller,
+    so both sides are read here. Five endpoints each assembling their own
+    before/after pair is five chances to pair the wrong two and a sixth
+    endpoint's chance to forget; wrapping the write is the whole contract.
+
+    A write that raises leaves the block without resetting, which is what a
+    failed write should do: there is nothing new for the clients to read.
     """
+    service = get_model_catalog_service()
+    before = service.load()
+    try:
+        yield
+    except PermissionError as exc:
+        # #1984: filesystem denial is not an authentication failure. Preserve
+        # the atomic writer's failure boundary and the unapplied draft; do not
+        # blindly retry a stale catalog over another writer's newer settings.
+        logger.exception("Filesystem access denied while saving the model catalog")
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "The server could not save model settings because filesystem access was denied. "
+                "Check the server service account's permissions on the settings folder and "
+                "whether another process or security software is holding model_catalog.json, "
+                "then retry."
+            ),
+        ) from exc
+    if service.load() == before:
+        return
     logger.warning(
         "Admin applied catalog; resetting global LLM/embedding clients. "
         "In-flight user turns may flip backend client mid-call."
     )
+    from deeptutor.services.embedding.client import reset_embedding_client
+    from deeptutor.services.llm.client import reset_llm_client
+
     clear_llm_config_cache()
     reset_llm_client()
     reset_embedding_client()
@@ -345,42 +545,13 @@ def load_ui_settings() -> dict[str, Any]:
                 # Filter persisted enabled_optional_tools to current
                 # toggleable set so retired tool names can't leak into
                 # the per-turn payload.
-                merged["enabled_optional_tools"] = _sanitize_enabled_tools(
+                merged["enabled_optional_tools"] = sanitize_enabled_tools(
                     merged.get("enabled_optional_tools")
                 )
                 return merged
         except Exception:
             pass
     return DEFAULT_UI_SETTINGS.copy()
-
-
-def _sanitize_enabled_tools(value: Any) -> list[str]:
-    if not isinstance(value, list):
-        return list(USER_TOGGLEABLE_TOOL_NAMES)
-    allowed = set(USER_TOGGLEABLE_TOOL_NAMES)
-    seen: set[str] = set()
-    out: list[str] = []
-    for name in value:
-        if isinstance(name, str) and name in allowed and name not in seen:
-            seen.add(name)
-            out.append(name)
-    return out
-
-
-def get_enabled_optional_tools() -> list[str]:
-    """Return the user's currently-enabled toggleable tool names.
-
-    Source of truth for the chat pipeline when a turn doesn't ship an
-    explicit ``tools`` list. Intersected with the admin grant whitelist so
-    a restricted user's saved toggles can't resurrect a revoked tool.
-    """
-    from deeptutor.multi_user.tool_access import allowed_optional_tools
-
-    enabled = _sanitize_enabled_tools(load_ui_settings().get("enabled_optional_tools"))
-    allowed = allowed_optional_tools()
-    if allowed is not None:
-        enabled = [name for name in enabled if name in allowed]
-    return enabled
 
 
 def save_ui_settings(settings: dict[str, Any]) -> None:
@@ -475,6 +646,19 @@ def _provider_choices() -> dict[str, list[dict[str, Any]]]:
                 "base_url": s.default_api_base,
                 "auth_mode": s.auth_mode,
                 "supports_wire_api_selection": s.supports_wire_api_selection,
+                # Which protocols a profile on this vendor may pick, and the
+                # vendor endpoint each one lives at when that differs.
+                "api_formats": list(s.api_formats),
+                "default_api_format": s.default_api_format,
+                "base_urls": {
+                    api_format: s.default_api_base_for(api_format)
+                    for api_format in s.api_formats
+                    if s.default_api_base_for(api_format)
+                },
+                # Legacy entries stay resolvable for stored catalogs but are
+                # not offered for new profiles; the same thing is expressed
+                # today as a provider plus an API format.
+                "status": "legacy" if s.is_legacy else "supported",
             }
             for s in PROVIDERS
         ],
@@ -524,6 +708,8 @@ def _provider_choices() -> dict[str, list[dict[str, Any]]]:
         }
         for name in sorted(DEPRECATED_SEARCH_PROVIDERS)
     ]
+    from deeptutor.services.voice.options import voice_options
+
     tts = sorted(
         [
             {
@@ -532,6 +718,7 @@ def _provider_choices() -> dict[str, list[dict[str, Any]]]:
                 "base_url": spec.default_api_base,
                 "default_model": spec.default_model,
                 "default_voice": spec.default_voice,
+                "voice_options": voice_options(name, "tts"),
             }
             for name, spec in TTS_PROVIDERS.items()
         ],
@@ -544,6 +731,7 @@ def _provider_choices() -> dict[str, list[dict[str, Any]]]:
                 "label": spec.label,
                 "base_url": spec.default_api_base,
                 "default_model": spec.default_model,
+                "voice_options": voice_options(name, "stt"),
             }
             for name, spec in STT_PROVIDERS.items()
         ],
@@ -575,6 +763,8 @@ def _provider_choices() -> dict[str, list[dict[str, Any]]]:
     )
     return {
         "llm": llm,
+        # Same shape, same vendors: the task service stands in for the LLM.
+        "task": llm,
         "embedding": embedding,
         "search": search,
         "tts": tts,
@@ -582,6 +772,99 @@ def _provider_choices() -> dict[str, list[dict[str, Any]]]:
         "imagegen": imagegen,
         "videogen": videogen,
     }
+
+
+def _match_service_provider(
+    provider: str,
+    table: dict[str, Any],
+) -> tuple[str, Any] | None:
+    """Find *provider*'s entry in one service's provider table.
+
+    Vendors are not named identically across tables — the LLM registry calls
+    Alibaba's endpoint ``dashscope`` while the embedding table calls it
+    ``aliyun`` — so an exact key miss falls back to the spec's own keywords
+    rather than to a second hand-maintained name map.
+    """
+    if provider in table:
+        return provider, table[provider]
+    for name, spec in table.items():
+        if provider in getattr(spec, "keywords", ()):
+            return name, spec
+    return None
+
+
+def _connection_targets() -> list[dict[str, Any]]:
+    """Which services one vendor credential can configure, and with what.
+
+    The connection UI needs to answer "if I paste an OpenRouter key here, what
+    does it get me?" — so this joins the six per-service provider tables on the
+    vendor and reports, per service, the provider value and the prefills a
+    profile created from that connection should start with. Derived rather than
+    duplicated: adding a vendor to a service table is enough to make it
+    connectable, and the web app never keeps a second copy of the tables.
+    """
+    from deeptutor.services.config.provider_runtime import (
+        EMBEDDING_PROVIDERS,
+        IMAGEGEN_PROVIDERS,
+        STT_PROVIDERS,
+        TTS_PROVIDERS,
+        VIDEOGEN_PROVIDERS,
+    )
+    from deeptutor.services.provider_registry import PROVIDERS
+
+    service_tables: dict[str, dict[str, Any]] = {
+        "embedding": {k: v for k, v in EMBEDDING_PROVIDERS.items() if k != "custom_openai_sdk"},
+        "tts": TTS_PROVIDERS,
+        "stt": STT_PROVIDERS,
+        "imagegen": IMAGEGEN_PROVIDERS,
+        "videogen": VIDEOGEN_PROVIDERS,
+    }
+
+    targets: list[dict[str, Any]] = []
+    for spec in PROVIDERS:
+        # OAuth vendors sign in through their own flow; there is no key to
+        # share, so offering them here would promise something untrue.
+        if spec.is_oauth:
+            continue
+        services: dict[str, dict[str, Any]] = {
+            "llm": {
+                "provider": spec.name,
+                "base_url": spec.default_api_base,
+                "default_model": "",
+            }
+        }
+        for service_name, table in service_tables.items():
+            match = _match_service_provider(spec.name, table)
+            if match is None:
+                continue
+            name, service_spec = match
+            entry: dict[str, Any] = {
+                "provider": name,
+                "base_url": service_spec.default_api_base,
+                "default_model": service_spec.default_model,
+            }
+            if service_name == "embedding":
+                entry["default_dim"] = (
+                    str(service_spec.default_dim) if service_spec.default_dim else ""
+                )
+            if service_name == "tts":
+                entry["default_voice"] = service_spec.default_voice
+            services[service_name] = entry
+        targets.append(
+            {
+                "provider": spec.name,
+                "label": (
+                    "Custom (OpenAI API)"
+                    if spec.name == "custom"
+                    else "Custom (Anthropic API)"
+                    if spec.name == "custom_anthropic"
+                    else spec.label
+                ),
+                "default_base_url": spec.default_api_base,
+                "services": services,
+            }
+        )
+    return sorted(targets, key=lambda item: str(item["label"]).lower())
 
 
 def _api_base_source(system: dict[str, Any]) -> str:
@@ -608,7 +891,6 @@ def _network_settings_payload() -> dict[str, Any]:
     )
     auth_enabled = bool(auth["enabled"])
     cookie_secure = bool(auth["cookie_secure"])
-    cookie_samesite = "lax" if commercial_mode_requested() else ("none" if cookie_secure else "lax")
     return {
         "settings": {
             "backend_port": file_system["backend_port"],
@@ -630,10 +912,8 @@ def _network_settings_payload() -> dict[str, Any]:
         "auth": {
             "enabled": auth_enabled,
             "cookie_secure": cookie_secure,
-            "cookie_samesite": cookie_samesite,
-            "cross_site_cookie_ready": bool(
-                auth_enabled and cookie_secure and cookie_samesite == "none"
-            ),
+            "cookie_samesite": "none" if cookie_secure else "lax",
+            "cross_site_cookie_ready": bool(auth_enabled and cookie_secure),
         },
         "restart_required": True,
     }
@@ -646,10 +926,17 @@ async def get_settings():
         # Non-admins never see the catalog (provider URLs/keys); their model
         # choices come from /settings/llm-options (grant-filtered).
         return {"ui": load_ui_settings()}
+    from deeptutor.services.model_selection.tasks import task_kind_payload
+
     return {
         "ui": load_ui_settings(),
         "catalog": redact_catalog_secrets(get_model_catalog_service().load()),
         "providers": _provider_choices(),
+        "connection_targets": _connection_targets(),
+        # What actually runs on the background task model. The list comes from
+        # the call sites themselves (one TaskKind each), so the task models page
+        # cannot list a task DeepTutor no longer makes — or miss a new one.
+        "task_kinds": task_kind_payload(),
     }
 
 
@@ -667,6 +954,30 @@ async def get_openai_codex_oauth_status() -> dict[str, Any]:
     _require_codex_oauth_actor()
     try:
         return get_codex_oauth_service().public_status()
+    except CodexAuthError as exc:
+        raise _codex_http_exception(exc) from None
+
+
+class CodexOAuthCallbackPayload(BaseModel):
+    callback_url: str
+
+
+@router.post("/providers/openai-codex/oauth/complete")
+async def complete_openai_codex_oauth(payload: CodexOAuthCallbackPayload) -> dict[str, Any]:
+    """Finish a waiting Codex login from a callback address the user pasted.
+
+    The provider redirects the browser to a loopback listener. In Docker that
+    listener lives in the container and the published ports do not include it,
+    so the browser shows a failed page while the sign-in waits forever
+    (#1252). This is the way back in without a tunnel: the address is parsed
+    for its OAuth result and discarded, and the exchange is the same one the
+    listener would have driven.
+    """
+    _require_codex_oauth_actor()
+    try:
+        return await get_codex_oauth_service().complete_login_with_callback_url(
+            payload.callback_url
+        )
     except CodexAuthError as exc:
         raise _codex_http_exception(exc) from None
 
@@ -727,17 +1038,17 @@ async def update_openai_codex_reasoning_effort(
     payload: CodexReasoningEffortUpdate,
 ) -> dict[str, Any]:
     _require_codex_oauth_actor()
-    try:
-        status_payload = await get_codex_oauth_service().set_reasoning_effort(
-            payload.model,
-            payload.reasoning_effort,
-        )
-    except CodexAuthError as exc:
-        raise _codex_http_exception(exc) from None
-    # This writes the catalog the runtime resolves against, like every other
-    # catalog write here — without it the next turn keeps the old effort until
-    # something else happens to invalidate.
-    _invalidate_runtime_caches()
+    # The codex service writes the catalog the runtime resolves against, like
+    # every other catalog write here — unbracketed, the next turn would keep
+    # the old effort until something else happened to reset the clients.
+    with _runtime_catalog_write():
+        try:
+            status_payload = await get_codex_oauth_service().set_reasoning_effort(
+                payload.model,
+                payload.reasoning_effort,
+            )
+        except CodexAuthError as exc:
+            raise _codex_http_exception(exc) from None
     return status_payload
 
 
@@ -914,6 +1225,7 @@ def _document_parsing_payload() -> dict[str, Any]:
     docling_slice = engines.get("docling", {})
     return {
         "engine": full.get("engine"),
+        "image_caption": bool(full.get("image_caption", False)),
         "image_description_model": full.get("image_description_model"),
         "engines": redacted,
         "available_engines": available,
@@ -965,8 +1277,8 @@ async def update_mineru_settings(payload: MinerUSettingsUpdate):
             "enable_formula": payload.enable_formula,
             "enable_table": payload.enable_table,
             "is_ocr": payload.is_ocr,
-            "normalize_tiny_scans": current.get("normalize_tiny_scans", False),
             "max_pages_per_part": current.get("max_pages_per_part", 180),
+            "normalize_tiny_scans": current.get("normalize_tiny_scans", False),
             "allow_local_model_download": payload.allow_local_model_download,
         }
     )
@@ -979,12 +1291,112 @@ async def get_document_parsing_settings():
     return _document_parsing_payload()
 
 
+@router.get("/readiness")
+async def get_settings_readiness():
+    """Return the value-free cross-setting capability readiness matrix."""
+
+    _require_settings_admin()
+    from deeptutor.services.config.readiness import build_settings_readiness
+
+    return await build_settings_readiness()
+
+
+@router.get("/profile")
+async def get_settings_profile():
+    """Export effective settings with credentials and deployment values removed."""
+
+    _require_settings_admin()
+    return export_settings_profile()
+
+
+@router.post("/profile/diff")
+async def diff_settings_profile(payload: SettingsProfileImportPayload):
+    """Review an imported profile without changing effective settings."""
+
+    _require_settings_admin()
+    try:
+        return review_settings_profile_import(payload.model_dump())
+    except SettingsProfileError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from None
+
+
+@router.get("/presets")
+async def get_settings_presets():
+    """List value-free starting points for a reviewable draft."""
+
+    _require_settings_admin()
+    return {
+        "schema_version": SETTINGS_PRESETS_SCHEMA_VERSION,
+        "presets": list_settings_presets(),
+    }
+
+
+async def _stage_settings_preset(
+    preset_id: str,
+    payload: SettingsPresetDraftRequest,
+) -> dict[str, Any]:
+    """Merge one preset into the unapplied draft; never touch live settings."""
+
+    preset = get_settings_preset(preset_id)
+    if preset is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown preset '{preset_id}'.")
+
+    draft_service = get_settings_draft_service()
+    stored = draft_service.load()
+    incoming = payload.model_dump()
+
+    # The browser sends its whole envelope, so unrelated unsaved edits survive.
+    # When a caller omits extensions, existing extension drafts must survive too.
+    extensions = deepcopy(stored.get("extensions") or {})
+    extensions.update(deepcopy(incoming.get("extensions") or {}))
+    incoming["extensions"] = extensions
+
+    merged = merge_draft_secrets(
+        incoming,
+        stored,
+        get_model_catalog_service().load(),
+    )
+    preset_draft = preset.draft_extensions()
+    tools = preset_draft["tools"]["enabled_tools"]
+    preset_draft["tools"]["enabled_tools"] = sanitize_enabled_tools(tools)
+    merged["extensions"].update(preset_draft)
+
+    return {
+        "preset": preset.public_dict(),
+        "draft": redact_draft(draft_service.save(merged)),
+    }
+
+
+@router.post("/presets/{preset_id}/draft")
+async def stage_settings_preset(
+    preset_id: str,
+    payload: SettingsPresetDraftRequest,
+) -> dict[str, Any]:
+    """Load a named preset into the existing draft for review."""
+
+    _require_settings_admin()
+    return await _stage_settings_preset(preset_id, payload)
+
+
 @router.put("/document-parsing")
 async def update_document_parsing_settings(payload: DocumentParsingUpdate):
     _require_settings_admin()
     service = get_runtime_settings_service()
     full = service.load_document_parsing(include_process_overrides=False)
     engines = {name: dict(slice_) for name, slice_ in full.get("engines", {}).items()}
+
+    for name, update in (payload.engines or {}).items():
+        if name not in engines:
+            continue
+        merged = dict(update or {})
+        # Token tri-state for engines with a secret (MinerU, Docling remote):
+        # omitted / None keeps the stored token; "" clears it; a string
+        # replaces it.
+        if "api_token" in (engines[name] or {}) and merged.get("api_token") is None:
+            merged.pop("api_token", None)
+        engines[name].update(merged)
+
+    new_engine = payload.engine or full.get("engine")
     image_model = full.get("image_description_model")
     if "image_description_model" in payload.model_fields_set:
         image_model = (
@@ -999,22 +1411,15 @@ async def update_document_parsing_settings(payload: DocumentParsingUpdate):
                 resolve_image_description_config(image_model)
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    for name, update in (payload.engines or {}).items():
-        if name not in engines:
-            continue
-        merged = dict(update or {})
-        # Token tri-state for engines with a secret (MinerU, Docling remote):
-        # omitted / None keeps the stored token; "" clears it; a string
-        # replaces it.
-        if "api_token" in (engines[name] or {}) and merged.get("api_token") is None:
-            merged.pop("api_token", None)
-        engines[name].update(merged)
-
-    new_engine = payload.engine or full.get("engine")
+    image_caption = (
+        payload.image_caption
+        if payload.image_caption is not None
+        else bool(full.get("image_caption", False))
+    )
     service.save_document_parsing(
         {
             "engine": new_engine,
+            "image_caption": image_caption,
             "image_description_model": image_model,
             "engines": engines,
         }
@@ -1183,12 +1588,13 @@ async def start_mineru_models_download(payload: MinerUModelDownloadPayload):
             message = (
                 f"mineru-models-download not found next to the configured CLI "
                 f"(expected {resolved['path']}). The configured install may be "
-                "magic-pdf 1.x — upgrade to MinerU 2.x for one-click downloads."
+                "legacy magic-pdf — upgrade to MinerU >= 3.4.5 for one-click downloads."
             )
         else:
             message = (
                 "mineru-models-download not found on the server PATH. Install "
-                'MinerU 2.x first (uv pip install -U "mineru[core]") or set the CLI path.'
+                'current MinerU first (uv pip install -U "mineru[all]>=3.4.5") or set '
+                "the CLI path."
             )
         return {"ok": False, "message": message}
 
@@ -1232,6 +1638,10 @@ async def test_mineru_connection(payload: MinerUSettingsUpdate):
             local_cli_probe,
             local_cli_version,
         )
+        from deeptutor.services.parsing.engines.mineru.formats import (
+            MIN_MINERU_VERSION,
+            mineru_version_is_current,
+        )
 
         probe = local_cli_probe(payload.local_cli_path)
         if not probe["found"]:
@@ -1247,7 +1657,7 @@ async def test_mineru_connection(payload: MinerUSettingsUpdate):
                 "ok": False,
                 "message": (
                     "MinerU CLI not found on the server PATH. Install it "
-                    '(uv pip install -U "mineru[core]"), set an explicit CLI path, '
+                    '(uv pip install -U "mineru[all]>=3.4.5"), set an explicit CLI path, '
                     "or switch to cloud mode."
                 ),
             }
@@ -1257,10 +1667,19 @@ async def test_mineru_connection(payload: MinerUSettingsUpdate):
             probe["path"] if probe.get("source") == "configured" else str(probe["command"])
         )
         version = await asyncio.to_thread(local_cli_version, version_target)
-        detail = version or f"at {probe['path']}"
+        if not mineru_version_is_current(version):
+            detail = version or "an unknown version"
+            return {
+                "ok": False,
+                "message": (
+                    f"Local MinerU CLI reported {detail}. DeepTutor needs MinerU >= "
+                    f"{MIN_MINERU_VERSION}; upgrade with "
+                    f"`pip install -U 'mineru[all]>={MIN_MINERU_VERSION}'`."
+                ),
+            }
         return {
             "ok": True,
-            "message": f"Local MinerU CLI detected: {probe['command']} ({detail})",
+            "message": f"Local MinerU CLI detected: {probe['command']} ({version})",
         }
 
     service = get_runtime_settings_service()
@@ -1306,68 +1725,332 @@ async def update_catalog(payload: CatalogPayload):
     current = service.load()
     restored = restore_catalog_secrets(payload.catalog, current)
     proposed = reconcile_codex_catalog_update(current, restored)
-    catalog = service.save(proposed)
-    _invalidate_runtime_caches()
+    with _runtime_catalog_write():
+        catalog = service.save(proposed)
     return {"catalog": redact_catalog_secrets(catalog)}
+
+
+@router.post("/apply/registry")
+async def apply_registry_edit(payload: RegistryEditPayload):
+    """Promote one provider, model, or default without replacing other drafts."""
+    _require_settings_admin()
+    from deeptutor.services.settings.registry_edit import merge_registry_edit
+
+    service = get_model_catalog_service()
+    draft_service = get_settings_draft_service()
+    stored = draft_service.load()
+    current = service.load()
+    edit = payload.model_dump(exclude_none=True)
+    try:
+        proposed = merge_registry_edit(current, edit, stored_draft=stored.get("catalog"))
+        proposed = reconcile_codex_catalog_update(current, proposed)
+        draft_catalog = stored.get("catalog")
+        if isinstance(draft_catalog, dict):
+            stored["catalog"] = merge_registry_edit(draft_catalog, edit, stored_draft=proposed)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    with _runtime_catalog_write():
+        service.apply(proposed)
+    catalog = service.load()
+    if stored.get("catalog") == catalog:
+        stored["catalog"] = None
+    if is_empty_draft(stored):
+        draft_service.clear()
+        public_draft = None
+    else:
+        public_draft = redact_draft(draft_service.save(stored))
+    return {"catalog": redact_catalog_secrets(catalog), "draft": public_draft}
+
+
+@router.post("/apply/provider")
+async def apply_provider_edit(payload: ProviderEditPayload):
+    """Save the provider on screen, preserving every unrelated live/draft entry."""
+    _require_settings_admin()
+    from deeptutor.services.settings.provider_edit import merge_provider_edit
+
+    service = get_model_catalog_service()
+    draft_service = get_settings_draft_service()
+    stored = draft_service.load()
+    current = service.load()
+    try:
+        proposed = merge_provider_edit(
+            current,
+            payload.service,
+            payload.profile,
+            connection=payload.connection,
+            active_model_id=payload.active_model_id,
+            activate=payload.activate,
+            stored_draft=stored.get("catalog"),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    reconciled = reconcile_codex_catalog_update(current, proposed)
+    with _runtime_catalog_write():
+        service.apply(reconciled)
+    catalog = service.load()
+    draft_catalog = stored.get("catalog")
+    if isinstance(draft_catalog, dict):
+        # Advance only the addressed profile in a saved draft, preserving edits
+        # to its sibling providers and to all non-model settings.
+        saved_profile = next(
+            item
+            for item in catalog["services"][payload.service]["profiles"]
+            if item["id"] == payload.profile["id"]
+        )
+        saved_connection = next(
+            (
+                item
+                for item in catalog.get("connections", [])
+                if item["id"] == (payload.connection or {}).get("id")
+            ),
+            None,
+        )
+        stored["catalog"] = merge_provider_edit(
+            draft_catalog,
+            payload.service,
+            saved_profile,
+            connection=saved_connection,
+            activate=payload.activate,
+            active_model_id=payload.active_model_id,
+        )
+        if stored["catalog"] == catalog:
+            stored["catalog"] = None
+    if is_empty_draft(stored):
+        draft_service.clear()
+        public_draft = None
+    else:
+        public_draft = redact_draft(draft_service.save(stored))
+    return {"catalog": redact_catalog_secrets(catalog), "draft": public_draft}
+
+
+@router.post("/apply/service")
+async def apply_catalog_service(payload: CatalogServicePayload):
+    """Apply one model service while leaving every other draft untouched.
+
+    Provider dialogs use this narrower commit path for their Done action. A
+    user may still have unrelated edits elsewhere in Settings, and closing an
+    STT dialog must not silently promote those edits too.
+    """
+
+    _require_settings_admin()
+    service = get_model_catalog_service()
+    current = service.load()
+    draft_service = get_settings_draft_service()
+    stored_draft = draft_service.load()
+    proposed = deepcopy(current)
+    proposed.setdefault("services", {})[payload.service] = deepcopy(payload.config)
+    restored = restore_catalog_secrets(proposed, stored_draft.get("catalog") or current)
+    restored = restore_catalog_secrets(restored, current)
+    if payload.service == "task" and payload.config.get("mode") == "reference":
+        from deeptutor.services.model_selection import apply_llm_selection_to_catalog
+
+        try:
+            selection = payload.config.get("selection")
+            if not selection or not selection.get("profile_id") or not selection.get("model_id"):
+                raise ValueError("Choose a configured task model first.")
+            apply_llm_selection_to_catalog(restored, selection)
+        except (ValueError, AttributeError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    reconciled = reconcile_codex_catalog_update(current, restored)
+    with _runtime_catalog_write():
+        runtime = service.apply(reconciled)
+    catalog = service.load()
+
+    # A previously saved draft contains a full catalog. Keep it, but advance
+    # this one service to the value that is now live; otherwise reloading the
+    # page would resurrect the pre-apply STT configuration over the live one.
+    draft_catalog = stored_draft.get("catalog")
+    if isinstance(draft_catalog, dict):
+        draft_catalog.setdefault("services", {})[payload.service] = deepcopy(
+            catalog["services"][payload.service]
+        )
+        stored_draft["catalog"] = None if draft_catalog == catalog else draft_catalog
+
+    if is_empty_draft(stored_draft):
+        draft_service.clear()
+        public_draft = None
+    else:
+        public_draft = redact_draft(draft_service.save(stored_draft))
+
+    return {
+        "message": f"{payload.service} settings applied to runtime.",
+        "catalog": redact_catalog_secrets(catalog),
+        "draft": public_draft,
+        "runtime": runtime,
+    }
+
+
+@router.get("/draft")
+async def get_settings_draft():
+    """Return the unapplied draft, or nothing when there is none.
+
+    The draft is deliberately invisible to every other read path: nothing that
+    resolves runtime configuration looks here, which is the whole difference
+    between saving a draft and applying it.
+    """
+    draft = get_settings_draft_service().load()
+    if is_empty_draft(draft):
+        return {"draft": None}
+    return {"draft": redact_draft(draft)}
+
+
+@router.put("/draft")
+async def update_settings_draft(payload: SettingsDraftPayload):
+    if payload.catalog is not None:
+        _require_settings_admin()
+    service = get_settings_draft_service()
+    stored = service.load()
+    merged = merge_draft_secrets(
+        payload.model_dump(),
+        stored,
+        get_model_catalog_service().load(),
+    )
+    if is_empty_draft(merged):
+        service.clear()
+        return {"draft": None}
+    saved = service.save(merged)
+    return {"draft": redact_draft(saved)}
+
+
+@router.delete("/draft")
+async def discard_settings_draft():
+    get_settings_draft_service().clear()
+    return {"draft": None}
 
 
 @router.post("/apply")
 async def apply_catalog(payload: CatalogPayload | None = None):
+    """Move settings into the files the runtime reads, and clear the draft.
+
+    With no body this promotes the stored draft's catalog, which is how the
+    settings UI applies: credentials that only ever existed in a draft would
+    otherwise have to round-trip through the browser as placeholders and come
+    back resolving to the previous key.
+    """
     _require_settings_admin()
     service = get_model_catalog_service()
+    draft_service = get_settings_draft_service()
     current = service.load()
-    catalog = (
-        reconcile_codex_catalog_update(
-            current,
-            restore_catalog_secrets(payload.catalog, current),
+    if payload is not None:
+        proposed = restore_catalog_secrets(payload.catalog, current)
+    else:
+        draft_catalog = draft_service.load().get("catalog")
+        proposed = (
+            restore_catalog_secrets(draft_catalog, current)
+            if isinstance(draft_catalog, dict)
+            else current
         )
-        if payload is not None
-        else current
-    )
-    applied = service.apply(catalog)
-    _invalidate_runtime_caches()
+    catalog = reconcile_codex_catalog_update(current, proposed)
+    with _runtime_catalog_write():
+        applied = service.apply(catalog)
+    catalog_after = service.load()
+    draft_service.clear()
     return {
         "message": "Catalog applied to runtime settings.",
-        "catalog": redact_catalog_secrets(service.load()),
+        "catalog": redact_catalog_secrets(catalog_after),
         "runtime": applied,
     }
 
 
+@router.post("/test-provider")
+async def test_provider_connection(payload: ProviderProbePayload):
+    """Test current form credentials, resolving masks from draft/live settings by ID."""
+    _require_settings_admin()
+    from deeptutor.services.settings.provider_probe import probe_provider, probe_search_provider
+
+    current = get_model_catalog_service().load()
+    saved = get_settings_draft_service().load().get("catalog")
+    source = restore_catalog_secrets(saved, current) if isinstance(saved, dict) else current
+    fields = payload.model_dump()
+    if payload.connection_id:
+        fields["id"] = payload.connection_id
+        proposed = {"connections": [fields]}
+        resolved = restore_catalog_secrets(proposed, source)["connections"][0]
+    else:
+        fields["id"] = payload.profile_id
+        proposed = {"services": {payload.service: {"profiles": [fields]}}}
+        resolved = restore_catalog_secrets(proposed, source)["services"][payload.service][
+            "profiles"
+        ][0]
+    from deeptutor.services.keypool import primary_api_key
+
+    key = primary_api_key(resolved.get("api_key"))
+    headers = resolved.get("extra_headers") or {}
+    if isinstance(headers, str):
+        try:
+            headers = json.loads(headers)
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(status_code=400, detail="Invalid extra headers JSON.") from exc
+    if not isinstance(headers, dict) or any(not isinstance(v, str) for v in headers.values()):
+        raise HTTPException(status_code=400, detail="Extra headers must contain text values.")
+    if (
+        (payload.api_key == CATALOG_SECRET_MASK and not key)
+        or key == CATALOG_SECRET_MASK
+        or any(v == CATALOG_SECRET_MASK for v in headers.values())
+    ):
+        raise HTTPException(
+            status_code=400, detail="Saved credentials were not found. Enter the key again."
+        )
+    if payload.service == "search":
+        return await probe_search_provider(
+            payload.binding, payload.base_url, key, proxy=payload.proxy
+        )
+    return await probe_provider(
+        payload.binding, payload.base_url, key, payload.api_format, headers, payload.api_version
+    )
+
+
 @router.post("/fetch-models")
 async def fetch_models_from_provider(payload: FetchModelsPayload):
-    """List the model IDs an OpenAI-compatible provider exposes.
+    """List selectable model IDs using the provider's own authentication.
 
     Thin HTTP surface over ``factory.fetch_models`` so the settings UI can
-    populate a model picker from ``base_url`` + ``api_key`` instead of making
-    the user type model IDs by hand.
+    populate a model picker. Copilot uses the caller's owner-private CLI login,
+    not the profile's API key or base URL.
     """
     _require_settings_admin()
     from deeptutor.services.llm.factory import fetch_models as fetch_llm_models
+    from deeptutor.services.provider_registry import canonical_provider_name
 
     base_url = (payload.base_url or "").strip()
     binding = (payload.binding or "").strip().lower() or "openai"
-    if not base_url and binding != "codebuddy":
+    is_copilot = canonical_provider_name(binding) == "github_copilot"
+    if not base_url and binding != "codebuddy" and not is_copilot:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="base_url is required for this provider.",
         )
 
     api_key = payload.api_key
-    if api_key == CATALOG_SECRET_MASK and payload.profile_id:
-        llm_service = get_model_catalog_service().load().get("services", {}).get("llm", {})
+    api_format = (payload.api_format or "").strip().lower()
+    if is_copilot:
+        base_url, api_key, api_format = "", None, "auto"
+    elif payload.profile_id and (api_key == CATALOG_SECRET_MASK or not api_format):
+        service = get_model_catalog_service().load().get("services", {}).get(payload.service, {})
         profile = next(
-            (
-                item
-                for item in llm_service.get("profiles", [])
-                if item.get("id") == payload.profile_id
-            ),
+            (item for item in service.get("profiles", []) if item.get("id") == payload.profile_id),
             None,
         )
-        api_key = profile.get("api_key") if profile else None
+        if api_key == CATALOG_SECRET_MASK:
+            api_key = profile.get("api_key") if profile else None
+        if not api_format and profile:
+            api_format = str(profile.get("api_format") or "")
 
     try:
-        model_ids = await fetch_llm_models(binding, base_url, api_key)
+        model_ids = await fetch_llm_models(binding, base_url, api_key, api_format or "auto")
     except Exception as exc:  # noqa: BLE001 — surface any provider error as 502
+        if is_copilot:
+            # OAuth exceptions can contain credential-bearing URLs or responses.
+            # Never echo or log their raw text at this public HTTP boundary.
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=(
+                    "Could not list GitHub Copilot models. "
+                    "Run: deeptutor provider login github-copilot "
+                    "for this account in the server's DeepTutor home, "
+                    "then retry. If already logged in, check Copilot access and connectivity."
+                ),
+            ) from None
         logger.exception("Failed to fetch models from %s", base_url)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
@@ -1375,6 +2058,25 @@ async def fetch_models_from_provider(payload: FetchModelsPayload):
         ) from exc
 
     return {"models": [{"id": model_id, "name": model_id} for model_id in model_ids]}
+
+
+@router.post("/model-capabilities")
+async def resolve_model_capabilities(payload: ModelCapabilitiesQuery):
+    """What the built-in capability tables assume for one provider/model pair.
+
+    The settings UI shows these as the value "Auto" resolves to next to each
+    per-model override, so a user can see what they are overriding.
+    """
+    _require_settings_admin()
+    from deeptutor.services.llm.capabilities import effective_capabilities
+
+    binding = (payload.binding or "").strip().lower() or "openai"
+    model = (payload.model or "").strip()
+    return {
+        "binding": binding,
+        "model": model,
+        "defaults": effective_capabilities(binding, model),
+    }
 
 
 @router.put("/theme")
@@ -1398,6 +2100,18 @@ async def update_voice_autoplay(update: VoiceAutoplayUpdate):
     """
     patch_ui_settings(voice_autoplay=update.voice_autoplay)
     return {"voice_autoplay": update.voice_autoplay}
+
+
+@router.put("/voice-math-speak")
+async def update_voice_math_speak(update: VoiceMathSpeakUpdate):
+    """Persist whether TTS verbalizes LaTeX as spoken math.
+
+    A personal UI preference (any authenticated user). The voice router reads
+    this on each synthesis call; chat does not send a per-request override.
+    Dollar-sign delimiters are stripped even when this is off.
+    """
+    patch_ui_settings(voice_math_speak=update.voice_math_speak)
+    return {"voice_math_speak": update.voice_math_speak}
 
 
 @router.put("/chat-response-timeout")
@@ -1495,9 +2209,103 @@ async def update_sidebar_nav_order(update: SidebarNavOrderUpdate):
 
 @router.put("/enabled-tools")
 async def update_enabled_tools(update: EnabledToolsUpdate):
-    sanitized = _sanitize_enabled_tools(update.enabled_tools)
+    sanitized = sanitize_enabled_tools(update.enabled_tools)
     patch_ui_settings(enabled_optional_tools=sanitized)
     return {"enabled_optional_tools": sanitized}
+
+
+@router.post("/voice/voices")
+async def list_voice_choices(payload: VoiceDiscoveryPayload):
+    """Read live account voices for a draft selection, without applying it."""
+    _require_settings_admin()
+    from deeptutor.services.voice.discovery import discover_voices
+
+    service = get_model_catalog_service()
+    current = service.load()
+    saved = get_settings_draft_service().load().get("catalog")
+    source = restore_catalog_secrets(saved, current) if isinstance(saved, dict) else current
+    catalog = service.resolve_connections(restore_catalog_secrets(payload.catalog, source))
+    try:
+        result = await discover_voices(catalog, payload.profile_id, payload.model_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return Response(
+        json.dumps(result), media_type="application/json", headers={"Cache-Control": "no-store"}
+    )
+
+
+@router.post(
+    "/voice/preview",
+    response_class=Response,
+    responses={200: {"content": {"audio/wav": {}, "audio/mpeg": {}}}},
+)
+async def preview_voice(payload: VoicePreviewPayload) -> Response:
+    """Audition the model being edited without saving or activating its catalog."""
+    _require_settings_admin()
+    from deeptutor.services.voice.base import VoiceProviderError, VoiceProviderTimeout
+    from deeptutor.services.voice.preview import preview_failure_message, synthesize_preview
+
+    service = get_model_catalog_service()
+    current = service.load()
+    saved = get_settings_draft_service().load().get("catalog")
+    # Restore the saved draft against live first; a missing draft secret must
+    # not replace an incoming mask with None before live can resolve it.
+    source = restore_catalog_secrets(saved, current) if isinstance(saved, dict) else current
+    catalog = restore_catalog_secrets(payload.catalog, source)
+    catalog = service.resolve_connections(catalog)
+    try:
+        audio, content_type = await synthesize_preview(
+            catalog, payload.profile_id, payload.model_id, payload.text
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except VoiceProviderTimeout as exc:
+        raise HTTPException(status_code=504, detail=str(exc)) from exc
+    except VoiceProviderError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=preview_failure_message(exc),
+        ) from exc
+    return Response(audio, media_type=content_type, headers={"Cache-Control": "no-store"})
+
+
+@router.post("/services/{service}/preview")
+async def preview_service(service: str, payload: ServicePreviewPayload):
+    """Stream a real result from the selected draft without applying it."""
+    _require_settings_admin()
+    from deeptutor.services.settings.service_preview import preview_events, validate_input
+    from deeptutor.services.voice.discovery import selected_catalog
+
+    try:
+        audio = validate_input(service, payload.text, payload.audio, payload.content_type)
+        catalog_service = get_model_catalog_service()
+        current = catalog_service.load()
+        saved = get_settings_draft_service().load().get("catalog")
+        source = restore_catalog_secrets(saved, current) if isinstance(saved, dict) else current
+        catalog = catalog_service.resolve_connections(
+            restore_catalog_secrets(payload.catalog, source)
+        )
+        selected_catalog(catalog, service, payload.profile_id, payload.model_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    async def stream():
+        async for event in preview_events(
+            catalog,
+            service,
+            payload.profile_id,
+            payload.model_id,
+            payload.text,
+            audio,
+            payload.content_type,
+        ):
+            yield json.dumps(event, ensure_ascii=False) + "\n"
+
+    return StreamingResponse(
+        stream(),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.post("/tests/{service}/start")
@@ -1505,8 +2313,16 @@ async def start_service_test(service: str, payload: CatalogPayload | None = None
     _require_settings_admin()
     catalog = None
     if payload is not None:
-        current = get_model_catalog_service().load()
-        catalog = restore_catalog_secrets(payload.catalog, current)
+        catalog_service = get_model_catalog_service()
+        current = catalog_service.load()
+        saved = get_settings_draft_service().load().get("catalog")
+        catalog = (
+            restore_catalog_secrets(payload.catalog, saved)
+            if isinstance(saved, dict)
+            else payload.catalog
+        )
+        catalog = restore_catalog_secrets(catalog, current)
+        catalog = catalog_service.resolve_connections(catalog)
     run = get_config_test_runner().start(service, catalog)
     return {"run_id": run.id}
 
@@ -1575,8 +2391,8 @@ async def complete_tour(payload: TourCompletePayload | None = None):
         if payload and payload.catalog
         else current
     )
-    applied = service.apply(catalog)
-    _invalidate_runtime_caches()
+    with _runtime_catalog_write():
+        applied = service.apply(catalog)
     now = int(time.time())
     launch_at = now + 3
     redirect_at = now + 5
@@ -1596,7 +2412,7 @@ async def complete_tour(payload: TourCompletePayload | None = None):
 
     return {
         "status": "completed",
-        "message": "Configuration saved. LearnLeader will restart shortly.",
+        "message": "Configuration saved. DeepTutor will restart shortly.",
         "launch_at": launch_at,
         "redirect_at": redirect_at,
         "runtime": applied,
@@ -1609,3 +2425,44 @@ async def reopen_tour():
         "message": "Run the terminal setup guide from the project root to re-open the guided setup.",
         "command": "deeptutor init",
     }
+
+
+@router.get("/usage", response_model=UsageStatistics)
+async def get_usage_statistics(
+    year: int = Query(..., ge=1970, le=9998),
+    timezone: str = Query("UTC", max_length=100),
+) -> UsageStatistics:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+    from deeptutor.services.session import get_session_store
+    from deeptutor.services.session.usage_statistics import aggregate_usage
+
+    try:
+        zone = ZoneInfo(timezone)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid timezone") from exc
+    start = datetime(year, 1, 1, tzinfo=zone).timestamp()
+    end = datetime(year + 1, 1, 1, tzinfo=zone).timestamp()
+    from deeptutor.services.workspace import get_content_workspace_service
+    from deeptutor.services.workspace.activity import data_activity
+    from deeptutor.services.workspace.context import workspace_context
+    from deeptutor.services.workspace.models import WorkspaceError
+
+    records = []
+    with data_activity():
+        workspace_ids = [""] + [
+            row["workspace_id"]
+            for row in get_content_workspace_service()._catalog()
+            if row.get("kind") == "workspace"
+        ]
+        for workspace_id in workspace_ids:
+            try:
+                with workspace_context(workspace_id):
+                    records.extend(await get_session_store().usage_records(start, end))
+            except WorkspaceError:
+                continue
+    from deeptutor.services.llm.usage_ledger import combined_usage_records
+
+    combined = await asyncio.to_thread(combined_usage_records, records, start, end)
+    return await asyncio.to_thread(aggregate_usage, combined, year=year, timezone=timezone)

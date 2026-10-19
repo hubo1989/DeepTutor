@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from contextvars import ContextVar
-import json
+from contextlib import asynccontextmanager
 import logging
-import math
+import threading
 from typing import Any, Dict, List, Optional
 
 from deeptutor.services.config.embedding_endpoint import (
@@ -20,67 +18,6 @@ from deeptutor.services.config.provider_runtime import (
 from .adapters import ADAPTER_BACKENDS, BaseEmbeddingAdapter, EmbeddingRequest
 from .config import EmbeddingConfig, get_embedding_config
 from .validation import validate_embedding_batch
-
-
-def _estimate_text_tokens(texts: List[str]) -> int:
-    """Estimate provider input tokens before an embedding request.
-
-    Embedding providers do not share a response usage schema, so the hard
-    preflight reservation uses a conservative character-based estimate and
-    reconciles with provider usage when available.
-    """
-    chars = sum(len(text or "") for text in texts)
-    return max(1, math.ceil(chars / 3.5))
-
-
-def _estimate_content_tokens(contents: List[Dict[str, Any]]) -> int:
-    text_items = [str(item.get("text") or "") for item in contents]
-    estimated = _estimate_text_tokens(text_items)
-    # Image/video-only embedding requests still consume provider work but may
-    # expose no token count. Count each such item minimally for quota purposes.
-    return max(estimated, sum(1 for item in contents if not item.get("text")))
-
-
-def _commercial_text_token_bound(texts: List[str]) -> int:
-    """UTF-8 bytes are a provider-neutral upper bound for tokenizer pieces."""
-
-    return max(
-        _estimate_text_tokens(texts), sum(len((text or "").encode("utf-8")) for text in texts)
-    )
-
-
-def _commercial_content_token_bound(contents: List[Dict[str, Any]]) -> int:
-    try:
-        serialized = json.dumps(contents, ensure_ascii=False, default=str, separators=(",", ":"))
-    except (TypeError, ValueError):
-        serialized = str(contents)
-    return max(_estimate_content_tokens(contents), len(serialized.encode("utf-8")))
-
-
-def _batch_request_id(request_id: str | None, batch_index: int) -> str | None:
-    """Derive a stable reservation id for one batch of a retried operation."""
-
-    normalized = str(request_id or "").strip()
-    return f"{normalized}/batch-{batch_index + 1}" if normalized else None
-
-
-def _usage_tokens(usage: Any) -> int:
-    if isinstance(usage, Mapping):
-        for key in ("total_tokens", "prompt_tokens", "input_tokens", "tokens"):
-            value = usage.get(key)
-            try:
-                if value is not None and int(value) > 0:
-                    return int(value)
-            except (TypeError, ValueError):
-                continue
-    for key in ("total_tokens", "prompt_tokens", "input_tokens", "tokens"):
-        value = getattr(usage, key, None)
-        try:
-            if value is not None and int(value) > 0:
-                return int(value)
-        except (TypeError, ValueError):
-            continue
-    return 0
 
 
 def _resolve_adapter_class(binding: str) -> type[BaseEmbeddingAdapter]:
@@ -107,27 +44,46 @@ class EmbeddingClient:
     # 创建时的 loop，跨 loop 既不互斥还会挂死。必须用线程级锁。
     _spacing_lock: Any = None
     _last_request_monotonic: float = 0.0
-    _thread_guard: Any = None
+    _thread_guard = threading.Lock()
 
     @classmethod
     def _global_spacing_lock(cls):
-        import threading
-
-        if cls._spacing_lock is None:
-            cls._thread_guard = threading.Lock()
-            with cls._thread_guard:
-                if cls._spacing_lock is None:
-                    from threading import Lock as _TLock
-
-                    cls._spacing_lock = _TLock()
+        with cls._thread_guard:
+            if cls._spacing_lock is None:
+                cls._spacing_lock = threading.Lock()
         return cls._spacing_lock
 
     @staticmethod
-    def _hold_spacing_lock():
-        """Blocking acquire — cross-thread, loop-agnostic."""
+    @asynccontextmanager
+    async def _hold_spacing_lock():
+        """Acquire the cross-thread lock without blocking the current loop."""
+        import asyncio
+
         lock = EmbeddingClient._global_spacing_lock()
-        lock.acquire()
-        return lock
+        while not lock.acquire(blocking=False):
+            await asyncio.sleep(0.05)
+        try:
+            yield
+        finally:
+            lock.release()
+
+    async def _wait_for_request_slot(self) -> None:
+        """Space request starts across threads/loops without serializing HTTP.
+
+        Text and multimodal calls share the same clock. No delay means no
+        throttling; adapters still enforce their own concurrency/retry policy.
+        """
+        import asyncio
+        from time import monotonic
+
+        delay = self.config.batch_delay
+        if delay <= 0:
+            return
+        async with EmbeddingClient._hold_spacing_lock():
+            remaining = delay - (monotonic() - EmbeddingClient._last_request_monotonic)
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+            EmbeddingClient._last_request_monotonic = monotonic()
 
     def __init__(self, config: Optional[EmbeddingConfig] = None):
         self.config = config or get_embedding_config()
@@ -159,147 +115,11 @@ class EmbeddingClient:
             f"(model: {self.config.model}, dimensions: {self.config.dim})"
         )
 
-    def _reserve_quota(self, estimated_tokens: int):
-        if self.config.source == "byok":
-            from deeptutor.multi_user.byok_usage import start_byok_usage
-            from deeptutor.multi_user.context import get_current_user
-            from deeptutor.multi_user.execution_source import get_execution_source
-
-            source = get_execution_source()
-            source_for_service = source if source and source.service == "embedding" else None
-            return start_byok_usage(
-                service="embedding",
-                user_id=source_for_service.user_id if source_for_service else get_current_user().id,
-                profile_id=(
-                    source_for_service.profile_id
-                    if source_for_service and source_for_service.profile_id
-                    else self.config.profile_id or "unknown"
-                ),
-                provider=self.config.provider_name or self.config.binding,
-                model=self.config.model,
-                estimated_units=estimated_tokens,
-            )
-        from deeptutor.multi_user.token_quota import reserve_current_user_units
-
-        return reserve_current_user_units(
-            resource="embedding",
-            requested_units=estimated_tokens,
-        )
-
-    @staticmethod
-    def _finalize_quota(lease: Any, usage: Any, estimated_tokens: int) -> None:
-        if lease is not None:
-            lease.finalize(_usage_tokens(usage) or estimated_tokens)
-
-    async def _reserve_commercial(
-        self,
-        quantity: int,
-        *,
-        request_id: str | None = None,
-    ):
-        from deeptutor.commercial.metering import (
-            CommercialUsageLimitExceeded,
-            CommercialUsageUnavailable,
-            reserve_commercial_usage,
-        )
-
-        from .adapters import EmbeddingProviderError
-
-        try:
-            return await reserve_commercial_usage(
-                meter="embedding_tokens",
-                quantity=quantity,
-                source=self.config.source,
-                provider=self.config.provider_name or self.config.binding,
-                model=self.config.model,
-                request_id=request_id,
-            )
-        except CommercialUsageLimitExceeded as exc:
-            raise EmbeddingProviderError(
-                str(exc),
-                status=429,
-                model=self.config.model,
-                provider="deeptutor",
-            ) from exc
-        except CommercialUsageUnavailable as exc:
-            raise EmbeddingProviderError(
-                str(exc),
-                status=503,
-                model=self.config.model,
-                provider="deeptutor",
-            ) from exc
-
-    @staticmethod
-    async def _release_leases(lease: Any, commercial_lease: Any) -> None:
-        """Release both ledgers even when the legacy SQLite release fails."""
-
-        try:
-            if lease is not None:
-                lease.release()
-        finally:
-            if commercial_lease is not None:
-                await commercial_lease.release()
-
-    async def _finalize_leases(
-        self,
-        lease: Any,
-        commercial_lease: Any,
-        usage: Any,
-        *,
-        estimated_tokens: int,
-        commercial_quantity: int,
-    ) -> None:
-        """Settle PostgreSQL even when the legacy SQLite finalizer fails."""
-
-        try:
-            self._finalize_quota(lease, usage, estimated_tokens)
-        finally:
-            await self._finalize_commercial(
-                commercial_lease,
-                usage,
-                commercial_quantity,
-            )
-
-    async def _finalize_commercial(
-        self,
-        lease: Any,
-        usage: Any,
-        fallback_quantity: int,
-    ) -> None:
-        if lease is None:
-            return
-        from deeptutor.commercial.metering import (
-            CommercialUsageUnavailable,
-            measurement_from_usage,
-        )
-
-        from .adapters import EmbeddingProviderError
-
-        measurement = measurement_from_usage(
-            usage,
-            fallback_quantity=fallback_quantity,
-            meter="embedding_tokens",
-        )
-        try:
-            await lease.finalize(
-                measurement.quantity,
-                usage_units=measurement.units,
-                is_estimated=measurement.is_estimated,
-            )
-        except CommercialUsageUnavailable as exc:
-            raise EmbeddingProviderError(
-                str(exc),
-                status=503,
-                model=self.config.model,
-                provider="deeptutor",
-            ) from exc
-
     async def embed(
         self,
         texts: List[str],
         progress_callback=None,
         *,
-        request_id: str | None = None,
         input_type: str | None = None,
     ) -> List[List[float]]:
         """Embed text batches, optionally identifying their retrieval role."""
@@ -310,8 +130,6 @@ class EmbeddingClient:
         # backend would change the request Jina has always sent (no `task`) and
         # silently invalidate the indexes built from it.
         role = input_type if getattr(self.adapter, "SUPPORTS_INPUT_TYPE", False) else None
-
-        import asyncio
 
         # Clamp configured batch size against the provider's per-request item
         # cap. SiliconFlow Qwen3 family caps at 32; DashScope at 20; others
@@ -326,7 +144,6 @@ class EmbeddingClient:
                 f"(provider '{self.config.binding}' max={provider_max})"
             )
         all_embeddings: List[List[float]] = []
-        batch_delay = self.config.batch_delay
         expected_dim: int | None = None
 
         total_batches = (len(texts) + batch_size - 1) // batch_size
@@ -338,41 +155,10 @@ class EmbeddingClient:
                 dimensions=self.config.dim or None,
                 input_type=role,
             )
-            estimated_tokens = _estimate_text_tokens(batch)
-            lease = self._reserve_quota(estimated_tokens)
-            commercial_quantity = _commercial_text_token_bound(batch)
             try:
-                commercial_lease = await self._reserve_commercial(
-                    commercial_quantity,
-                    request_id=_batch_request_id(request_id, i),
-                )
-            except BaseException:
-                if lease is not None:
-                    lease.release()
-                raise
-            try:
-                # 全局发帖节流：线程级锁串行化"等待间隔+发帖"，跨线程/跨
-                # event loop 互斥（asyncio 锁在新 loop 模型下失效的教训）。
-                # asyncio.sleep 换成阻塞等待发帖侧可接受：DT 的 embedding
-                # 并发都在后台线程里，阻塞不伤 API 主线程。
-                import time as _time
-                from time import monotonic as _mono
-
-                _lock = EmbeddingClient._hold_spacing_lock()
-                try:
-                    delay = self.config.batch_delay
-                    if delay > 0:
-                        elapsed = _mono() - EmbeddingClient._last_request_monotonic
-                        if elapsed < delay:
-                            _time.sleep(delay - elapsed)
-                    EmbeddingClient._last_request_monotonic = _mono()
-                    response = await self.adapter.embed(request)
-                finally:
-                    _lock.release()
-            except BaseException as exc:
-                await self._release_leases(lease, commercial_lease)
-                if not isinstance(exc, Exception):
-                    raise
+                await self._wait_for_request_slot()
+                response = await self.adapter.embed(request)
+            except Exception as exc:
                 # Capture batch context so the task log stream / KB diagnostics
                 # show actionable info instead of a bare exception string.
                 import traceback
@@ -388,25 +174,14 @@ class EmbeddingClient:
                     f"{traceback.format_exc()}"
                 )
                 raise
-            try:
-                validated = validate_embedding_batch(
-                    response.embeddings,
-                    expected_count=len(batch),
-                    binding=self.config.binding,
-                    model=self.config.model,
-                    batch_index=i + 1,
-                    total_batches=total_batches,
-                    start_index=start,
-                )
-            except Exception:
-                await self._release_leases(lease, commercial_lease)
-                raise
-            await self._finalize_leases(
-                lease,
-                commercial_lease,
-                getattr(response, "usage", None),
-                estimated_tokens=estimated_tokens,
-                commercial_quantity=commercial_quantity,
+            validated = validate_embedding_batch(
+                response.embeddings,
+                expected_count=len(batch),
+                binding=self.config.binding,
+                model=self.config.model,
+                batch_index=i + 1,
+                total_batches=total_batches,
+                start_index=start,
             )
             batch_dim = len(validated[0]) if validated else 0
             if expected_dim is None:
@@ -426,12 +201,15 @@ class EmbeddingClient:
             if progress_callback:
                 try:
                     progress_callback(i + 1, total_batches)
-                except Exception:
-                    pass
-
-            # Delay between batches to avoid rate limiting
-            if i < total_batches - 1 and batch_delay > 0:
-                await asyncio.sleep(batch_delay)
+                except Exception as exc:
+                    # Progress feedback is best-effort: never fail the embedding
+                    # run, but never lose the failure silently either — index
+                    # progress would read as stalled with no trace why.
+                    self.logger.warning(
+                        f"Embedding progress callback failed "
+                        f"(batch {i + 1}/{total_batches}): {exc}",
+                        exc_info=True,
+                    )
 
         self.logger.debug(
             f"Generated {len(all_embeddings)} embeddings using "
@@ -456,7 +234,6 @@ class EmbeddingClient:
         contents: List[Dict[str, Any]],
         *,
         progress_callback=None,
-        request_id: str | None = None,
     ) -> List[List[float]]:
         """Embed provider-agnostic multimodal content items.
 
@@ -469,8 +246,6 @@ class EmbeddingClient:
             raise ValueError(
                 "Configured embedding provider/model does not support multimodal contents."
             )
-
-        import asyncio
 
         spec = EMBEDDING_PROVIDERS.get(self.config.binding)
         provider_max = spec.max_batch_items if spec else 256
@@ -487,90 +262,62 @@ class EmbeddingClient:
                 contents=batch,
                 enable_fusion=False,
             )
-            estimated_tokens = _estimate_content_tokens(batch)
-            lease = self._reserve_quota(estimated_tokens)
-            commercial_quantity = _commercial_content_token_bound(batch)
-            try:
-                commercial_lease = await self._reserve_commercial(
-                    commercial_quantity,
-                    request_id=_batch_request_id(request_id, i),
-                )
-            except BaseException:
-                if lease is not None:
-                    lease.release()
-                raise
-            try:
-                response = await self.adapter.embed(request)
-                validated = validate_embedding_batch(
-                    response.embeddings,
-                    expected_count=len(batch),
-                    binding=self.config.binding,
-                    model=self.config.model,
-                    batch_index=i + 1,
-                    total_batches=total_batches,
-                    start_index=start,
-                )
-            except BaseException:
-                await self._release_leases(lease, commercial_lease)
-                raise
-            await self._finalize_leases(
-                lease,
-                commercial_lease,
-                getattr(response, "usage", None),
-                estimated_tokens=estimated_tokens,
-                commercial_quantity=commercial_quantity,
+            await self._wait_for_request_slot()
+            response = await self.adapter.embed(request)
+            validated = validate_embedding_batch(
+                response.embeddings,
+                expected_count=len(batch),
+                binding=self.config.binding,
+                model=self.config.model,
+                batch_index=i + 1,
+                total_batches=total_batches,
+                start_index=start,
             )
             all_embeddings.extend(validated)
 
             if progress_callback:
                 try:
                     progress_callback(i + 1, total_batches)
-                except Exception:
-                    pass
-
-            if i < total_batches - 1 and self.config.batch_delay > 0:
-                await asyncio.sleep(self.config.batch_delay)
+                except Exception as exc:
+                    # Same contract as embed(): log and continue, so a broken
+                    # progress sink cannot stall multimodal indexing invisibly.
+                    self.logger.warning(
+                        f"Embedding progress callback failed "
+                        f"(batch {i + 1}/{total_batches}): {exc}",
+                        exc_info=True,
+                    )
 
         return all_embeddings
 
-    def embed_sync(
-        self,
-        texts: List[str],
-        *,
-        request_id: str | None = None,
-    ) -> List[List[float]]:
+    def embed_sync(self, texts: List[str]) -> List[List[float]]:
         import asyncio
 
         try:
             asyncio.get_running_loop()
         except RuntimeError:
-            return asyncio.run(self.embed(texts, request_id=request_id))
+            return asyncio.run(self.embed(texts))
 
         import concurrent.futures
 
         with concurrent.futures.ThreadPoolExecutor() as executor:
-            future = executor.submit(asyncio.run, self.embed(texts, request_id=request_id))
+            future = executor.submit(asyncio.run, self.embed(texts))
             return future.result()
 
 
-_SCOPED_CLIENT: ContextVar[tuple[int, EmbeddingClient] | None] = ContextVar(
-    "deeptutor_scoped_embedding_client", default=None
-)
-_CLIENT_EPOCH = 0
+_client: Optional[EmbeddingClient] = None
 
 
 def get_embedding_client(config: Optional[EmbeddingConfig] = None) -> EmbeddingClient:
+    global _client
     resolved_config = config or get_embedding_config()
-    scoped = _SCOPED_CLIENT.get()
-    client = scoped[1] if scoped is not None and scoped[0] == _CLIENT_EPOCH else None
+    client = _client
     if client is None or client.config != resolved_config:
         client = EmbeddingClient(resolved_config)
-        _SCOPED_CLIENT.set((_CLIENT_EPOCH, client))
+        _client = client
+    # Each caller retains its own client even if another worker changes the cache.
     return client
 
 
 def reset_embedding_client() -> None:
-    """Invalidate embedding clients across all async-context-local caches."""
-    global _CLIENT_EPOCH
-    _CLIENT_EPOCH += 1
-    _SCOPED_CLIENT.set(None)
+    global _client
+    _client = None

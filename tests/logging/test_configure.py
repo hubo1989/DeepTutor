@@ -1,7 +1,10 @@
 import importlib
 import json
 import logging
+import os
 from pathlib import Path
+import stat
+import sys
 
 import pytest
 
@@ -19,6 +22,18 @@ def _clean_logging_handlers():
 def _flush_root_handlers() -> None:
     for handler in logging.getLogger().handlers:
         handler.flush()
+
+
+def test_cli_console_logs_can_use_stderr_without_polluting_stdout(monkeypatch, capsys):
+    configure_module = importlib.import_module("deeptutor.logging.configure")
+    monkeypatch.setattr(
+        configure_module, "load_logging_config", lambda: LoggingConfig(file_output=False)
+    )
+    configure_module.configure_logging(force=True, console_stream=sys.stderr)
+    logging.getLogger("deeptutor.tests.cli").info("setup diagnostic")
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "setup diagnostic" in captured.err
 
 
 def test_configure_logging_writes_jsonl_and_respects_level(monkeypatch, tmp_path: Path):
@@ -75,3 +90,26 @@ def test_configure_logging_uses_rotation_settings(monkeypatch, tmp_path: Path):
 
     assert (tmp_path / "deeptutor.jsonl").exists()
     assert (tmp_path / "deeptutor.jsonl.1").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits are not authoritative")
+def test_configure_logging_uses_private_directory_and_file_modes(monkeypatch, tmp_path: Path):
+    configure_module = importlib.import_module("deeptutor.logging.configure")
+    log_dir = tmp_path / "logs"
+    monkeypatch.setattr(
+        configure_module,
+        "load_logging_config",
+        lambda: LoggingConfig(
+            level="INFO",
+            console_output=False,
+            file_output=True,
+            log_dir=str(log_dir),
+            max_bytes=1024,
+            backup_count=1,
+        ),
+    )
+
+    configure_module.configure_logging(force=True)
+
+    assert stat.S_IMODE(log_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE((log_dir / "deeptutor.jsonl").stat().st_mode) == 0o600

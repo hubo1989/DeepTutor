@@ -6,7 +6,10 @@ path service, a user workspace, or an LLM.
 
 from __future__ import annotations
 
+import io
+import json
 from pathlib import Path
+import zipfile
 
 import pytest
 
@@ -16,6 +19,9 @@ from deeptutor.reading import (
     ReadingError,
     ReadingStore,
     Rect,
+    TextPositionSelector,
+    TextQuoteSelector,
+    content_hash,
     export_material,
     parse_locators,
     render_outline,
@@ -29,7 +35,9 @@ from deeptutor.reading.extract import (
     first_line_label,
     split_into_sections,
 )
+from deeptutor.reading.models import parse_text_selectors
 from deeptutor.reading.search import normalise, search_units, terms_of
+from deeptutor.utils.document_images import MAX_INLINE_IMAGE_EDGE
 
 pymupdf = pytest.importorskip("pymupdf")
 
@@ -48,6 +56,70 @@ def _write_pdf(path: Path, pages: list[str], *, toc: list | None = None) -> Path
         doc.set_toc(toc)
     doc.save(path)
     doc.close()
+    return path
+
+
+def _write_epub(path: Path) -> Path:
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("mimetype", "application/epub+zip")
+        archive.writestr(
+            "META-INF/container.xml",
+            """<?xml version="1.0"?><container xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>""",
+        )
+        archive.writestr(
+            "OEBPS/content.opf",
+            """<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0"><manifest><item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/><item id="one" href="chapters/one.xhtml" media-type="application/xhtml+xml"/><item id="two" href="chapters/two.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="one"/><itemref idref="two"/></spine></package>""",
+        )
+        archive.writestr(
+            "OEBPS/nav.xhtml",
+            """<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops"><body><nav epub:type="toc"><ol><li><a href="chapters/one.xhtml">Part One</a><ol><li><a href="chapters/one.xhtml#a1">First Topic</a></li><li><a href="chapters/one.xhtml#a2">Second Topic</a></li><li><a href="chapters/two.xhtml">Second Chapter</a></li></ol></li></ol></nav></body></html>""",
+        )
+        archive.writestr(
+            "OEBPS/chapters/one.xhtml",
+            "<html xmlns='http://www.w3.org/1999/xhtml'><head><title>One</title></head><body><h1>First Chapter</h1><h2 id='a1'>First Topic</h2><p>Alpha source text.</p><h2 id='a2'>Second Topic</h2><script>ignore me</script></body></html>",
+        )
+        archive.writestr(
+            "OEBPS/chapters/two.xhtml",
+            "<html xmlns='http://www.w3.org/1999/xhtml'><body><h1>Second Chapter</h1><p>Beta source text.</p></body></html>",
+        )
+    return path
+
+
+def _write_epub2(path: Path) -> Path:
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("mimetype", "application/epub+zip")
+        archive.writestr(
+            "META-INF/container.xml",
+            """<?xml version="1.0"?><container xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>""",
+        )
+        archive.writestr(
+            "content.opf",
+            """<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="book"><manifest><item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/><item id="chapter" href="chapter.xhtml" media-type="application/xhtml+xml"/></manifest><spine toc="ncx"><itemref idref="chapter"/></spine></package>""",
+        )
+        archive.writestr(
+            "toc.ncx",
+            """<?xml version="1.0"?><ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1"><navMap><navPoint id="chapter"><navLabel><text>Legacy Chapter</text></navLabel><content src="chapter.xhtml"/><navPoint id="section"><navLabel><text>Legacy Section</text></navLabel><content src="chapter.xhtml#legacy-section"/></navPoint></navPoint></navMap></ncx>""",
+        )
+        archive.writestr(
+            "chapter.xhtml",
+            "<html xmlns='http://www.w3.org/1999/xhtml'><body><h1>Legacy Chapter</h1><h2 id='legacy-section'>Legacy Section</h2><p>NCX text.</p></body></html>",
+        )
+    return path
+
+
+def _wrap_epub_for_finder(path: Path) -> Path:
+    """Model the package macOS Finder makes when it compresses an EPUB."""
+    data = path.read_bytes()
+    with zipfile.ZipFile(io.BytesIO(data)) as source:
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, "w") as target:
+            for info in source.infolist():
+                target.writestr(f"MyBook/{info.filename}", source.read(info))
+            target.writestr(
+                "__MACOSX/OEBPS/._one.xhtml",
+                b"\x00\x05\x16\x07" + b"\x00" * 60,
+            )
+    path.write_bytes(output.getvalue())
     return path
 
 
@@ -103,9 +175,23 @@ def test_pdf_outline_drops_bookmarks_pointing_outside_the_page_range(tmp_path: P
     assert all(1 <= e.locator <= len(extraction.units) for e in extraction.outline)
 
 
+def test_pdf_without_bookmarks_does_not_invent_contents(tmp_path: Path) -> None:
+    path = _write_pdf(
+        tmp_path / "plain.pdf",
+        ["Figure 1: this is page content, not a document heading.", "References"],
+    )
+
+    extraction = extract_material(path)
+    assert extraction.outline == ()
+
+    reading_store = ReadingStore(root=tmp_path / "plain-materials")
+    manifest = reading_store.ingest(path)
+    assert reading_store.outline(manifest.material_id) == []
+
+
 def test_text_file_is_cut_into_sections_on_paragraph_boundaries(tmp_path: Path) -> None:
     paragraph = "Dense prose about attention mechanisms. " * 30  # ~1.2k chars
-    path = tmp_path / "notes.md"
+    path = tmp_path / "notes.txt"
     path.write_text("\n\n".join([paragraph] * 8), encoding="utf-8")
 
     extraction = extract_material(path)
@@ -115,6 +201,121 @@ def test_text_file_is_cut_into_sections_on_paragraph_boundaries(tmp_path: Path) 
     assert len(extraction.units) > 1
     # Cuts land on paragraph boundaries, so no unit starts mid-sentence.
     assert all(unit.startswith("Dense prose") for unit in extraction.units)
+
+
+@pytest.mark.parametrize("suffix", [".md", ".markdown"])
+def test_uploaded_markdown_uses_headings_for_stored_outline(
+    store: ReadingStore, tmp_path: Path, suffix: str
+) -> None:
+    prose = "Ordinary prose at a section boundary. " * 95
+    path = tmp_path / f"notes{suffix}"
+    path.write_text(
+        "# Opening\n\nIntroduction.\n\n"
+        "## Long section\n\n" + prose + "\n\n```md\n# Not a heading\n```\n\n"
+        "### Finish\n\nConclusion.",
+        encoding="utf-8",
+    )
+
+    manifest = store.ingest(path)
+    outline = store.outline(manifest.material_id)
+
+    assert manifest.unit == "section"
+    assert [row.title for row in outline] == [
+        "Opening",
+        "Long section",
+        "Long section",
+        "Finish",
+    ]
+    assert [row.level for row in outline] == [1, 2, 2, 3]
+    assert [row.locator for row in outline] == [1, 2, 3, 4]
+    assert all(row.synthesised is False for row in outline)
+    assert all("Ordinary prose" not in row.title for row in outline)
+    assert all(len(store.unit_text(manifest.material_id, row.locator)) <= 4200 for row in outline)
+    assert "# Not a heading" in "\n".join(
+        store.unit_text(manifest.material_id, row.locator) for row in outline
+    )
+
+
+@pytest.mark.parametrize("markdown", ["No headings.\n\nMore prose.", "# Only\n\nMore prose."])
+def test_uploaded_markdown_with_fewer_than_two_headings_keeps_flat_fallback(
+    store: ReadingStore, tmp_path: Path, markdown: str
+) -> None:
+    path = tmp_path / "flat.md"
+    path.write_text(markdown, encoding="utf-8")
+
+    extraction = extract_material(path)
+    manifest = store.ingest(path)
+
+    assert extraction.units == split_into_sections(markdown)
+    assert extraction.outline == ()
+    assert all(row.synthesised is True for row in store.outline(manifest.material_id))
+
+
+def test_epub_preserves_spine_units_source_hrefs_and_nested_outline(tmp_path: Path) -> None:
+    extraction = extract_material(_write_epub(tmp_path / "book.epub"))
+
+    assert extraction.render_mode == "epub"
+    assert extraction.has_raw_view is False
+    assert extraction.unit == "chapter"
+    assert extraction.units == (
+        "First Chapter\nFirst Topic\nAlpha source text.\nSecond Topic",
+        "Second Chapter\nBeta source text.",
+    )
+    assert [ref.source_href for ref in extraction.unit_refs] == [
+        "OEBPS/chapters/one.xhtml",
+        "OEBPS/chapters/two.xhtml",
+    ]
+    assert [
+        (
+            row.locator,
+            row.title,
+            row.level,
+            row.source_href,
+            row.source_anchor,
+        )
+        for row in extraction.outline
+    ] == [
+        (1, "Part One", 1, "OEBPS/chapters/one.xhtml", ""),
+        (1, "First Topic", 2, "OEBPS/chapters/one.xhtml", "a1"),
+        (1, "Second Topic", 2, "OEBPS/chapters/one.xhtml", "a2"),
+        (2, "Second Chapter", 2, "OEBPS/chapters/two.xhtml", ""),
+    ]
+
+
+def test_epub2_ncx_preserves_heading_anchors(tmp_path: Path) -> None:
+    extraction = extract_material(_write_epub2(tmp_path / "legacy.epub"))
+
+    assert [
+        (row.locator, row.title, row.level, row.source_href, row.source_anchor)
+        for row in extraction.outline
+    ] == [
+        (1, "Legacy Chapter", 1, "chapter.xhtml", ""),
+        (1, "Legacy Section", 2, "chapter.xhtml", "legacy-section"),
+    ]
+
+
+def test_existing_epub_outline_is_upgraded_with_source_anchors(
+    store: ReadingStore, tmp_path: Path
+) -> None:
+    manifest = store.ingest(_write_epub(tmp_path / "book.epub"))
+    outline_path = store.root / manifest.source_hash / "outline.json"
+    legacy_rows = [
+        {
+            "locator": row.locator,
+            "title": row.title,
+            "level": row.level,
+            "synthesised": row.synthesised,
+        }
+        for row in store.outline(manifest.material_id)
+    ]
+    outline_path.write_text(json.dumps(legacy_rows), encoding="utf-8")
+
+    upgraded = store.outline(manifest.material_id)
+
+    assert upgraded[1].source_href == "OEBPS/chapters/one.xhtml"
+    assert upgraded[1].source_anchor == "a1"
+    assert upgraded[2].source_anchor == "a2"
+    assert all("source_anchor" in row for row in json.loads(outline_path.read_text()))
 
 
 def test_pptx_slides_become_units_when_the_extractor_marks_them(tmp_path: Path) -> None:
@@ -135,6 +336,55 @@ def test_pptx_slides_become_units_when_the_extractor_marks_them(tmp_path: Path) 
     assert extraction.unit == "slide"
     assert len(extraction.units) == 2
     assert "First slide body" in extraction.units[0]
+
+
+def _large_noise_jpeg(size: tuple[int, int] = (2000, 1200)) -> bytes:
+    """A noisy JPEG past the inline long-edge bound, well inside byte budgets."""
+    import random
+
+    from PIL import Image as PILImage
+
+    raw = random.Random(9).randbytes(size[0] * size[1] * 3)
+    buf = io.BytesIO()
+    PILImage.frombytes("RGB", size, raw).save(buf, format="JPEG", quality=95)
+    return buf.getvalue()
+
+
+@pytest.mark.parametrize("suffix", ["docx", "pptx"])
+def test_office_reading_media_keeps_source_resolution(tmp_path: Path, suffix: str) -> None:
+    """Reader-pane media is stored whole; the inline transport bound is for chat.
+
+    Both Office ingests used the chat-attachment budget by default, so a bound
+    meant for images that are base64-inlined into one request would have shrunk
+    what the reader pane displays.
+    """
+    from PIL import Image as PILImage
+
+    image = _large_noise_jpeg()
+    path = tmp_path / f"material.{suffix}"
+    if suffix == "docx":
+        from docx import Document as DocxDocument
+
+        doc = DocxDocument()
+        doc.add_paragraph("A picture follows.")
+        doc.add_picture(io.BytesIO(image))
+        doc.save(str(path))
+    else:
+        from pptx import Presentation
+        from pptx.util import Inches
+
+        prs = Presentation()
+        slide = prs.slides.add_slide(prs.slide_layouts[5])
+        slide.shapes.add_picture(io.BytesIO(image), Inches(1), Inches(1), Inches(4), Inches(3))
+        prs.save(str(path))
+
+    extraction = extract_material(path)
+
+    assert extraction.media, "the embedded picture should become locator media"
+    stored = extraction.media[0].data
+    assert stored == image, "reading media is kept byte-for-byte"
+    with PILImage.open(io.BytesIO(stored)) as whole:
+        assert max(whole.size) > MAX_INLINE_IMAGE_EDGE
 
 
 def test_empty_and_unreadable_sources_raise_reading_error(tmp_path: Path) -> None:
@@ -179,6 +429,187 @@ def test_ingest_writes_units_raw_and_manifest(store: ReadingStore, pdf_path: Pat
     assert store.unit_text(manifest.material_id, 2).find("scaled dot-product") >= 0
     raw = store.raw_path(manifest.material_id)
     assert raw is not None and raw.read_bytes()[:5] == b"%PDF-"
+
+
+def test_epub_store_keeps_original_but_legacy_pdf_flag_stays_false(
+    store: ReadingStore, tmp_path: Path
+) -> None:
+    path = _write_epub(tmp_path / "book.epub")
+    manifest = store.ingest(path)
+
+    assert manifest.render_mode == "epub"
+    assert manifest.has_raw_view is False
+    assert store.raw_path(manifest.material_id) is not None
+    assert store.unit_references(manifest.material_id)[1].source_href.endswith("two.xhtml")
+
+
+def test_epub_store_normalizes_finder_packages_for_browser_readers(
+    store: ReadingStore, tmp_path: Path
+) -> None:
+    path = _wrap_epub_for_finder(_write_epub(tmp_path / "book.epub"))
+
+    manifest = store.ingest(path)
+
+    raw = store.raw_path(manifest.material_id)
+    render = store.render_path(manifest.material_id)
+    assert raw is not None and render is not None
+    assert raw.read_bytes() == path.read_bytes()
+    normalized = render.read_bytes()
+    assert manifest.byte_size == len(path.read_bytes())
+    assert manifest.source_hash == content_hash(path.read_bytes())
+    assert store.ingest(path).material_id == manifest.material_id
+    assert [ref.source_href for ref in store.unit_references(manifest.material_id)] == [
+        "OEBPS/chapters/one.xhtml",
+        "OEBPS/chapters/two.xhtml",
+    ]
+    with zipfile.ZipFile(io.BytesIO(normalized)) as archive:
+        infos = archive.infolist()
+        assert archive.read("mimetype") == b"application/epub+zip"
+    assert infos[0].filename == "mimetype"
+    assert infos[0].compress_type == zipfile.ZIP_STORED
+    assert all(
+        "__MACOSX" not in info.filename and not info.filename.startswith("MyBook/")
+        for info in infos
+    )
+
+
+def test_position_round_trip_validates_locator_and_anchor(
+    store: ReadingStore, tmp_path: Path
+) -> None:
+    from deeptutor.reading import ReadingPosition
+
+    manifest = store.ingest(_write_epub(tmp_path / "book.epub"))
+    saved = store.save_position(
+        manifest.material_id,
+        ReadingPosition(locator=2, source_anchor="epubcfi(/6/4)", percentage=0.6),
+    )
+
+    assert saved.updated_at > 0
+    assert store.position(manifest.material_id).source_anchor == "epubcfi(/6/4)"
+    with pytest.raises(ReadingError):
+        store.save_position(manifest.material_id, ReadingPosition(locator=99))
+
+
+def test_bookmarks_are_plural_deliberate_and_deduplicated_by_locator(
+    store: ReadingStore, tmp_path: Path
+) -> None:
+    """Unlike the position, these are chosen — several of them, by id."""
+    manifest = store.ingest(_write_epub(tmp_path / "book.epub"))
+    material_id = manifest.material_id
+
+    assert store.bookmarks(material_id) == []
+
+    second = store.add_bookmark(material_id, 2, "the good bit")
+    first = store.add_bookmark(material_id, 1)
+
+    assert second.label == "the good bit"
+    # Saving a place must not force the reader to name it first.
+    assert first.label == ""
+    assert first.bookmark_id != second.bookmark_id
+
+    # Reading order, not insertion order: the list is an index, not a log.
+    assert [row.locator for row in store.bookmarks(material_id)] == [1, 2]
+
+    # The affordance is a toggle on the reader's toolbar, so "bookmark this
+    # page" when the page is already bookmarked is the existing bookmark —
+    # not a second identical row.
+    again = store.add_bookmark(material_id, 2, "ignored")
+    assert again.bookmark_id == second.bookmark_id
+    assert again.label == "the good bit"
+    assert len(store.bookmarks(material_id)) == 2
+
+    with pytest.raises(ReadingError):
+        store.add_bookmark(material_id, 99)
+
+    assert store.delete_bookmark(material_id, second.bookmark_id) is True
+    assert store.delete_bookmark(material_id, second.bookmark_id) is False
+    assert [row.locator for row in store.bookmarks(material_id)] == [1]
+
+
+def test_bookmarks_survive_a_compatible_reingest(store: ReadingStore, tmp_path: Path) -> None:
+    """A bookmark is a place the reader chose, so a repair keeps it.
+
+    The automatic viewport is allowed to reset when the spine changes under
+    it; a deliberately-kept place is user-owned state like an annotation.
+    """
+    source = _write_epub(tmp_path / "book.epub")
+    manifest = store.ingest(source)
+    kept = store.add_bookmark(manifest.material_id, 2, "chapter two")
+
+    reingested = store.ingest(source)
+
+    rows = store.bookmarks(reingested.material_id)
+    assert [row.bookmark_id for row in rows] == [kept.bookmark_id]
+    assert rows[0].label == "chapter two"
+
+
+def _downgrade_epub_manifest_to_legacy_text(store: ReadingStore, material_id: str) -> None:
+    material_dir = store.root / material_id
+    manifest_path = material_dir / "manifest.json"
+    data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    data.pop("render_mode", None)
+    data["has_raw_view"] = False
+    manifest_path.write_text(json.dumps(data), encoding="utf-8")
+    raw_dir = material_dir / "raw"
+    if raw_dir.exists():
+        for child in raw_dir.iterdir():
+            child.unlink()
+        raw_dir.rmdir()
+
+
+def test_reupload_upgrades_legacy_epub_when_it_has_no_annotations(
+    store: ReadingStore, tmp_path: Path
+) -> None:
+    path = _write_epub(tmp_path / "book.epub")
+    first = store.ingest(path)
+    _downgrade_epub_manifest_to_legacy_text(store, first.material_id)
+
+    upgraded = store.ingest(path)
+
+    assert upgraded.render_mode == "epub"
+    assert store.raw_path(upgraded.material_id) is not None
+
+
+def test_legacy_epub_upgrade_discards_out_of_range_position(
+    store: ReadingStore, tmp_path: Path
+) -> None:
+    from deeptutor.reading import ReadingPosition
+
+    path = _write_epub(tmp_path / "book.epub")
+    first = store.ingest(path)
+    # Emulate a legacy text extraction with more units than the EPUB spine.
+    material_dir = store.root / first.material_id
+    manifest_path = material_dir / "manifest.json"
+    data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    data["unit_count"] = 3
+    manifest_path.write_text(json.dumps(data), encoding="utf-8")
+    (material_dir / "units" / "0003.txt").write_text("Legacy split", encoding="utf-8")
+    store.save_position(
+        first.material_id, ReadingPosition(locator=3, source_anchor="old-text-anchor")
+    )
+    _downgrade_epub_manifest_to_legacy_text(store, first.material_id)
+
+    upgraded = store.ingest(path)
+
+    assert upgraded.unit_count == 2
+    assert store.position(upgraded.material_id).locator == 1
+    assert store.position(upgraded.material_id).source_anchor == ""
+
+
+def test_reupload_rejects_legacy_epub_upgrade_with_annotations(
+    store: ReadingStore, tmp_path: Path
+) -> None:
+    from deeptutor.reading import ReadingUpgradeConflict
+
+    path = _write_epub(tmp_path / "book.epub")
+    first = store.ingest(path)
+    store.save_annotation(first.material_id, Annotation(annotation_id="", locator=1, quote="Alpha"))
+    _downgrade_epub_manifest_to_legacy_text(store, first.material_id)
+
+    with pytest.raises(ReadingUpgradeConflict):
+        store.ingest(path)
+
+    assert [row.quote for row in store.annotations(first.material_id)] == ["Alpha"]
 
 
 def test_reingesting_the_same_bytes_reuses_the_material_and_its_annotations(
@@ -276,9 +707,145 @@ def test_annotations_round_trip_with_generated_ids(store: ReadingStore, pdf_path
     )
 
     assert saved.annotation_id
+    assert saved.material_revision == manifest.revision
     stored = store.annotations(manifest.material_id)
     assert len(stored) == 1
     assert stored[0].rects[0].to_list() == [0.1, 0.2, 0.5, 0.25]
+
+
+def test_w3c_text_selectors_round_trip_and_can_supply_the_quote(
+    store: ReadingStore, pdf_path: Path
+) -> None:
+    manifest = store.ingest(pdf_path)
+    unit_text = store.unit_text(manifest.material_id, 1)
+    start = unit_text.index("Introduction")
+
+    saved = store.save_annotation(
+        manifest.material_id,
+        Annotation(
+            annotation_id="",
+            locator=1,
+            selectors=(
+                TextQuoteSelector(exact="Introduction", suffix=" to sequence"),
+                TextPositionSelector(start=start, end=start + 12),
+            ),
+        ),
+    )
+
+    assert saved.quote == "Introduction"
+    assert [
+        selector.to_dict() for selector in store.annotations(manifest.material_id)[0].selectors
+    ] == [
+        {
+            "type": "TextQuoteSelector",
+            "exact": "Introduction",
+            "suffix": " to sequence",
+        },
+        {"type": "TextPositionSelector", "start": start, "end": start + 12},
+    ]
+
+
+def test_mismatched_quote_and_text_quote_selector_are_rejected(
+    store: ReadingStore, pdf_path: Path
+) -> None:
+    manifest = store.ingest(pdf_path)
+
+    with pytest.raises(ReadingError, match="does not match"):
+        store.save_annotation(
+            manifest.material_id,
+            Annotation(
+                annotation_id="",
+                locator=1,
+                quote="Introduction",
+                selectors=(TextQuoteSelector(exact="different text"),),
+            ),
+        )
+
+
+def test_text_quote_selector_must_occur_in_stored_unit(store: ReadingStore, pdf_path: Path) -> None:
+    manifest = store.ingest(pdf_path)
+
+    with pytest.raises(ReadingError, match="does not occur"):
+        store.save_annotation(
+            manifest.material_id,
+            Annotation(
+                annotation_id="",
+                locator=1,
+                selectors=(TextQuoteSelector(exact="not in this unit"),),
+            ),
+        )
+
+
+def test_text_position_selector_cannot_extend_past_stored_unit(
+    store: ReadingStore, pdf_path: Path
+) -> None:
+    manifest = store.ingest(pdf_path)
+    unit_length = len(store.unit_text(manifest.material_id, 1))
+
+    with pytest.raises(ReadingError, match="extends past"):
+        store.save_annotation(
+            manifest.material_id,
+            Annotation(
+                annotation_id="",
+                locator=1,
+                selectors=(TextPositionSelector(start=0, end=unit_length + 1),),
+            ),
+        )
+
+
+def test_legacy_selector_parser_keeps_prefix_tail_nearest_the_quote() -> None:
+    parsed = parse_text_selectors(
+        [
+            {
+                "type": "TextQuoteSelector",
+                "exact": "text",
+                "prefix": "a" * 200 + "b" * 200,
+            }
+        ]
+    )
+
+    assert isinstance(parsed[0], TextQuoteSelector)
+    assert parsed[0].prefix == "b" * 128
+
+
+def test_selector_whitespace_is_canonicalised_to_stored_unit(
+    store: ReadingStore, pdf_path: Path
+) -> None:
+    manifest = store.ingest(pdf_path)
+    unit_path = store.root / manifest.material_id / "units" / "0001.txt"
+    unit_path.write_text("Before Sequence\n\nmodels after", encoding="utf-8")
+
+    saved = store.save_annotation(
+        manifest.material_id,
+        Annotation(
+            annotation_id="",
+            locator=1,
+            quote="Sequence models",
+            selectors=(TextQuoteSelector(exact="Sequence models", prefix="Before"),),
+        ),
+    )
+
+    assert saved.quote == "Sequence\n\nmodels"
+    assert saved.selectors[0].to_dict()["exact"] == "Sequence\n\nmodels"
+
+
+def test_quote_and_position_selectors_must_identify_the_same_text(
+    store: ReadingStore, pdf_path: Path
+) -> None:
+    manifest = store.ingest(pdf_path)
+
+    with pytest.raises(ReadingError, match="different text"):
+        store.save_annotation(
+            manifest.material_id,
+            Annotation(
+                annotation_id="",
+                locator=1,
+                selectors=(
+                    TextQuoteSelector(exact="Introduction"),
+                    TextPositionSelector(start=0, end=7),
+                ),
+            ),
+        )
 
 
 def test_saving_the_same_id_updates_in_place_and_keeps_created_at(
@@ -590,6 +1157,24 @@ def test_markdown_export_lists_marks_in_locator_order(store: ReadingStore, pdf_p
     assert "first" in text
 
 
+def test_markdown_export_labels_saved_citations(store: ReadingStore, pdf_path: Path) -> None:
+    manifest = store.ingest(pdf_path)
+    store.save_annotation(
+        manifest.material_id,
+        Annotation(
+            annotation_id="",
+            locator=1,
+            kind="citation",
+            quote="Introduction",
+        ),
+    )
+
+    text = export_material(store, manifest.material_id, fmt="markdown").data.decode("utf-8")
+
+    assert "**Citation**" in text
+    assert "> Introduction" in text
+
+
 def test_markdown_export_handles_a_material_with_no_annotations(
     store: ReadingStore, tmp_path: Path
 ) -> None:
@@ -623,3 +1208,49 @@ def test_pdf_export_is_refused_for_a_text_only_material(
 
     with pytest.raises(ReadingError):
         export_material(store, manifest.material_id, fmt="pdf")
+
+
+def test_state_written_before_the_split_is_still_read(store: ReadingStore, pdf_path: Path) -> None:
+    """Annotations and viewports predate per-material state directories.
+
+    They live beside the content as `annotations.json` / `position.json`, keyed
+    by a material id that equalled the content hash. Those files must keep
+    resolving, or every annotation a user made before the split disappears.
+    """
+    manifest = store.ingest(pdf_path)
+    material_dir = store.root / manifest.material_id
+    legacy_annotation = {
+        "annotation_id": "legacy-1",
+        "locator": 2,
+        "quote": "scaled dot-product",
+        "note": "written by the old reader",
+        "color": "yellow",
+        "kind": "highlight",
+    }
+    (material_dir / "annotations.json").write_text(
+        json.dumps([legacy_annotation]), encoding="utf-8"
+    )
+    (material_dir / "position.json").write_text(
+        json.dumps({"locator": 3, "source_anchor": "", "percentage": 0.0}),
+        encoding="utf-8",
+    )
+
+    assert [row.note for row in store.annotations(manifest.material_id)] == [
+        "written by the old reader"
+    ]
+    assert store.position(manifest.material_id).locator == 3
+
+    # A write moves the material onto the per-material path without losing the
+    # rows that were only in the legacy file.
+    store.save_annotation(
+        manifest.material_id,
+        Annotation(
+            annotation_id="new-1",
+            locator=1,
+            quote="sequence models",
+            note="written after the split",
+        ),
+    )
+
+    notes = sorted(row.note for row in store.annotations(manifest.material_id))
+    assert notes == ["written after the split", "written by the old reader"]

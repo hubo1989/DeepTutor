@@ -17,6 +17,9 @@ import json_repair
 
 from deeptutor.services.llm.provider_core.base import LLMProvider, LLMResponse, ToolCallRequest
 from deeptutor.services.provider_registry import ANTHROPIC_EFFORT_BASED_FAMILIES
+from deeptutor.services.session.provider_response_state import (
+    normalize_provider_response_state,
+)
 
 _ALNUM = string.ascii_letters + string.digits
 
@@ -155,11 +158,30 @@ class AnthropicProvider(LLMProvider):
         return block
 
     @staticmethod
+    def _replayable_thinking_blocks(msg: dict[str, Any]) -> list[dict[str, Any]]:
+        """The signed thinking blocks to replay for this assistant turn.
+
+        A round still inside the current turn's working set carries them on the
+        message itself. A round rebuilt from history carries them in the
+        provider-private state instead, which is where they are persisted —
+        so read that as the fallback, through the same validation used to
+        store it.
+        """
+        direct = msg.get("thinking_blocks")
+        if isinstance(direct, list) and direct:
+            return direct
+        state = normalize_provider_response_state(msg.get("_provider_response_state"))
+        if state is None:
+            return []
+        blocks = state.get("thinking_blocks")
+        return blocks if isinstance(blocks, list) else []
+
+    @staticmethod
     def _assistant_blocks(msg: dict[str, Any]) -> list[dict[str, Any]]:
         blocks: list[dict[str, Any]] = []
         content = msg.get("content")
 
-        for tb in msg.get("thinking_blocks") or []:
+        for tb in AnthropicProvider._replayable_thinking_blocks(msg):
             if isinstance(tb, dict) and tb.get("type") == "thinking":
                 blocks.append(
                     {
@@ -318,19 +340,23 @@ class AnthropicProvider(LLMProvider):
             budget -= 1
 
         new_msgs = list(messages)
-        if len(new_msgs) >= 3:
-            m = new_msgs[-2]
+        if new_msgs:
+            m = new_msgs[-1]
             c = m.get("content")
-            if isinstance(c, str):
-                new_msgs[-2] = {
+            if isinstance(c, str) and c:
+                new_msgs[-1] = {
                     **m,
                     "content": [{"type": "text", "text": c, "cache_control": marker}],
                 }
                 budget -= 1
-            elif isinstance(c, list) and c:
+            elif (
+                isinstance(c, list)
+                and c
+                and c[-1].get("type") not in {"thinking", "redacted_thinking"}
+            ):
                 nc = list(c)
                 nc[-1] = {**nc[-1], "cache_control": marker}
-                new_msgs[-2] = {**m, "content": nc}
+                new_msgs[-1] = {**m, "content": nc}
                 budget -= 1
 
         new_tools = tools
@@ -400,9 +426,9 @@ class AnthropicProvider(LLMProvider):
             budget = budget_map.get(effort, 4096)
             kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
             kwargs["max_tokens"] = max(max_tokens, budget + 4096)
-            kwargs["temperature"] = 1.0
+            kwargs.setdefault("extra_body", {})["temperature"] = 1.0
         elif not effort_based:
-            kwargs["temperature"] = temperature
+            kwargs.setdefault("extra_body", {})["temperature"] = temperature
 
         if anthropic_tools:
             kwargs["tools"] = anthropic_tools
@@ -456,6 +482,8 @@ class AnthropicProvider(LLMProvider):
             total_prompt = input_tokens + cache_creation + cache_read
             usage = {
                 "prompt_tokens": total_prompt,
+                "cache_read_input_tokens": cache_read,
+                "cache_creation_input_tokens": cache_creation,
                 "completion_tokens": response.usage.output_tokens,
                 "total_tokens": total_prompt + response.usage.output_tokens,
             }
@@ -465,6 +493,14 @@ class AnthropicProvider(LLMProvider):
             tool_calls=tool_calls,
             finish_reason=finish_reason,
             usage=usage,
+            # ``thinking_blocks`` keeps the signed blocks this provider needs
+            # to replay; ``reasoning_content`` is the plain text every
+            # provider-agnostic consumer reads, including the trace. Without
+            # it a non-streaming call reported no reasoning at all.
+            reasoning_content="\n".join(
+                str(block.get("thinking") or "") for block in thinking_blocks
+            ).strip()
+            or None,
             thinking_blocks=thinking_blocks or None,
         )
 
@@ -529,17 +565,34 @@ class AnthropicProvider(LLMProvider):
         idle_timeout_s = 90
         try:
             async with self._client.messages.stream(**kwargs) as stream:
-                if on_content_delta:
-                    stream_iter = stream.text_stream.__aiter__()
+                if on_content_delta or on_reasoning_delta:
+                    # Iterate the raw event stream rather than ``text_stream``.
+                    # ``text_stream`` yields text blocks only, so an extended
+                    # thinking model streamed its answer here while its
+                    # reasoning — the part a reader most wants to watch arrive —
+                    # was silently dropped, and ``on_reasoning_delta`` went
+                    # unused despite being accepted.
+                    stream_iter = stream.__aiter__()
                     while True:
                         try:
-                            text = await asyncio.wait_for(
+                            event = await asyncio.wait_for(
                                 stream_iter.__anext__(),
                                 timeout=idle_timeout_s,
                             )
                         except StopAsyncIteration:
                             break
-                        await on_content_delta(text)
+                        if getattr(event, "type", "") != "content_block_delta":
+                            continue
+                        delta = getattr(event, "delta", None)
+                        delta_type = str(getattr(delta, "type", "") or "")
+                        if delta_type == "text_delta" and on_content_delta:
+                            text = str(getattr(delta, "text", "") or "")
+                            if text:
+                                await on_content_delta(text)
+                        elif delta_type == "thinking_delta" and on_reasoning_delta:
+                            thinking = str(getattr(delta, "thinking", "") or "")
+                            if thinking:
+                                await on_reasoning_delta(thinking)
                 response = await asyncio.wait_for(
                     stream.get_final_message(),
                     timeout=idle_timeout_s,

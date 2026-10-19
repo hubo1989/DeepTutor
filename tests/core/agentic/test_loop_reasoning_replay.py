@@ -20,9 +20,9 @@ from typing import Any
 
 import pytest
 
-from deeptutor.core.agentic.loop import LabelProtocol, run_agentic_loop
-from deeptutor.core.agentic.tool_dispatch import DispatchOutcome
-from deeptutor.core.stream_bus import StreamBus
+from deeptutor.runtime.agentic.loop import LabelProtocol, run_agentic_loop
+from deeptutor.runtime.agentic.tool_dispatch import DispatchOutcome
+from deeptutor.runtime.stream_bus import StreamBus
 
 
 def _content_chunk(content: str) -> SimpleNamespace:
@@ -232,6 +232,21 @@ async def test_a_repair_round_replays_its_reasoning() -> None:
 
     second_request = _assistant_messages(client.calls[1])
     assert second_request[0]["reasoning_content"] == "Forgot the label."
+
+
+@pytest.mark.asyncio
+async def test_a_reasoning_only_repair_round_replays_its_reasoning() -> None:
+    client = await _run(
+        [
+            [_reasoning_chunk("The answer needs a label.")],
+            [_content_chunk("``FINISH``\ndone")],
+        ]
+    )
+
+    second_request = _assistant_messages(client.calls[1])
+    assert len(second_request) == 1
+    assert second_request[0]["content"] == ""
+    assert second_request[0]["reasoning_content"] == "The answer needs a label."
 
 
 @pytest.mark.asyncio

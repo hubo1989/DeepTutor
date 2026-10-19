@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-import contextvars
+import asyncio
+import logging
+import threading
 from typing import Any
 
 import pytest
@@ -74,6 +76,129 @@ async def test_embedding_client_batches_requests(monkeypatch) -> None:
     assert len(adapter.calls[0].texts) == 2
     assert len(adapter.calls[1].texts) == 1
     assert adapter.config["dimensions"] == 8
+
+
+@pytest.mark.asyncio
+async def test_embedding_client_overlaps_calls_when_batch_delay_is_zero(
+    monkeypatch,
+) -> None:
+    class _NonBlockingOnlyLock:
+        def __init__(self) -> None:
+            self._lock = threading.Lock()
+
+        def acquire(self, blocking: bool = True) -> bool:
+            if blocking:
+                raise AssertionError("embedding spacing lock must not block the event loop")
+            return self._lock.acquire(blocking=False)
+
+        def release(self) -> None:
+            self._lock.release()
+
+    class _ConcurrentAdapter(_FakeAdapter):
+        in_flight = 0
+        max_in_flight = 0
+
+        async def embed(self, request):
+            type(self).in_flight += 1
+            type(self).max_in_flight = max(type(self).max_in_flight, type(self).in_flight)
+            try:
+                await asyncio.sleep(0.02)
+                return await super().embed(request)
+            finally:
+                type(self).in_flight -= 1
+
+    _FakeAdapter.instances = []
+    monkeypatch.setattr(
+        "deeptutor.services.embedding.client._resolve_adapter_class",
+        lambda _b: _ConcurrentAdapter,
+    )
+    monkeypatch.setattr(EmbeddingClient, "_spacing_lock", _NonBlockingOnlyLock())
+    monkeypatch.setattr(EmbeddingClient, "_last_request_monotonic", 0.0)
+    _ConcurrentAdapter.in_flight = 0
+    _ConcurrentAdapter.max_in_flight = 0
+    client = EmbeddingClient(_build_config("openai"))
+
+    heartbeat = asyncio.Event()
+
+    async def mark_loop_responsive() -> None:
+        await asyncio.sleep(0)
+        heartbeat.set()
+
+    first, second, _ = await asyncio.wait_for(
+        asyncio.gather(
+            client.embed(["first"]),
+            client.embed(["second"]),
+            mark_loop_responsive(),
+        ),
+        timeout=1.0,
+    )
+
+    assert heartbeat.is_set()
+    assert len(first) == len(second) == 1
+    # batch_delay is 0, so the spacing lock must not serialize the HTTP calls.
+    assert _ConcurrentAdapter.max_in_flight == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("multimodal", [False, True])
+async def test_embedding_requests_are_spaced_but_http_can_overlap(monkeypatch, multimodal):
+    from time import monotonic
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    starts = []
+
+    class Adapter(_FakeAdapter):
+        def get_model_info(self):
+            return {"multimodal": True}
+
+        async def embed(self, request):
+            starts.append(monotonic())
+            if len(starts) == 2:
+                entered.set()
+            await release.wait()
+            items = request.contents or request.texts
+            return type("Resp", (), {"embeddings": [[0.1, 0.2] for _ in items]})()
+
+    monkeypatch.setattr(
+        "deeptutor.services.embedding.client._resolve_adapter_class", lambda _: Adapter
+    )
+    monkeypatch.setattr(EmbeddingClient, "_spacing_lock", None)
+    monkeypatch.setattr(EmbeddingClient, "_last_request_monotonic", 0.0)
+    config = _build_config("openai")
+    config.batch_delay = 0.02
+    first_client = EmbeddingClient(config)
+    second_client = EmbeddingClient(config)
+    first = asyncio.create_task(first_client.embed(["text"]))
+    second = asyncio.create_task(
+        second_client.embed_contents([{"image": "data:image/png;base64,test"}])
+        if multimodal
+        else second_client.embed(["other"])
+    )
+    try:
+        # Both requests must start before either HTTP response is released.
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        assert starts[1] - starts[0] >= config.batch_delay
+    finally:
+        release.set()
+        await asyncio.gather(first, second)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_spacing_wait_releases_cross_thread_lock(monkeypatch):
+    from time import monotonic
+
+    monkeypatch.setattr(EmbeddingClient, "_spacing_lock", threading.Lock())
+    monkeypatch.setattr(EmbeddingClient, "_last_request_monotonic", monotonic())
+    client = EmbeddingClient(_build_config("openai"))
+    client.config.batch_delay = 60
+    waiting = asyncio.create_task(client._wait_for_request_slot())
+    await asyncio.sleep(0)
+    assert EmbeddingClient._spacing_lock.locked()
+    waiting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiting
+    assert not EmbeddingClient._spacing_lock.locked()
 
 
 @pytest.mark.asyncio
@@ -259,26 +384,6 @@ def test_get_embedding_client_refreshes_when_config_changes(monkeypatch) -> None
     reset_embedding_client()
 
 
-def test_reset_embedding_client_invalidates_other_contexts(monkeypatch) -> None:
-    from deeptutor.services.embedding import client as client_module
-
-    _FakeAdapter.instances = []
-    config = _build_config("openai")
-    monkeypatch.setattr(client_module, "_resolve_adapter_class", lambda _binding: _FakeAdapter)
-    monkeypatch.setattr(client_module, "get_embedding_config", lambda: config)
-
-    reset_embedding_client()
-    original = get_embedding_client()
-    copied_context = contextvars.copy_context()
-    assert copied_context.run(get_embedding_client) is original
-
-    reset_embedding_client()
-    refreshed = copied_context.run(get_embedding_client)
-
-    assert refreshed is not original
-    reset_embedding_client()
-
-
 @pytest.mark.parametrize("flag", [True, False, None])
 def test_embedding_client_propagates_send_dimensions_to_adapter(
     monkeypatch, flag: bool | None
@@ -327,3 +432,99 @@ def test_embedding_client_multimodal_detection_uses_model_level_metadata() -> No
     assert text_model.supports_multimodal_contents() is False
     assert vision_model.supports_multimodal_contents() is True
     assert cohere_v3.supports_multimodal_contents() is False
+
+
+@pytest.mark.asyncio
+async def test_embed_progress_callback_failure_logged_and_not_fatal(monkeypatch, caplog) -> None:
+    """A failing progress callback must not break embedding, but the failure
+    cannot stay silent — swallowed errors make KB index progress untrustworthy."""
+
+    def _broken_callback(completed: int, total: int) -> None:
+        raise RuntimeError("progress sink offline")
+
+    _FakeAdapter.instances = []
+    monkeypatch.setattr(
+        "deeptutor.services.embedding.client._resolve_adapter_class", lambda _b: _FakeAdapter
+    )
+    client = EmbeddingClient(_build_config("openai"))
+
+    with caplog.at_level(logging.WARNING, logger="deeptutor.services.embedding.client"):
+        vectors = await client.embed(["a", "b", "c"], progress_callback=_broken_callback)
+
+    assert len(vectors) == 3
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("progress callback" in r.getMessage() for r in warnings)
+    assert any("progress sink offline" in r.getMessage() for r in warnings)
+
+
+@pytest.mark.asyncio
+async def test_embed_contents_progress_callback_failure_logged_and_not_fatal(
+    monkeypatch, caplog
+) -> None:
+    class _MultimodalAdapter(_FakeAdapter):
+        def get_model_info(self):
+            return {"multimodal": True}
+
+        async def embed(self, request):
+            self.calls.append(request)
+            items = request.contents or [{"text": t} for t in request.texts]
+            return type(
+                "Resp",
+                (),
+                {"embeddings": [[float(i)] * 2 for i, _ in enumerate(items)]},
+            )()
+
+    def _broken_callback(completed: int, total: int) -> None:
+        raise RuntimeError("progress sink offline")
+
+    _FakeAdapter.instances = []
+    monkeypatch.setattr(
+        "deeptutor.services.embedding.client._resolve_adapter_class",
+        lambda _b: _MultimodalAdapter,
+    )
+    client = EmbeddingClient(_build_config("openai"))
+
+    with caplog.at_level(logging.WARNING, logger="deeptutor.services.embedding.client"):
+        vectors = await client.embed_contents(
+            [{"text": "a"}, {"text": "b"}, {"text": "c"}],
+            progress_callback=_broken_callback,
+        )
+
+    assert len(vectors) == 3
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("progress callback" in r.getMessage() for r in warnings)
+    assert any("progress sink offline" in r.getMessage() for r in warnings)
+
+
+def test_embedding_spacing_shared_across_thread_event_loops(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from time import monotonic
+
+    starts = []
+    requests_started = threading.Event()
+    starts_guard = threading.Lock()
+
+    class Adapter(_FakeAdapter):
+        async def embed(self, request):
+            with starts_guard:
+                starts.append(monotonic())
+                if len(starts) == 2:
+                    requests_started.set()
+            deadline = monotonic() + 2
+            while not requests_started.is_set():
+                assert monotonic() < deadline, "HTTP calls serialized across thread loops"
+                await asyncio.sleep(0.005)
+            return await super().embed(request)
+
+    monkeypatch.setattr(
+        "deeptutor.services.embedding.client._resolve_adapter_class", lambda _: Adapter
+    )
+    monkeypatch.setattr(EmbeddingClient, "_spacing_lock", None)
+    monkeypatch.setattr(EmbeddingClient, "_last_request_monotonic", 0.0)
+    config = _build_config("openai")
+    config.batch_delay = 0.02
+    clients = [EmbeddingClient(config), EmbeddingClient(config)]
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(asyncio.run, client.embed(["text"])) for client in clients]
+        assert all(len(future.result(timeout=3)) == 1 for future in futures)
+    assert starts[1] - starts[0] >= config.batch_delay

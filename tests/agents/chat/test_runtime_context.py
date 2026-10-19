@@ -4,19 +4,19 @@ stale training-data dates when composing web_search queries.
 
 Regression guard for the bug where "今天上海天气怎样？" produced a web_search
 query of "上海天气 2025年6月" — a year stale relative to the real clock.
-See ``deeptutor/agents/chat/prompt_blocks.py:_runtime_context_block``.
+See ``deeptutor/agents/loop/prompt_blocks.py:_runtime_context_block``.
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from pathlib import Path
 
 import pytest
 import yaml
 
-from deeptutor.agents.chat import prompt_blocks as prompt_blocks_module
-from deeptutor.agents.chat.prompt_blocks import ChatPromptAssembler
+from deeptutor.agents.loop import prompt_blocks as prompt_blocks_module
+from deeptutor.agents.loop.prompt_blocks import ChatPromptAssembler
 from deeptutor.core.context import UnifiedContext
 
 # Deliberately omits ``runtime_context``: exercises the code-default fallback,
@@ -27,7 +27,12 @@ PROMPTS_NO_RUNTIME = {
     "loop": {"system": "loop"},
 }
 
-FIXED_NOW = datetime(2026, 8, 17, 12, tzinfo=timezone(timedelta(hours=8)))
+# Naive on purpose: ``datetime.now()`` (which ``_runtime_context_block`` calls)
+# returns a naive datetime; ``.astimezone()`` then only attaches the host's
+# local timezone without shifting the calendar date. Freezing an aware
+# datetime instead made ``astimezone()`` convert across zones, so west-of-UTC
+# hosts rendered the frozen instant as the previous day.
+FIXED_NOW = datetime(2026, 8, 17, 12)
 
 
 class FrozenDateTime(datetime):

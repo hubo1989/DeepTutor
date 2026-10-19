@@ -53,8 +53,6 @@ class LLMResponse:
     usage: dict[str, int] = field(default_factory=dict)
     reasoning_content: str | None = None
     thinking_blocks: list[dict[str, Any]] | None = None
-    # Provider-private payload (e.g. native Responses-API output items) that
-    # callers may replay on a later turn. Empty unless a provider sets it.
     provider_specific_fields: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -82,7 +80,7 @@ class LLMProvider(ABC):
         "timeout",
         "timed out",
         # An idle stream that never delivered its final message: the wording
-        # chat_stream uses for its own stall guard, which is as retryable
+        # ``chat_stream`` uses for its own stall guard, which is as retryable
         # as the timeouts above and was being classified as permanent.
         "stalled",
         "connection",
@@ -326,7 +324,6 @@ class LLMProvider(ABC):
         if status_code is not None:
             return status_code in cls._RETRYABLE_HTTP_STATUS_CODES
         err = (content or "").lower()
-
         message_status = cls._status_code_from_message(err)
         if message_status is not None:
             return message_status in cls._RETRYABLE_HTTP_STATUS_CODES
@@ -349,11 +346,22 @@ class LLMProvider(ABC):
         allow_image_fallback: bool = True,
         **kwargs: Any,
     ) -> LLMResponse:
+        from deeptutor.services.llm.metrics import measure_provider_call
         from deeptutor.services.llm.multimodal import (
             has_image_parts,
             strip_image_parts,
             strip_image_parts_inplace,
         )
+
+        raw_call = call
+
+        async def measured_call(**call_kwargs: Any) -> LLMResponse:
+            call_kwargs["model"] = call_kwargs.get("model") or self.get_default_model()
+            return await measure_provider_call(
+                raw_call,
+                provider=getattr(self, "provider_name", self.__class__.__name__),
+                **call_kwargs,
+            )
 
         delays = self._normalize_retry_delays(retry_delays)
         attempt = 0
@@ -363,7 +371,7 @@ class LLMProvider(ABC):
             status_code = None
             caught_exception = None
             try:
-                response = await call(
+                response = await measured_call(
                     messages=messages,
                     tools=tools,
                     model=model,
@@ -400,7 +408,7 @@ class LLMProvider(ABC):
                         "Non-transient LLM error with image content; model is not"
                         " known vision-capable, retrying once without images"
                     )
-                    retry_response = await call(
+                    retry_response = await measured_call(
                         messages=strip_image_parts(messages),
                         tools=tools,
                         model=model,

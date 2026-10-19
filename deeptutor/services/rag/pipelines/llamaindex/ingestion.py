@@ -15,7 +15,8 @@ from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core.schema import BaseNode
 
 from . import vector_store
-from .config import should_show_progress
+from .config import should_show_progress, vector_index_config_from_settings
+from .embedding_adapter import current_embedding
 
 
 def build_ingestion_pipeline() -> IngestionPipeline:
@@ -32,7 +33,7 @@ def build_ingestion_pipeline() -> IngestionPipeline:
                 chunk_size=Settings.chunk_size,
                 chunk_overlap=Settings.chunk_overlap,
             ),
-            Settings.embed_model,
+            current_embedding(),
         ],
     )
 
@@ -98,9 +99,14 @@ def create_index_from_documents(
     if show_progress is None:
         show_progress = should_show_progress()
     nodes = documents_to_nodes(documents, show_progress=show_progress)
-    storage_context = vector_store.storage_context_for_nodes(nodes)
+    storage_context = vector_store.storage_context_for_nodes(
+        nodes, vector_index_config_from_settings()
+    )
     index = VectorStoreIndex(
-        nodes=nodes, storage_context=storage_context, show_progress=show_progress
+        nodes=nodes,
+        storage_context=storage_context,
+        show_progress=show_progress,
+        embed_model=current_embedding(),
     )
     index.storage_context.persist(persist_dir=str(storage_dir))
     return index, len(documents)
