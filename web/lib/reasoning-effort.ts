@@ -154,13 +154,6 @@ export function reasoningEffortOptions(
     return options(["minimal", "high"], current);
   }
 
-  if (provider === "custom") {
-    // A user-supplied OpenAI-compatible endpoint may route to any upstream
-    // model, so expose the common cross-gateway levels and let Auto handle
-    // providers without an explicit control.
-    return options(["none", "low", "medium", "high"], current);
-  }
-
   if (BINARY_THINKING_PROVIDERS.has(provider)) {
     // Deliberately no selector for the rest — VolcEngine/BytePlus thinking
     // models are switched on by the backend from the spec's
@@ -176,6 +169,12 @@ export function reasoningEffortOptions(
     }
     if (includesAny(modelName, ["o1", "o3", "o4"])) {
       return options(["low", "medium", "high"], current);
+    }
+    if (provider === "custom") {
+      // A user-supplied OpenAI-compatible endpoint may route to any upstream
+      // model, so expose the common cross-gateway levels and let Auto handle
+      // providers without an explicit control.
+      return options(["none", "low", "medium", "high"], current);
     }
     return options([], current);
   }

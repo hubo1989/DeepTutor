@@ -101,6 +101,15 @@ test("known reasoning families get conservative provider-specific choices", () =
     "medium",
     "high",
   ]);
+  assert.deepEqual(values("custom", "gpt-5.1"), [
+    "",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+  ]);
+  assert.deepEqual(values("custom", "o3-mini"), ["", "low", "medium", "high"]);
 });
 
 test("unknown models stay hidden unless they already carry an override", () => {
