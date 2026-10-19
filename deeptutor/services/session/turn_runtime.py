@@ -1280,6 +1280,38 @@ class TurnRuntimeManager:
             pass
         return True
 
+    async def cancel_turn_and_wait(
+        self,
+        turn_id: str,
+        *,
+        timeout_seconds: float = 15.0,
+    ) -> bool:
+        """Cancel a turn and wait until persisted teardown has completed."""
+        active_statuses = {"queued", "running", "waiting_input"}
+        deadline = asyncio.get_running_loop().time() + max(0.0, timeout_seconds)
+        try:
+            # Bound the cancellation await too: its cleanup can itself stall.
+            cancelled = await asyncio.wait_for(
+                self.cancel_turn(turn_id),
+                timeout=max(0.0, deadline - asyncio.get_running_loop().time()),
+            )
+        except asyncio.TimeoutError:
+            return False
+        if not cancelled:
+            turn = await self.store.get_turn(turn_id)
+            return turn is None or str(turn.get("status") or "") not in active_statuses
+        while True:
+            turn = await self.store.get_turn(turn_id)
+            status = str((turn or {}).get("status") or "")
+            live = await self._has_live_execution(turn_id)
+            if turn is not None and status not in active_statuses and not live:
+                return True
+            if turn is None and not live:
+                return True
+            if asyncio.get_running_loop().time() >= deadline:
+                return False
+            await asyncio.sleep(0.05)
+
     async def cancel_all_turns(self) -> int:
         """Cancel and await every live turn owned by this runtime manager."""
         async with self._lock:

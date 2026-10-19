@@ -6,7 +6,6 @@ import asyncio
 from collections.abc import AsyncGenerator, Mapping
 import contextlib
 import json
-import math
 from types import SimpleNamespace
 from typing import Any, TypedDict
 
@@ -25,6 +24,7 @@ from .config import LLMConfig, get_llm_config
 from .error_mapping import map_error
 from .multimodal import prepare_multimodal_messages
 from .provider_factory import get_runtime_provider
+from .usage_estimation import estimate_prompt_tokens
 from .utils import is_local_llm_server
 
 DEFAULT_MAX_RETRIES = settings.retry.max_retries
@@ -292,16 +292,7 @@ def _estimate_factory_request_tokens(
     max_tokens: int,
 ) -> tuple[int, int]:
     """Return conservative total and prompt estimates shared by both ledgers."""
-    try:
-        prompt_estimate = max(
-            1,
-            math.ceil(
-                len(json.dumps(messages, ensure_ascii=False, default=str, separators=(",", ":")))
-                / 3.5
-            ),
-        )
-    except (TypeError, ValueError):
-        prompt_estimate = max(1, math.ceil(len(str(messages)) / 3.5))
+    prompt_estimate = max(1, estimate_prompt_tokens(messages))
     return prompt_estimate + max(1, int(max_tokens)), prompt_estimate
 
 

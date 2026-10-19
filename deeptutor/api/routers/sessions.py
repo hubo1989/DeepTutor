@@ -20,6 +20,12 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+def _turn_runtime_manager():
+    from deeptutor.services.session import get_turn_runtime_manager
+
+    return get_turn_runtime_manager()
+
+
 class SessionRenameRequest(BaseModel):
     title: str = Field(..., min_length=1, max_length=100)
 
@@ -167,13 +173,18 @@ async def rename_session(session_id: str, payload: SessionRenameRequest):
 @router.delete("/{session_id}")
 async def delete_session(session_id: str):
     store = get_session_store()
+    if await store.get_session(session_id) is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+
     list_active_turns = getattr(store, "list_active_turns", None)
     if callable(list_active_turns):
-        from deeptutor.services.session import get_turn_runtime_manager
-
-        runtime = get_turn_runtime_manager()
+        runtime = _turn_runtime_manager()
         for turn in await list_active_turns(session_id):
-            await runtime.cancel_turn(turn["id"])
+            if not await runtime.cancel_turn_and_wait(turn["id"]):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Active conversation turn could not be stopped before deletion",
+                )
     deleted = await store.delete_session(session_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Session not found")

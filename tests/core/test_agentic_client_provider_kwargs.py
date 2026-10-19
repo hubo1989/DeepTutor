@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
@@ -11,11 +12,14 @@ from deeptutor.core.agentic.client import (
     LLMClientConfig,
     _ProviderOpenAIAdapter,
     _ProviderOpenAIStream,
+    _request_commercial_token_bound,
+    _request_token_estimate,
     build_completion_kwargs,
     build_openai_client,
     can_use_native_tool_calling,
 )
 from deeptutor.services.llm.provider_core.base import LLMResponse, ToolCallRequest
+from deeptutor.services.llm.usage_estimation import ESTIMATED_IMAGE_TOKENS
 
 
 def test_agentic_kwargs_disable_deepseek_flash_thinking_by_default() -> None:
@@ -90,6 +94,57 @@ def test_agentic_kwargs_preserve_legacy_shape_without_binding() -> None:
     )
 
     assert kwargs == {"temperature": 0.2, "max_tokens": 256}
+
+
+@pytest.mark.parametrize("binding", ["openai", "openrouter", "custom"])
+def test_agentic_kwargs_apply_claude_temperature_overrides(binding: str) -> None:
+    kwargs = build_completion_kwargs(
+        temperature=0.7,
+        model="anthropic/claude-opus-4-7",
+        max_tokens=1024,
+        binding=binding,
+    )
+
+    assert "temperature" not in kwargs
+
+
+def test_agentic_reservation_estimates_images_without_transport_bytes() -> None:
+    def messages(payload: str) -> list[dict]:
+        return [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe this image"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{payload}"},
+                    },
+                ],
+            }
+        ]
+
+    small = messages("AAAA")
+    large = messages("A" * 8_212_712)
+    tools = [{"type": "function", "function": {"name": "lookup", "parameters": {}}}]
+    small_before = deepcopy(small)
+
+    requested_small, prompt_small, output_small = _request_token_estimate(
+        {"messages": small, "tools": tools, "max_tokens": 64}
+    )
+    requested_large, prompt_large, output_large = _request_token_estimate(
+        {"messages": large, "tools": tools, "max_tokens": 64}
+    )
+    commercial_small = _request_commercial_token_bound({"messages": small, "tools": tools}, 64)
+    commercial_large = _request_commercial_token_bound({"messages": large, "tools": tools}, 64)
+
+    assert (requested_large, prompt_large, output_large) == (
+        requested_small,
+        prompt_small,
+        output_small,
+    )
+    assert commercial_large == commercial_small
+    assert prompt_small >= ESTIMATED_IMAGE_TOKENS
+    assert small == small_before
 
 
 @pytest.mark.asyncio
@@ -181,7 +236,7 @@ def test_build_openai_client_routes_oauth_backend_through_adapter(monkeypatch) -
 
 
 @pytest.mark.asyncio
-async def test_build_openai_client_rotates_api_keys_after_429(monkeypatch) -> None:
+async def test_build_openai_client_tries_every_api_key_after_429(monkeypatch) -> None:
     await agentic_client.close_agentic_client_pool()
     seen_keys: list[str] = []
 
@@ -194,7 +249,7 @@ async def test_build_openai_client_rotates_api_keys_after_429(monkeypatch) -> No
 
         async def create(self, **_kwargs):
             seen_keys.append(self.api_key)
-            if self.api_key == "key-a":
+            if self.api_key != "key-c":
                 raise RateLimitError("rate limited")
             return "ok"
 
@@ -213,7 +268,7 @@ async def test_build_openai_client_rotates_api_keys_after_429(monkeypatch) -> No
         LLMClientConfig(
             binding="openai",
             model="gpt-test",
-            api_key=["key-a", "key-b"],
+            api_key=["key-a", "key-b", "key-c"],
             base_url="https://example.test/v1",
         )
     )
@@ -221,7 +276,7 @@ async def test_build_openai_client_rotates_api_keys_after_429(monkeypatch) -> No
     result = await client.chat.completions.create(model="gpt-test", messages=[])
 
     assert result == "ok"
-    assert seen_keys == ["key-a", "key-b"]
+    assert seen_keys == ["key-a", "key-b", "key-c"]
     await agentic_client.close_agentic_client_pool()
 
 

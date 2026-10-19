@@ -16,6 +16,9 @@ def test_delete_session_cleans_only_current_user_artifacts(as_user, monkeypatch)
     attachment_id = "upload-1"
 
     class _SessionStore:
+        async def get_session(self, candidate: str) -> dict[str, str] | None:
+            return {"id": candidate} if candidate == session_id else None
+
         async def delete_session(self, candidate: str) -> bool:
             return candidate == session_id
 

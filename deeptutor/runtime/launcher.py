@@ -245,12 +245,13 @@ def _port_listeners(port: int) -> list[tuple[int, str]]:
             check=False,
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=3,
         )
     except Exception:
         return []
     pids: list[int] = []
-    for line in completed.stdout.splitlines():
+    for line in (completed.stdout or "").splitlines():
         if not line.startswith("p"):
             continue
         try:
@@ -272,12 +273,13 @@ def _port_listeners_windows(port: int) -> list[tuple[int, str]]:
             check=False,
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=5,
         )
     except Exception:
         return []
     pids: list[int] = []
-    for line in completed.stdout.splitlines():
+    for line in (completed.stdout or "").splitlines():
         parts = line.split()
         if len(parts) < 5 or parts[0].upper() != "TCP" or parts[3].upper() != "LISTENING":
             continue
@@ -300,9 +302,10 @@ def _port_listeners_windows(port: int) -> list[tuple[int, str]]:
                     check=False,
                     capture_output=True,
                     text=True,
+                    errors="replace",
                     timeout=3,
                 )
-                first = result.stdout.strip().splitlines()[:1]
+                first = (result.stdout or "").strip().splitlines()[:1]
                 if first and first[0].startswith('"'):
                     name = first[0].split('","')[0].strip('"')
             except Exception:
@@ -868,11 +871,12 @@ def _process_command(pid: int | None) -> str:
             check=False,
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=2,
         )
     except Exception:
         return ""
-    return completed.stdout.strip()
+    return (completed.stdout or "").strip()
 
 
 def _looks_like_next_process(pid: int | None) -> bool:
