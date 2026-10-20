@@ -479,9 +479,10 @@ def test_run_unknown_ids(client: TestClient) -> None:
     assert client.get("/api/memory/runs/unknown").status_code == 404
     assert client.get("/api/memory/runs/unknown/events").status_code == 404
     assert client.post("/api/memory/runs/unknown/undo").status_code == 404
+    # Fork semantics: an unknown (or cross-owner) run id reports 404 so
+    # existence is never disclosed; only a known-but-inactive run is 409.
     cancel = client.post("/api/memory/runs/unknown/cancel")
-    assert cancel.status_code == 409
-    assert cancel.json()["detail"] == "not active"
+    assert cancel.status_code == 404
 
 
 def test_list_runs_validation(client: TestClient) -> None:

@@ -1579,7 +1579,7 @@ def _pageindex_config_payload() -> dict:
     }
 
 
-@router.get("/knowledge-bases/rag-pipelines/pageindex/config")
+@router.get("/knowledge-bases/rag-pipelines/pageindex/config", dependencies=[Depends(require_admin)])
 async def get_pageindex_pipeline_config():
     """Read the PageIndex credential state (key redacted to a boolean)."""
     try:
@@ -1589,7 +1589,7 @@ async def get_pageindex_pipeline_config():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.put("/knowledge-bases/rag-pipelines/pageindex/config")
+@router.put("/knowledge-bases/rag-pipelines/pageindex/config", dependencies=[Depends(require_admin)])
 async def update_pageindex_pipeline_config(payload: PageIndexConfigUpdate):
     """Persist the deployment-level PageIndex Cloud credential."""
     try:
@@ -1632,7 +1632,7 @@ def _ima_config_payload() -> dict:
     }
 
 
-@router.get("/knowledge-bases/rag-pipelines/ima/config")
+@router.get("/knowledge-bases/rag-pipelines/ima/config", dependencies=[Depends(require_admin)])
 async def get_ima_pipeline_config():
     """Read the account-level IMA credentials (key redacted to a boolean)."""
     try:
@@ -1642,7 +1642,7 @@ async def get_ima_pipeline_config():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.put("/knowledge-bases/rag-pipelines/ima/config")
+@router.put("/knowledge-bases/rag-pipelines/ima/config", dependencies=[Depends(require_admin)])
 async def update_ima_pipeline_config(payload: ImaConfigUpdate):
     """Persist the account-level IMA Client ID / API key."""
     try:
@@ -1686,7 +1686,7 @@ class LlamaIndexConfigUpdate(BaseModel):
     image_description_timeout_seconds: int | None = None
 
 
-@router.get("/knowledge-bases/rag-pipelines/llamaindex/config")
+@router.get("/knowledge-bases/rag-pipelines/llamaindex/config", dependencies=[Depends(require_admin)])
 async def get_llamaindex_pipeline_config():
     """Read the LlamaIndex engine's retrieval + chunking knobs.
 
@@ -1712,7 +1712,7 @@ async def get_llamaindex_pipeline_config():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.put("/knowledge-bases/rag-pipelines/llamaindex/config")
+@router.put("/knowledge-bases/rag-pipelines/llamaindex/config", dependencies=[Depends(require_admin)])
 async def update_llamaindex_pipeline_config(payload: LlamaIndexConfigUpdate):
     """Persist the LlamaIndex engine knobs.
 
@@ -1740,7 +1740,7 @@ class GraphRagConfigUpdate(BaseModel):
     dynamic_community_selection: bool | None = None
 
 
-@router.get("/knowledge-bases/rag-pipelines/graphrag/config")
+@router.get("/knowledge-bases/rag-pipelines/graphrag/config", dependencies=[Depends(require_admin)])
 async def get_graphrag_pipeline_config():
     """Read GraphRAG's query knobs (response style, community granularity)."""
     try:
@@ -1752,7 +1752,7 @@ async def get_graphrag_pipeline_config():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.put("/knowledge-bases/rag-pipelines/graphrag/config")
+@router.put("/knowledge-bases/rag-pipelines/graphrag/config", dependencies=[Depends(require_admin)])
 async def update_graphrag_pipeline_config(payload: GraphRagConfigUpdate):
     """Persist GraphRAG's query knobs. Takes effect on the next query."""
     try:
@@ -1803,7 +1803,7 @@ def _validate_lightrag_llm_selection(profile_id: str, model_id: str) -> None:
         raise HTTPException(status_code=422, detail=str(exc)) from None
 
 
-@router.get("/knowledge-bases/rag-pipelines/lightrag/config")
+@router.get("/knowledge-bases/rag-pipelines/lightrag/config", dependencies=[Depends(require_admin)])
 async def get_lightrag_pipeline_config():
     """Read LightRAG's query knobs plus its indexing concurrency/extraction knobs."""
     try:
@@ -1920,7 +1920,7 @@ async def update_lightrag_server_pipeline_config(payload: LightRagServerConfigUp
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/knowledge-bases/rag-pipelines/{provider}/preflight")
+@router.get("/knowledge-bases/rag-pipelines/{provider}/preflight", dependencies=[Depends(require_admin)])
 async def get_rag_pipeline_preflight(provider: str):
     """Check whether ``provider`` can run in the current environment.
 
@@ -1983,7 +1983,7 @@ def _model_options_payload(kinds: list[str]) -> dict:
     return out
 
 
-@router.get("/knowledge-bases/rag-pipelines/model-options")
+@router.get("/knowledge-bases/rag-pipelines/model-options", dependencies=[Depends(require_admin)])
 async def get_rag_model_options(kinds: str = "llm,embedding"):
     """List configured models (secret-free) for the requested model kinds."""
     try:
@@ -2280,7 +2280,7 @@ class ConnectObsidianRequest(BaseModel):
     vault_path: str
 
 
-@router.post("/knowledge-bases/connect-obsidian")
+@router.post("/knowledge-bases/connect-obsidian", dependencies=[Depends(require_admin)])
 async def connect_obsidian_vault(payload: ConnectObsidianRequest):
     """Connect an existing Obsidian vault as a knowledge base.
 
@@ -2353,7 +2353,7 @@ class ConnectFolderRequest(BaseModel):
     rag_provider: str = DEFAULT_PROVIDER
 
 
-@router.post("/knowledge-bases/probe-folder")
+@router.post("/knowledge-bases/probe-folder", dependencies=[Depends(require_admin)])
 async def probe_linked_folder_route(payload: ProbeFolderRequest):
     """Inspect a local folder for a ready engine index before linking it.
 
@@ -2372,7 +2372,7 @@ async def probe_linked_folder_route(payload: ProbeFolderRequest):
     return result.to_dict()
 
 
-@router.post("/knowledge-bases/connect-folder")
+@router.post("/knowledge-bases/connect-folder", dependencies=[Depends(require_admin)])
 async def connect_linked_folder_route(payload: ConnectFolderRequest):
     """Mount an existing engine index as a read-only ``linked`` knowledge base.
 
@@ -2449,7 +2449,7 @@ class ConnectWeKnoraRequest(BaseModel):
     knowledge_base_id: str
 
 
-@router.post("/knowledge-bases/probe-lightrag-server")
+@router.post("/knowledge-bases/probe-lightrag-server", dependencies=[Depends(require_admin)])
 async def probe_lightrag_server_route(payload: ProbeLightRagServerRequest):
     """Test-connect to an external LightRAG server before binding a KB to it.
 
@@ -2473,7 +2473,7 @@ async def probe_lightrag_server_route(payload: ProbeLightRagServerRequest):
     return result.to_dict()
 
 
-@router.post("/knowledge-bases/connect-lightrag-server")
+@router.post("/knowledge-bases/connect-lightrag-server", dependencies=[Depends(require_admin)])
 async def connect_lightrag_server_route(payload: ConnectLightRagServerRequest):
     """Connect an external LightRAG server as a retrieval-only knowledge base.
 
@@ -2774,7 +2774,7 @@ async def search_kiwix_articles(
     }
 
 
-@router.post("/knowledge-bases/probe-ima")
+@router.post("/knowledge-bases/probe-ima", dependencies=[Depends(require_admin)])
 async def probe_ima_route(payload: ProbeImaRequest):
     """Test-connect to a Tencent IMA knowledge base before binding a KB to it.
 
@@ -2793,7 +2793,7 @@ async def probe_ima_route(payload: ProbeImaRequest):
     return result.to_dict()
 
 
-@router.post("/knowledge-bases/connect-ima")
+@router.post("/knowledge-bases/connect-ima", dependencies=[Depends(require_admin)])
 async def connect_ima_route(payload: ConnectImaRequest):
     """Connect a Tencent IMA knowledge base as a retrieval-only knowledge base.
 
@@ -4837,7 +4837,7 @@ async def websocket_progress(websocket: WebSocket, kb_name: str):
                 logger.warning("Failed to reset user context after progress WS: %s", reset_error)
 
 
-@router.post("/knowledge-bases/{kb_name}/link-folder", response_model=LinkedFolderInfo)
+@router.post("/knowledge-bases/{kb_name}/link-folder", response_model=LinkedFolderInfo, dependencies=[Depends(require_admin)])
 async def link_folder(kb_name: str, request: LinkFolderRequest):
     """
     Link a local folder to a knowledge base.
@@ -4867,7 +4867,7 @@ async def link_folder(kb_name: str, request: LinkFolderRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/knowledge-bases/{kb_name}/linked-folders", response_model=list[LinkedFolderInfo])
+@router.get("/knowledge-bases/{kb_name}/linked-folders", response_model=list[LinkedFolderInfo], dependencies=[Depends(require_admin)])
 async def get_linked_folders(kb_name: str):
     """Get list of linked folders for a knowledge base."""
     try:
@@ -4883,7 +4883,7 @@ async def get_linked_folders(kb_name: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.delete("/knowledge-bases/{kb_name}/linked-folders/{folder_id}")
+@router.delete("/knowledge-bases/{kb_name}/linked-folders/{folder_id}", dependencies=[Depends(require_admin)])
 async def unlink_folder(kb_name: str, folder_id: str):
     """Unlink a folder from a knowledge base."""
     try:
@@ -4905,6 +4905,7 @@ async def unlink_folder(kb_name: str, folder_id: str):
 @router.post(
     "/knowledge-bases/{kb_name}/sync-folder/{folder_id}",
     response_model=SyncFolderResponse,
+    dependencies=[Depends(require_admin)],
 )
 async def sync_folder(
     kb_name: str,
