@@ -45,7 +45,7 @@ function profileLabel(profile: ByokProfile, fallback: string): string {
   return [profile.provider, profile.model].filter(Boolean).join(" · ") || fallback;
 }
 
-export default function ByokSettingsPage() {
+export default function ByokSettingsSection() {
   const { i18n } = useTranslation();
   const zh = i18n.language?.toLowerCase().startsWith("zh");
   const copy = zh

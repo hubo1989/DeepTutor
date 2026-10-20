@@ -32,6 +32,10 @@ export interface AuthStatus {
       extensions: string[];
     };
   } | null;
+  /** Fork SaaS marker: hosted commercial mode is active for this deployment. */
+  commercial_enabled?: boolean;
+  /** Trial length in days when commercial mode is on; null when not applicable. */
+  trial_days?: number | null;
 }
 
 const AUTH_STATUS_CACHE_MS = 5_000;
@@ -156,11 +160,37 @@ function extractDetail(detail: unknown): string {
 }
 
 /**
- * Register a new account. The first user to register becomes admin.
+ * Ask the server to email a one-time registration code for this address.
+ * The response never reveals whether the address already holds an account.
+ */
+export async function requestRegistrationCode(
+  email: string,
+  password: string,
+): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const res = await apiFetch(apiUrl("/api/auth/register/request-code"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, password }),
+      skipAuthRedirect: true,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok) return { ok: true };
+    return { ok: false, error: extractDetail(data.detail) };
+  } catch {
+    return { ok: false, error: "Could not reach the server" };
+  }
+}
+
+/**
+ * Complete a new account with the one-time email verification code.
+ *
+ * The backend sets the session cookie once the code is consumed, so a
+ * successful call logs the new account in directly.
  */
 export async function register(
-  username: string,
-  password: string,
+  email: string,
+  code: string,
 ): Promise<{
   ok: boolean;
   role?: string;
@@ -171,7 +201,7 @@ export async function register(
     const res = await apiFetch(apiUrl("/api/auth/register"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username, password }),
+      body: JSON.stringify({ email, code }),
       // Registration validation failures (e.g. 400/401) should surface inline
       // rather than bounce the user through the global login redirect.
       skipAuthRedirect: true,
@@ -186,20 +216,6 @@ export async function register(
     return { ok: false, error: extractDetail(data.detail) };
   } catch {
     return { ok: false, error: "Could not reach the server" };
-  }
-}
-
-/**
- * Check whether the user store is empty (first user will become admin).
- */
-export async function checkIsFirstUser(): Promise<boolean> {
-  try {
-    const res = await apiFetch(apiUrl("/api/auth/is_first_user"));
-    if (!res.ok) return false;
-    const data = await res.json();
-    return Boolean(data.is_first_user);
-  } catch {
-    return false;
   }
 }
 

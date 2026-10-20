@@ -5520,5 +5520,18 @@
   "Applies to Chat, Solve, Ask Questions, Guided Learning, Reading, Course Study and standard visualizations. Changes take effect on the next turn.": "适用于对话、解题、主动提问、引导学习、沉浸式阅读、课程学习和常规可视化。从下一轮开始生效。",
   "Clear instructions": "清空提示词",
   "{{used}} / {{limit}} characters": "{{used}} / {{limit}} 字符",
-  "contextBudget.segment.workspace_instructions": "工作区提示词"
+  "contextBudget.segment.workspace_instructions": "工作区提示词",
+  "Could not send verification code": "验证码发送失败",
+  "Email": "邮箱",
+  "Email verification code": "邮箱验证码",
+  "If this email can register, a verification code has been sent.": "如果该邮箱可以注册，验证码已发送。",
+  "Request a verification code first": "请先获取验证码",
+  "Resend in {{seconds}}s": "{{seconds}} 秒后可重发",
+  "Resend verification code": "重新发送验证码",
+  "Send verification code": "发送验证码",
+  "Sending verification code…": "验证码发送中…",
+  "Verify and create account": "验证并创建账户",
+  "auth.brandTagline": "LearnLeader · 智能体原生学习",
+  "commercial.registration.trialLimits": "包含核心学习功能；最多 2 个知识库、同时运行 1 项学习任务、单文件 25 MiB。代码沙箱和高成本视频渲染不在试用范围内。",
+  "commercial.registration.trialSummary": "{{days}} 天免费试用 · 无需绑卡 · 到期不扣费"
 }
