@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from . import _turn_runtime_shared as _shared
 from .turns import (
     LearningTurnAdapter,
@@ -90,8 +92,6 @@ class TurnRuntimeManager(
         }
         # Strip runtime-only config keys before the strict public contract
         # validates; they are re-merged into the payload afterwards.
-        import copy as _copy
-
         wire = dict(payload)
         raw_cfg = dict(wire.get("config", {}) or {})
         stripped = {
@@ -158,11 +158,6 @@ class TurnRuntimeManager(
         replace_assistant_message_id: int | str | None = None,
         commercial_lease: Any = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        if commercial_lease is not None:
-            try:
-                await commercial_lease.settle_running()
-            except Exception:
-                pass
         result = await TurnRequestPreparer.start_turn(
             self,
             payload,

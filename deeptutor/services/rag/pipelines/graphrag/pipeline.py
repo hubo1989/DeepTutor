@@ -92,18 +92,30 @@ class GraphRagPipeline:
         self.logger.info(
             "Initializing KB '%s' with %d file(s) using GraphRAG", kb_name, len(file_paths)
         )
+        from deeptutor.commercial.storage_limits import (
+            create_staging_directory,
+            enforce_staging_scratch_limit,
+            promote_staged_directory_with_storage_limits,
+        )
+
+        staging = create_staging_directory(root_dir)
         try:
-            gr_config.write_settings(root_dir)
+            gr_config.write_settings(staging)
+            enforce_staging_scratch_limit(staging, replacing_root=root_dir)
             source_for_input: dict[str, str] = {}
             count = await ingestion.prepare_input(
-                file_paths, root_dir, source_for_input=source_for_input
+                file_paths, staging, source_for_input=source_for_input
             )
             if count == 0:
                 self.logger.error("GraphRAG: no extractable documents for '%s'", kb_name)
+                shutil.rmtree(staging, ignore_errors=True)
                 self._cleanup_failed_version_dir(root_dir)
                 return False
-            await self._build(root_dir, is_update=False)
-            storage.write_meta(root_dir)
+            await self._build(staging, is_update=False)
+            storage.write_meta(staging, version_name=root_dir.name)
+            await asyncio.to_thread(
+                promote_staged_directory_with_storage_limits, staging, root_dir
+            )
             if indexed_file_callback := kwargs.get("indexed_file_callback"):
                 names = await asyncio.to_thread(storage.indexed_input_names, root_dir)
                 indexed_file_callback(
@@ -117,6 +129,7 @@ class GraphRagPipeline:
                 traceback.format_exc(),
                 extra={PROCESS_LOG_PRIVATE_ATTR: True},
             )
+            shutil.rmtree(staging, ignore_errors=True)
             self._cleanup_failed_version_dir(root_dir)
             raise
 

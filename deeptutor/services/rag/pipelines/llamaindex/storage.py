@@ -95,24 +95,47 @@ def create_index(
         raise
 
 
-def insert_documents(existing_storage: Path, storage_dir: Path, documents: list[Any]) -> int:
-    index = vector_store.load_index(existing_storage)
-    _validate_persisted_embeddings(index, existing_storage)
-    if hasattr(index, "insert_nodes"):
-        count = ingestion.insert_documents_into_index(index, documents)
-    else:
-        # Some tests use a tiny fake index that only implements insert().
-        for document in documents:
-            index.insert(document)
-        count = len(documents)
-    index.storage_context.persist(persist_dir=str(storage_dir))
-    retrievers.persist_bm25_retriever(index, storage_dir, top_k=20)
-    from deeptutor.services.rag.source_pages import persist_page_catalog
+def insert_documents(
+    existing_storage: Path,
+    storage_dir: Path,
+    documents: list[Any],
+    *,
+    prepare_staging: Callable[[Path], None] | None = None,
+) -> int:
+    from deeptutor.commercial.storage_limits import (
+        create_staging_directory,
+        owner_tree_size_bytes,
+        promote_staged_directory_with_storage_limits,
+    )
 
-    if existing_storage != storage_dir and (existing_storage / "source_pages.json").is_file():
-        shutil.copy2(existing_storage / "source_pages.json", storage_dir / "source_pages.json")
-    persist_page_catalog(documents, storage_dir)
-    return count
+    staging = create_staging_directory(storage_dir)
+    try:
+        # Copy-on-write keeps the readable index untouched until every related
+        # store file and optional BM25 artifact has been persisted successfully.
+        owner_tree_size_bytes(existing_storage)
+        shutil.copytree(existing_storage, staging, dirs_exist_ok=True)
+        index = vector_store.load_index(staging)
+        _validate_persisted_embeddings(index, staging)
+        if hasattr(index, "insert_nodes"):
+            count = ingestion.insert_documents_into_index(index, documents)
+        else:
+            # Some tests use a tiny fake index that only implements insert().
+            for document in documents:
+                index.insert(document)
+            count = len(documents)
+        index.storage_context.persist(persist_dir=str(staging))
+        retrievers.persist_bm25_retriever(index, staging, top_k=20)
+        from deeptutor.services.rag.source_pages import persist_page_catalog
+
+        persist_page_catalog(documents, staging)
+        if prepare_staging is not None:
+            prepare_staging(staging)
+        promote_staged_directory_with_storage_limits(staging, storage_dir)
+        clear_index_cache()
+        return count
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
 
 
 def _persisted_vector_fault(exc: ValueError) -> str:

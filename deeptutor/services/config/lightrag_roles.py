@@ -22,6 +22,9 @@ class LightRagModelSelection(BaseModel):
     profile_id: str = Field(min_length=1, max_length=128)
     model_id: str = Field(min_length=1, max_length=128)
     reasoning_effort: ReasoningEffort | None = None
+    # Tolerate the v2 LLMSelection extras when a persisted selection round-trips.
+    source: str | None = None
+    generation: int | None = None
 
 
 class _LightRagRoleSettings(BaseModel):
