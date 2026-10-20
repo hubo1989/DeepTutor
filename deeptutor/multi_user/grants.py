@@ -13,6 +13,8 @@ import threading
 from typing import Any
 
 from deeptutor.services.file_io import atomic_write_text
+from .quota_config import normalize_quotas
+from .token_quota import default_quota
 
 from .identity import get_user_by_id
 from .paths import SYSTEM_ROOT, ensure_system_dirs
@@ -77,37 +79,34 @@ def _grant_write_lock(path: Path):
 
 
 def empty_grant(user_id: str) -> dict[str, Any]:
+    defaults = default_quota()
+    normalized_quota = normalize_quotas(None, fallback=defaults)
     return {
-        "version": 2,
+        "version": 3,
         "user_id": user_id,
         "models": {"llm": []},
+        # Platform and BYOK access are explicit. New users cannot cause an
+        # outbound request until an administrator grants the relevant service.
+        "platform": {
+            "embedding": {"enabled": False},
+            "mineru": {"enabled": False},
+        },
+        "byok": {
+            "llm": {"enabled": False},
+            "embedding": {"enabled": False},
+            "mineru": {"enabled": False},
+        },
         "knowledge_bases": [],
         "skills": [],
-        # Partners an admin has lent this user. People build their own partners
-        # now, so a grant is only about someone *else's*: it lets the user talk
-        # to the named partners — never configure them — and their side of each
-        # conversation stays private to their account. Same shape as ``skills``
-        # (``[{"partner_id": ...}]``).
         "partners": [],
-        # Tool whitelists share the partner-config semantics for built-ins:
-        # ``enabled_tools=None`` means "default" (every tool in the pool),
-        # ``[]`` means none, a list is an explicit whitelist. MCP tools can
-        # proxy host-side capabilities, so non-admin runtime access treats
-        # ``mcp_tools=None`` as deny-by-default until an admin grants explicit
-        # names. ``cli_apps`` is the same posture for installed CLI apps, keyed
-        # by app id: each one is third-party code executing in the sandbox, so
-        # an absent grant is no access rather than all of them.
-        # ``exec_enabled`` is a tri-state override on top of the
-        # deployment exec policy: ``None`` follows the policy, ``False`` always
-        # denies, ``True`` is only honored where the sandbox can actually
-        # isolate users (SYSTEM isolation).
         "enabled_tools": None,
         "mcp_tools": None,
         "cli_apps": None,
         "exec_enabled": None,
+        "quota": normalized_quota,
+        "token_quota": dict(normalized_quota["llm"]),
         "learning_policy": None,
     }
-
 
 def _normalize_tool_list(value: Any) -> list[str] | None:
     if value is None:
@@ -169,11 +168,35 @@ def normalize_grant(user_id: str, payload: dict[str, Any] | None) -> dict[str, A
     if not isinstance(payload, dict):
         return base
     base["user_id"] = user_id
+    try:
+        version = int(payload.get("version", 2))
+    except (TypeError, ValueError):
+        version = 2
+    # Existing users already consuming the globally configured Embedding and
+    # MinerU services retain access after migration. New grants use the safer
+    # explicit platform defaults from ``empty_grant``.
+    if version < 3:
+        base["platform"] = {
+            "embedding": {"enabled": True},
+            "mineru": {"enabled": True},
+        }
     models = payload.get("models") if isinstance(payload.get("models"), dict) else {}
     items = models.get("llm") if isinstance(models, dict) else []
     if not isinstance(items, list):
         items = []
     base["models"]["llm"] = [dict(item) for item in items if isinstance(item, dict)]
+    raw_platform = payload.get("platform")
+    if isinstance(raw_platform, dict):
+        for service in ("embedding", "mineru"):
+            value = raw_platform.get(service)
+            if isinstance(value, dict):
+                base["platform"][service] = {"enabled": bool(value.get("enabled", False))}
+    raw_byok = payload.get("byok")
+    if isinstance(raw_byok, dict):
+        for service in ("llm", "embedding", "mineru"):
+            value = raw_byok.get(service)
+            if isinstance(value, dict):
+                base["byok"][service] = {"enabled": bool(value.get("enabled", False))}
     for key in ("knowledge_bases", "skills", "partners"):
         # Read once, then narrow. Two separate ``.get`` calls cannot be narrowed
         # together — nothing promises they return the same object — so the
@@ -185,6 +208,14 @@ def normalize_grant(user_id: str, payload: dict[str, Any] | None) -> dict[str, A
         base[key] = _normalize_tool_list(payload.get(key))
     exec_enabled = payload.get("exec_enabled")
     base["exec_enabled"] = bool(exec_enabled) if isinstance(exec_enabled, bool) else None
+    raw_quota = payload.get("quota")
+    legacy_token_quota = payload.get("token_quota")
+    base["quota"] = normalize_quotas(
+        raw_quota,
+        fallback=default_quota(),
+        legacy_token_quota=legacy_token_quota,
+    )
+    base["token_quota"] = dict(base["quota"]["llm"])
     base["learning_policy"] = _normalize_learning_policy(payload.get("learning_policy"))
     return base
 

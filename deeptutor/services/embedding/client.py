@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import math
+
 from contextlib import asynccontextmanager
 import logging
 import threading
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 from deeptutor.services.config.embedding_endpoint import (
     redact_embedding_endpoint_for_display,
@@ -36,8 +38,182 @@ def _resolve_adapter_class(binding: str) -> type[BaseEmbeddingAdapter]:
     return cls
 
 
+def _estimate_text_tokens(texts: List[str]) -> int:
+    """Estimate provider input tokens before an embedding request.
+
+    Embedding providers do not share a response usage schema, so the hard
+    preflight reservation uses a conservative character-based estimate and
+    reconciles with provider usage when available.
+    """
+    chars = sum(len(text or "") for text in texts)
+    return max(1, math.ceil(chars / 3.5))
+
+
+def _estimate_content_tokens(contents: List[Dict[str, Any]]) -> int:
+    text_items = [str(item.get("text") or "") for item in contents]
+    estimated = _estimate_text_tokens(text_items)
+    # Image/video-only embedding requests still consume provider work but may
+    # expose no token count. Count each such item minimally for quota purposes.
+    return max(estimated, sum(1 for item in contents if not item.get("text")))
+
+
+def _commercial_text_token_bound(texts: List[str]) -> int:
+    """UTF-8 bytes are a provider-neutral upper bound for tokenizer pieces."""
+
+    return max(
+        _estimate_text_tokens(texts), sum(len((text or "").encode("utf-8")) for text in texts)
+    )
+
+
+def _commercial_content_token_bound(contents: List[Dict[str, Any]]) -> int:
+    try:
+        serialized = json.dumps(contents, ensure_ascii=False, default=str, separators=(",", ":"))
+    except (TypeError, ValueError):
+        serialized = str(contents)
+    return max(_estimate_content_tokens(contents), len(serialized.encode("utf-8")))
+
+
+def _batch_request_id(request_id: str | None, batch_index: int) -> str | None:
+    """Derive a stable reservation id for one batch of a retried operation."""
+
+    normalized = str(request_id or "").strip()
+    return f"{normalized}/batch-{batch_index + 1}" if normalized else None
+
+
+def _usage_tokens(usage: Any) -> int:
+    if isinstance(usage, Mapping):
+        for key in ("total_tokens", "prompt_tokens", "input_tokens", "tokens"):
+            value = usage.get(key)
+            try:
+                if value is not None and int(value) > 0:
+                    return int(value)
+            except (TypeError, ValueError):
+                continue
+    for key in ("total_tokens", "prompt_tokens", "input_tokens", "tokens"):
+        value = getattr(usage, key, None)
+        try:
+            if value is not None and int(value) > 0:
+                return int(value)
+        except (TypeError, ValueError):
+            continue
+    return 0
+
+
+def _estimate_text_tokens(texts: List[str]) -> int:
+    """Estimate provider input tokens before an embedding request.
+
+    Embedding providers do not share a response usage schema, so the hard
+    preflight reservation uses a conservative character-based estimate and
+    reconciles with provider usage when available.
+    """
+    chars = sum(len(text or "") for text in texts)
+    return max(1, math.ceil(chars / 3.5))
+
+
+def _estimate_content_tokens(contents: List[Dict[str, Any]]) -> int:
+    text_items = [str(item.get("text") or "") for item in contents]
+    estimated = _estimate_text_tokens(text_items)
+    # Image/video-only embedding requests still consume provider work but may
+    # expose no token count. Count each such item minimally for quota purposes.
+    return max(estimated, sum(1 for item in contents if not item.get("text")))
+
+
+def _commercial_text_token_bound(texts: List[str]) -> int:
+    """UTF-8 bytes are a provider-neutral upper bound for tokenizer pieces."""
+
+    return max(
+        _estimate_text_tokens(texts), sum(len((text or "").encode("utf-8")) for text in texts)
+    )
+
+
+def _commercial_content_token_bound(contents: List[Dict[str, Any]]) -> int:
+    try:
+        serialized = json.dumps(contents, ensure_ascii=False, default=str, separators=(",", ":"))
+    except (TypeError, ValueError):
+        serialized = str(contents)
+    return max(_estimate_content_tokens(contents), len(serialized.encode("utf-8")))
+
+
+def _batch_request_id(request_id: str | None, batch_index: int) -> str | None:
+    """Derive a stable reservation id for one batch of a retried operation."""
+
+    normalized = str(request_id or "").strip()
+    return f"{normalized}/batch-{batch_index + 1}" if normalized else None
+
+
+def _usage_tokens(usage: Any) -> int:
+    if isinstance(usage, Mapping):
+        for key in ("total_tokens", "prompt_tokens", "input_tokens", "tokens"):
+            value = usage.get(key)
+            try:
+                if value is not None and int(value) > 0:
+                    return int(value)
+            except (TypeError, ValueError):
+                continue
+    for key in ("total_tokens", "prompt_tokens", "input_tokens", "tokens"):
+        value = getattr(usage, key, None)
+        try:
+            if value is not None and int(value) > 0:
+                return int(value)
+        except (TypeError, ValueError):
+            continue
+    return 0
+
+
 class EmbeddingClient:
     """Unified embedding client for RAG and retrieval services."""
+    # 发帖节流：线程级锁串行化"等待间隔+发帖"，跨线程/跨 event loop 互斥
+    # （asyncio 锁在新 loop 模型下失效的教训）。
+    _spacing_lock: Any = None
+    _last_request_monotonic: float = 0.0
+    _thread_guard: Any = None
+
+    @classmethod
+    def _global_spacing_lock(cls):
+        import threading
+
+        if cls._spacing_lock is None:
+            cls._thread_guard = threading.Lock()
+            with cls._thread_guard:
+                if cls._spacing_lock is None:
+                    from threading import Lock as _TLock
+
+                    cls._spacing_lock = _TLock()
+        return cls._spacing_lock
+
+    @staticmethod
+    def _hold_spacing_lock():
+        """Blocking acquire — cross-thread, loop-agnostic."""
+        lock = EmbeddingClient._global_spacing_lock()
+        lock.acquire()
+        return lock
+
+        # 每个线程经 _run_in_new_loop 跑独立 event loop——asyncio.Lock 绑定
+        # 创建时的 loop，跨 loop 既不互斥还会挂死。必须用线程级锁。
+        _spacing_lock: Any = None
+        _last_request_monotonic: float = 0.0
+        _thread_guard: Any = None
+
+        @classmethod
+        def _global_spacing_lock(cls):
+            import threading
+
+            if cls._spacing_lock is None:
+                cls._thread_guard = threading.Lock()
+                with cls._thread_guard:
+                    if cls._spacing_lock is None:
+                        from threading import Lock as _TLock
+
+                        cls._spacing_lock = _TLock()
+            return cls._spacing_lock
+
+        @staticmethod
+        def _hold_spacing_lock():
+            """Blocking acquire — cross-thread, loop-agnostic."""
+            lock = EmbeddingClient._global_spacing_lock()
+            lock.acquire()
+            return lock
+
 
     # 全局发帖节流：KB reindex 时 LlamaIndex 用线程池并发调 embedding，
     # 每个线程经 _run_in_new_loop 跑独立 event loop——asyncio.Lock 绑定
@@ -121,6 +297,7 @@ class EmbeddingClient:
         progress_callback=None,
         *,
         input_type: str | None = None,
+        request_id: str | None = None,
     ) -> List[List[float]]:
         """Embed text batches, optionally identifying their retrieval role."""
         if not texts:
@@ -155,9 +332,33 @@ class EmbeddingClient:
                 dimensions=self.config.dim or None,
                 input_type=role,
             )
+            estimated_tokens = _estimate_text_tokens(batch)
+            lease = self._reserve_quota(estimated_tokens)
+            commercial_quantity = _commercial_text_token_bound(batch)
+            try:
+                commercial_lease = await self._reserve_commercial(
+                    commercial_quantity,
+                    request_id=_batch_request_id(request_id, i),
+                )
+            except BaseException:
+                if lease is not None:
+                    lease.release()
+                raise
             try:
                 await self._wait_for_request_slot()
                 response = await self.adapter.embed(request)
+            except BaseException as exc:
+                await self._release_leases(lease, commercial_lease)
+                if not isinstance(exc, Exception):
+                    raise
+                import traceback as _tb
+
+                self.logger.error(
+                    f"Embedding batch failed "
+                    f"(binding={self.config.binding}, model={self.config.model}, "
+                    f"batch_index={i + 1}/{total_batches}): {exc}\n{_tb.format_exc()}"
+                )
+                raise
             except Exception as exc:
                 # Capture batch context so the task log stream / KB diagnostics
                 # show actionable info instead of a bare exception string.
@@ -182,6 +383,13 @@ class EmbeddingClient:
                 batch_index=i + 1,
                 total_batches=total_batches,
                 start_index=start,
+            )
+            await self._finalize_leases(
+                lease,
+                commercial_lease,
+                getattr(response, "usage", None),
+                estimated_tokens=estimated_tokens,
+                commercial_quantity=commercial_quantity,
             )
             batch_dim = len(validated[0]) if validated else 0
             if expected_dim is None:
@@ -216,6 +424,142 @@ class EmbeddingClient:
             f"{self.config.binding} (batch_size={batch_size})"
         )
         return all_embeddings
+
+
+    def _reserve_quota(self, estimated_tokens: int):
+        if self.config.source == "byok":
+            from deeptutor.multi_user.byok_usage import start_byok_usage
+            from deeptutor.multi_user.context import get_current_user
+            from deeptutor.multi_user.execution_source import get_execution_source
+
+            source = get_execution_source()
+            source_for_service = source if source and source.service == "embedding" else None
+            return start_byok_usage(
+                service="embedding",
+                user_id=source_for_service.user_id if source_for_service else get_current_user().id,
+                profile_id=(
+                    source_for_service.profile_id
+                    if source_for_service and source_for_service.profile_id
+                    else self.config.profile_id or "unknown"
+                ),
+                provider=self.config.provider_name or self.config.binding,
+                model=self.config.model,
+                estimated_units=estimated_tokens,
+            )
+        from deeptutor.multi_user.token_quota import reserve_current_user_units
+
+        return reserve_current_user_units(
+            resource="embedding",
+            requested_units=estimated_tokens,
+        )
+
+    @staticmethod
+    def _finalize_quota(lease: Any, usage: Any, estimated_tokens: int) -> None:
+        if lease is not None:
+            lease.finalize(_usage_tokens(usage) or estimated_tokens)
+
+    async def _reserve_commercial(
+        self,
+        quantity: int,
+        *,
+        request_id: str | None = None,
+    ):
+        from deeptutor.commercial.metering import (
+            CommercialUsageLimitExceeded,
+            CommercialUsageUnavailable,
+            reserve_commercial_usage,
+        )
+
+        from .adapters import EmbeddingProviderError
+
+        try:
+            return await reserve_commercial_usage(
+                meter="embedding_tokens",
+                quantity=quantity,
+                source=self.config.source,
+                provider=self.config.provider_name or self.config.binding,
+                model=self.config.model,
+                request_id=request_id,
+            )
+        except CommercialUsageLimitExceeded as exc:
+            raise EmbeddingProviderError(
+                str(exc),
+                status=429,
+                model=self.config.model,
+                provider="deeptutor",
+            ) from exc
+        except CommercialUsageUnavailable as exc:
+            raise EmbeddingProviderError(
+                str(exc),
+                status=503,
+                model=self.config.model,
+                provider="deeptutor",
+            ) from exc
+
+    @staticmethod
+    async def _release_leases(lease: Any, commercial_lease: Any) -> None:
+        """Release both ledgers even when the legacy SQLite release fails."""
+
+        try:
+            if lease is not None:
+                lease.release()
+        finally:
+            if commercial_lease is not None:
+                await commercial_lease.release()
+
+    async def _finalize_leases(
+        self,
+        lease: Any,
+        commercial_lease: Any,
+        usage: Any,
+        *,
+        estimated_tokens: int,
+        commercial_quantity: int,
+    ) -> None:
+        """Settle PostgreSQL even when the legacy SQLite finalizer fails."""
+
+        try:
+            self._finalize_quota(lease, usage, estimated_tokens)
+        finally:
+            await self._finalize_commercial(
+                commercial_lease,
+                usage,
+                commercial_quantity,
+            )
+
+    async def _finalize_commercial(
+        self,
+        lease: Any,
+        usage: Any,
+        fallback_quantity: int,
+    ) -> None:
+        if lease is None:
+            return
+        from deeptutor.commercial.metering import (
+            CommercialUsageUnavailable,
+            measurement_from_usage,
+        )
+
+        from .adapters import EmbeddingProviderError
+
+        measurement = measurement_from_usage(
+            usage,
+            fallback_quantity=fallback_quantity,
+            meter="embedding_tokens",
+        )
+        try:
+            await lease.finalize(
+                measurement.quantity,
+                usage_units=measurement.units,
+                is_estimated=measurement.is_estimated,
+            )
+        except CommercialUsageUnavailable as exc:
+            raise EmbeddingProviderError(
+                str(exc),
+                status=503,
+                model=self.config.model,
+                provider="deeptutor",
+            ) from exc
 
     def supports_multimodal_contents(self) -> bool:
         """Return whether the configured adapter/model accepts multimodal contents."""

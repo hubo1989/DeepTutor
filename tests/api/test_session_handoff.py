@@ -50,16 +50,24 @@ def _handoff_client(
             ),
         )
         bearer = "pb-bearer-token-that-must-not-persist"
+        alice_user_id = "pb-user"
     else:
-        bearer = auth_service.create_token("alice", "user", "u-alice")
+        # The v2 decode path requires the account to exist in the store
+        # (revocation is immediate), so provision it before minting a token.
+        auth_service.add_user("alice", "alice-password-123", role="user")
+        from deeptutor.multi_user.identity import load_users
+
+        record = load_users().get("alice") or {}
+        alice_user_id = str(record.get("id") or "u-alice")
+        bearer = auth_service.create_token("alice", "user", alice_user_id)
 
     app = FastAPI()
     app.include_router(auth_router.router, prefix="/api/auth")
-    return TestClient(_loopback_proxy(app)), bearer
+    return TestClient(_loopback_proxy(app)), bearer, alice_user_id
 
 
 def test_private_create_public_exchange_and_complete(tmp_path, monkeypatch) -> None:
-    client, bearer = _handoff_client(tmp_path, monkeypatch)
+    client, bearer, alice_user_id = _handoff_client(tmp_path, monkeypatch)
     monkeypatch.setattr(auth_router, "_SECURE", True)
     monkeypatch.setattr(auth_router, "_SAMESITE", "none")
 
@@ -99,7 +107,8 @@ def test_private_create_public_exchange_and_complete(tmp_path, monkeypatch) -> N
         completed.cookies.get("dt_token", ""),
     )
     assert session is not None
-    assert (session.username, session.role, session.user_id) == ("alice", "user", "u-alice")
+    assert (session.username, session.role) == ("alice", "user")
+    assert session.user_id == alice_user_id
 
     replayed = client.post(
         "/api/auth/session-handoff/complete",
@@ -110,7 +119,7 @@ def test_private_create_public_exchange_and_complete(tmp_path, monkeypatch) -> N
 
 
 def test_codes_and_tickets_reject_mismatched_frontend_hosts(tmp_path, monkeypatch) -> None:
-    client, bearer = _handoff_client(tmp_path, monkeypatch)
+    client, bearer, alice_user_id = _handoff_client(tmp_path, monkeypatch)
     created = client.post(
         "/api/auth/session-handoff",
         headers={
@@ -145,7 +154,7 @@ def test_codes_and_tickets_reject_mismatched_frontend_hosts(tmp_path, monkeypatc
 
 
 def test_malformed_frontend_host_is_rejected_without_server_error(tmp_path, monkeypatch) -> None:
-    client, _ = _handoff_client(tmp_path, monkeypatch)
+    client, _, _ = _handoff_client(tmp_path, monkeypatch)
 
     exchange = client.post(
         "/api/auth/session-handoff/exchange",
@@ -163,7 +172,7 @@ def test_malformed_frontend_host_is_rejected_without_server_error(tmp_path, monk
 
 
 def test_pocketbase_bearer_is_jwe_wrapped_and_cookie_is_http_only(tmp_path, monkeypatch) -> None:
-    client, bearer = _handoff_client(tmp_path, monkeypatch, pocketbase=True)
+    client, bearer, alice_user_id = _handoff_client(tmp_path, monkeypatch, pocketbase=True)
     monkeypatch.setattr(auth_router, "_SECURE", True)
     monkeypatch.setattr(auth_router, "_SAMESITE", "none")
 
@@ -197,7 +206,7 @@ def test_pocketbase_bearer_is_jwe_wrapped_and_cookie_is_http_only(tmp_path, monk
 
 
 def test_private_login_host_policy_gates_password_login(tmp_path, monkeypatch) -> None:
-    _, bearer = _handoff_client(tmp_path, monkeypatch)
+    _, bearer, _unused_id = _handoff_client(tmp_path, monkeypatch)
     payload = auth_service.TokenPayload(username="alice", role="user", user_id="u-alice")
     monkeypatch.setattr(auth_router, "authenticate", lambda _username, _password: payload)
     monkeypatch.setattr(auth_router, "create_token", lambda *_args, **_kwargs: bearer)
@@ -221,7 +230,7 @@ def test_private_login_host_policy_gates_password_login(tmp_path, monkeypatch) -
 
 
 def test_direct_backend_request_cannot_forge_private_frontend_host(tmp_path, monkeypatch) -> None:
-    _, bearer = _handoff_client(tmp_path, monkeypatch)
+    _, bearer, _unused_id = _handoff_client(tmp_path, monkeypatch)
     app = FastAPI()
     app.include_router(auth_router.router, prefix="/api/auth")
     with TestClient(app) as direct:

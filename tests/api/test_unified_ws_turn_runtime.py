@@ -503,7 +503,7 @@ async def test_turn_runtime_persists_llm_selection_in_turn_snapshot(
     monkeypatch.setattr("deeptutor.services.skill.get_skill_service", _fake_skill_service)
     monkeypatch.setattr("deeptutor.services.persona.get_persona_service", _fake_persona_service)
 
-    selection = {"profile_id": "p-alt", "model_id": "m-alt"}
+    selection = {"source": "platform", "profile_id": "p-alt", "model_id": "m-alt"}
     session, turn = await runtime.start_turn(
         {
             "type": "start_turn",
@@ -731,8 +731,8 @@ async def test_turn_runtime_allows_model_switching_within_same_session(
     monkeypatch.setattr("deeptutor.services.skill.get_skill_service", _fake_skill_service)
     monkeypatch.setattr("deeptutor.services.persona.get_persona_service", _fake_persona_service)
 
-    first_selection = {"profile_id": "p-default", "model_id": "m-default"}
-    second_selection = {"profile_id": "p-alt", "model_id": "m-alt"}
+    first_selection = {"source": "platform", "profile_id": "p-default", "model_id": "m-default"}
+    second_selection = {"source": "platform", "profile_id": "p-alt", "model_id": "m-alt"}
 
     session, first_turn = await runtime.start_turn(
         {
@@ -794,7 +794,7 @@ async def test_regenerate_reuses_snapshot_or_override_llm_selection(tmp_path) ->
     session = await store.create_session(session_id="session-with-snapshot")
     await store.update_session_preferences(
         session["id"],
-        {"llm_selection": {"profile_id": "p-default", "model_id": "m-default"}},
+        {"llm_selection": {"source": "platform", "profile_id": "p-default", "model_id": "m-default"}},
     )
     await store.add_message(
         session_id=session["id"],

@@ -5,7 +5,36 @@ from __future__ import annotations
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from urllib.parse import quote
+
 from fastapi.responses import FileResponse
+
+_RESTRICTIVE_CSP = "sandbox; default-src 'none'"
+_ACTIVE_CONTENT_SUFFIXES = {
+    ".html",
+    ".htm",
+    ".svg",
+    ".xht",
+    ".xhtml",
+    ".xml",
+    ".pdf",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".webm",
+    ".mp4",
+    ".mp3",
+    ".wav",
+}
+
+
+def _attachment_disposition(filename: str) -> str:
+    fallback = filename.encode("ascii", errors="replace").decode("ascii")
+    fallback = fallback.replace('"', "_").replace("\\", "_")
+    return f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{quote(filename, safe='')}"
+
 
 from deeptutor.api.routers.auth import require_auth
 from deeptutor.multi_user.context import get_current_user_or_none
@@ -85,4 +114,11 @@ async def read_output(
         path = _resolve_partner_output(output_path)
         if path is None:
             raise
-    return FileResponse(path)
+    headers = {
+        "Cache-Control": "private, max-age=0, must-revalidate",
+        "X-Content-Type-Options": "nosniff",
+        "Content-Security-Policy": _RESTRICTIVE_CSP,
+    }
+    if path.suffix.lower() in _ACTIVE_CONTENT_SUFFIXES:
+        headers["Content-Disposition"] = _attachment_disposition(path.name)
+    return FileResponse(path=str(path), headers=headers)

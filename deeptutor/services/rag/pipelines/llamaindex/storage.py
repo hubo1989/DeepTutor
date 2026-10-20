@@ -66,16 +66,33 @@ def resolve_add_storage_plan(kb_dir: Path, signature: EmbeddingSignature | None)
 
 
 def create_index(
-    documents: list[Any], storage_dir: Path, *, show_progress: bool | None = None
+    documents: list[Any],
+    storage_dir: Path,
+    *,
+    show_progress: bool | None = None,
+    prepare_staging: Callable[[Path], None] | None = None,
 ) -> int:
-    index, count = ingestion.create_index_from_documents(
-        documents, storage_dir, show_progress=show_progress
+    from deeptutor.commercial.storage_limits import (
+        create_staging_directory,
+        promote_staged_directory_with_storage_limits,
     )
-    retrievers.persist_bm25_retriever(index, storage_dir, top_k=20)
-    from deeptutor.services.rag.source_pages import persist_page_catalog
 
-    persist_page_catalog(documents, storage_dir)
-    return count
+    staging = create_staging_directory(storage_dir)
+    try:
+        index, count = ingestion.create_index_from_documents(
+            documents, staging, show_progress=show_progress
+        )
+        retrievers.persist_bm25_retriever(index, staging, top_k=20)
+        from deeptutor.services.rag.source_pages import persist_page_catalog
+
+        persist_page_catalog(documents, staging)
+        if prepare_staging is not None:
+            prepare_staging(staging)
+        promote_staged_directory_with_storage_limits(staging, storage_dir)
+        return count
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
 
 
 def insert_documents(existing_storage: Path, storage_dir: Path, documents: list[Any]) -> int:

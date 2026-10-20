@@ -28,6 +28,11 @@ class EmbeddingConfig:
     request_timeout: int = 60
     batch_size: int = 10
     batch_delay: float = 0.0
+    # Accounting/source metadata is public reference data only. The API key
+    # remains in the adapter instance and is never serialized with this object.
+    source: str = "platform"
+    profile_id: str | None = None
+    profile_generation: int | None = None
 
 
 _scoped_config: ContextVar[EmbeddingConfig | None] = ContextVar("embedding_config", default=None)

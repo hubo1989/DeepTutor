@@ -16,11 +16,13 @@ class _FakeWebSocket:
         self.query_params = {"token": "test-token"}
         self.cookies: dict[str, str] = {}
         self.headers: dict[str, str] = {}
-        self._messages = [json.dumps(message)]
+        self._messages = [json.dumps({"protocol_version": "2.0", **message})]
         self.payload = payload
         self.sent: list[dict[str, object]] = []
         self.accepted = False
         self.close_codes: list[int] = []
+
+        self.app = SimpleNamespace(state=SimpleNamespace())
 
     async def accept(self) -> None:
         self.accepted = True
@@ -90,18 +92,43 @@ async def _run_user_input(
         "deeptutor.commercial.entitlement_context.install_commercial_access_for_current_user",
         refresh_commercial_access,
     )
+    # The v2 socket resolves its turn service through the application
+    # container rather than the legacy module-level manager accessor.
+    async def _submit_user_input(turn_id: str, content: str, command_id: str) -> bool:
+        turn = await store.get_turn(turn_id)
+        if turn is None:
+            return False
+        # The turn's own session must match the one this caller reached it
+        # through; a mismatch means the turn belongs to another session.
+        if str(turn.get("session_id") or "") != requested_session_id:
+            return False
+        session = await store.get_session(turn.get("session_id") or "")
+        if session is None:
+            return False
+        bus.submit_input(content)
+        return True
+
+    async def _noop_start() -> None:
+        return None
+
     monkeypatch.setattr(
-        "deeptutor.services.session.get_turn_runtime_manager",
-        lambda: SimpleNamespace(store=store),
+        "deeptutor.app.container.get_application_container",
+        lambda: SimpleNamespace(
+            turns=SimpleNamespace(
+                store=store,
+                submit_user_input=_submit_user_input,
+            ),
+            start=_noop_start,
+        ),
     )
-    monkeypatch.setattr("deeptutor.core.stream_bus.get_bus", lambda _turn_id: bus)
+    monkeypatch.setattr("deeptutor.runtime.stream_bus.get_bus", lambda _turn_id: bus)
 
     ws = _FakeWebSocket(
         {
             "type": "user_input",
             "turn_id": turn_id,
-            "session_id": requested_session_id,
             "content": "private answer",
+            "command_id": "cmd-1",
         },
         caller,
     )
@@ -118,7 +145,20 @@ async def test_user_input_rejects_another_owners_turn(monkeypatch) -> None:
     )
 
     assert bus.inputs == []
-    assert ws.sent == [{"type": "error", "content": "Turn not found: turn_owned_by_alice"}]
+    # The v2 protocol acknowledges the command and reports the refusal as
+    # a turn-not-active reason rather than a bare error frame.
+    assert ws.sent == [
+        {
+            "type": "command_ack",
+            "command_id": "cmd-1",
+            "command_type": "user_input",
+            "accepted": False,
+            "turn_id": "turn_owned_by_alice",
+            "error_code": "turn_not_active",
+            "message": "Turn is not active: turn_owned_by_alice",
+            "protocol_version": "2.0",
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -129,7 +169,19 @@ async def test_user_input_accepts_the_turn_owner(monkeypatch) -> None:
         requested_session_id="session_owned_by_alice",
     )
 
-    assert ws.sent == []
+    # The v2 protocol acknowledges an accepted user_input.
+    assert ws.sent == [
+        {
+            "type": "command_ack",
+            "command_id": "cmd-1",
+            "command_type": "user_input",
+            "accepted": True,
+            "turn_id": "turn_owned_by_alice",
+            "error_code": "",
+            "message": "",
+            "protocol_version": "2.0",
+        }
+    ]
     assert bus.inputs == ["private answer"]
 
 
@@ -142,7 +194,20 @@ async def test_user_input_rejects_owner_with_mismatched_session(monkeypatch) -> 
     )
 
     assert bus.inputs == []
-    assert ws.sent == [{"type": "error", "content": "Turn not found: turn_owned_by_alice"}]
+    # The v2 protocol acknowledges the command and reports the refusal as
+    # a turn-not-active reason rather than a bare error frame.
+    assert ws.sent == [
+        {
+            "type": "command_ack",
+            "command_id": "cmd-1",
+            "command_type": "user_input",
+            "accepted": False,
+            "turn_id": "turn_owned_by_alice",
+            "error_code": "turn_not_active",
+            "message": "Turn is not active: turn_owned_by_alice",
+            "protocol_version": "2.0",
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -164,21 +229,54 @@ async def test_user_input_keeps_auth_disabled_local_mode_compatible(monkeypatch)
         "deeptutor.commercial.entitlement_context.install_commercial_access_for_current_user",
         refresh_commercial_access,
     )
+    # The v2 socket resolves its turn service through the application
+    # container rather than the legacy module-level manager accessor.
+    async def _submit_user_input(turn_id: str, content: str, command_id: str) -> bool:
+        turn = await store.get_turn(turn_id)
+        if turn is None:
+            return False
+        session = await store.get_session(turn.get("session_id") or "")
+        if session is None:
+            return False
+        bus.submit_input(content)
+        return True
+
+    async def _noop_start() -> None:
+        return None
+
     monkeypatch.setattr(
-        "deeptutor.services.session.get_turn_runtime_manager",
-        lambda: SimpleNamespace(store=store),
+        "deeptutor.app.container.get_application_container",
+        lambda: SimpleNamespace(
+            turns=SimpleNamespace(
+                store=store,
+                submit_user_input=_submit_user_input,
+            ),
+            start=_noop_start,
+        ),
     )
-    monkeypatch.setattr("deeptutor.core.stream_bus.get_bus", lambda _turn_id: bus)
+    monkeypatch.setattr("deeptutor.runtime.stream_bus.get_bus", lambda _turn_id: bus)
 
     ws = _FakeWebSocket(
         {
             "type": "user_input",
             "turn_id": "turn_local",
             "content": "local answer",
+            "command_id": "cmd-local",
         },
         TokenPayload(username="ignored", role="user", user_id="ignored"),
     )
     await unified_ws.unified_websocket(ws)  # type: ignore[arg-type]
 
-    assert ws.sent == []
+    assert ws.sent == [
+        {
+            "type": "command_ack",
+            "command_id": "cmd-local",
+            "command_type": "user_input",
+            "accepted": True,
+            "turn_id": "turn_local",
+            "error_code": "",
+            "message": "",
+            "protocol_version": "2.0",
+        }
+    ]
     assert bus.inputs == ["local answer"]

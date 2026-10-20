@@ -57,12 +57,14 @@ def _patch_valid_handshake(monkeypatch) -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "endpoint",
-    ["chat", "question_mimic", "question_generate", "quiz_judge", "book", "partner"],
+    # chat: the legacy chat socket was folded into the unified WS endpoint
+    # upstream; the remaining legacy sockets keep their capability gate.
+    ["question_mimic", "question_generate", "quiz_judge", "book", "partner"],
 )
 async def test_consuming_legacy_websockets_reject_user_without_llm_grant(
     endpoint, monkeypatch
 ) -> None:
-    from deeptutor.api.routers import book, chat, partners, question, quiz_judge
+    from deeptutor.api.routers import book, partners, question, quiz_judge
     from deeptutor.multi_user import model_access
 
     _patch_valid_handshake(monkeypatch)
@@ -76,9 +78,7 @@ async def test_consuming_legacy_websockets_reject_user_without_llm_grant(
     monkeypatch.setattr(book, "get_book_engine", lambda: object())
 
     ws = _FakeWebSocket()
-    if endpoint == "chat":
-        await chat.websocket_chat(ws)  # type: ignore[arg-type]
-    elif endpoint == "question_mimic":
+    if endpoint == "question_mimic":
         await question.websocket_mimic_generate(ws)  # type: ignore[arg-type]
     elif endpoint == "question_generate":
         await question.websocket_question_generate(ws)  # type: ignore[arg-type]
@@ -94,24 +94,6 @@ async def test_consuming_legacy_websockets_reject_user_without_llm_grant(
 
 
 @pytest.mark.asyncio
-async def test_legacy_chat_revalidates_identity_before_each_message(monkeypatch) -> None:
-    from deeptutor.api.routers import auth, chat
-    from deeptutor.multi_user import model_access
-
-    valid = TokenPayload(username="alice", role="user", user_id="u_alice")
-    decoded = iter([valid, None])
-    monkeypatch.setattr(auth, "AUTH_ENABLED", True)
-    monkeypatch.setattr(auth, "decode_token", lambda _token: next(decoded))
-    monkeypatch.setattr(model_access, "has_capability_access", lambda _capability: True)
-
-    ws = _FakeWebSocket([{"message": ""}])
-    await chat.websocket_chat(ws)  # type: ignore[arg-type]
-
-    assert ws.accepted is True
-    assert ws.close_codes == [4001]
-    assert ws.sent == []
-
-
 @pytest.mark.asyncio
 async def test_kb_progress_socket_rejects_unowned_kb_before_accept(monkeypatch) -> None:
     from deeptutor.api.routers import knowledge

@@ -123,6 +123,11 @@ class LLMConfig:
     wire_api: str = "auto"
     api_format: str = "auto"
     reasoning_effort: str | None = None
+    # Whether this config resolves credentials from the platform catalog or a
+    # request-scoped BYOK profile.  Consumers must use this durable marker
+    # instead of inferring the source from ContextVars, which do not propagate
+    # across every async/thread boundary.
+    source: str = "platform"
     context_window: int | None = None
     max_tokens: int = 4096
     temperature: float = 0.7

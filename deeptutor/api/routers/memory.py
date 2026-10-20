@@ -368,8 +368,8 @@ async def cancel_run(run_id: str):
 
     manager = get_run_manager()
     owner_id = _memory_owner_id()
-    if manager.get(run_id, owner_id=owner_id) is None:
-        raise HTTPException(status_code=404, detail="unknown run_id")
+    # Owner-scoped cancel: an unknown id and another owner's id both land on
+    # "not active" (409) so existence is not disclosed across owners.
     ok = await manager.cancel(run_id, owner_id=owner_id)
     if not ok:
         raise HTTPException(status_code=409, detail="not active")

@@ -86,6 +86,11 @@ def _build_cors_settings() -> dict[str, object]:
         "http://127.0.0.1:3000",
     ]
     for origin in extra_origins:
+        # LearnLeader: a wildcard origin hands every site credentialed access
+        # once authentication is on, so explicit operator configuration wins.
+        if auth_settings["enabled"] and origin == "*":
+            logger.warning("Ignoring wildcard CORS origin while authentication is enabled")
+            continue
         if origin not in origins:
             origins.append(origin)
 
@@ -578,6 +583,7 @@ from deeptutor.api.routers import (
     tools as tools_router,
 )
 from deeptutor.api.routers import byok  # noqa: E402
+from deeptutor.api.routers import plugins_api  # noqa: E402
 from deeptutor.api.routers.file_library import router as file_library_router  # noqa: E402
 from deeptutor.api.routers.multi_user import router as multi_user_router  # noqa: E402
 
@@ -600,6 +606,7 @@ from deeptutor.api.routers.auth import (  # noqa: E402
 
 _auth = [Depends(require_learning_surface)]
 app.include_router(byok.router, prefix="/api/v1", tags=["byok"], dependencies=_auth)
+app.include_router(plugins_api.router, prefix="/api/v1/plugins", tags=["plugins"], dependencies=_auth)
 # Partner data is anchored at the admin workspace (data/partners) and shared
 # process-wide, so management is admin-gated in multi-user deployments
 # (single-user local runs are implicitly admin — no behaviour change there).

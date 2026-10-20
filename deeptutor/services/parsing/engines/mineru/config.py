@@ -60,6 +60,11 @@ class MinerUConfig:
     # Local-mode model weight download source + optional custom address
     # (HF_ENDPOINT mirror; "" = the source's official address).
     model_download_source: str = "huggingface"
+    # Platform/BYOK source metadata; the token itself remains only in the
+    # adapter instance and is never serialized.
+    source: str = "platform"
+    profile_id: str | None = None
+    profile_generation: int | None = None
     model_download_endpoint: str = ""
     model_version: str = "pipeline"
     language: str = "auto"

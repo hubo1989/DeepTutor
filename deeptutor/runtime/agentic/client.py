@@ -15,6 +15,7 @@ from dataclasses import dataclass, replace
 import hashlib
 import inspect
 import json
+import math
 import threading
 from types import SimpleNamespace
 from typing import Any
@@ -25,9 +26,11 @@ from deeptutor.services.config import load_system_settings
 from deeptutor.services.keypool import KeyPool, primary_api_key
 from deeptutor.services.llm import get_token_limit_kwargs, supports_tools
 from deeptutor.services.llm.capabilities import catalog_capability_override
+from deeptutor.services.llm.usage_estimation import estimate_prompt_tokens
 from deeptutor.services.llm.exceptions import (
     LLMProviderError,
     LLMProviderTransportError,
+    LLMRateLimitError,
 )
 from deeptutor.services.llm.openai_http_client import (
     openai_sdk_client_kwargs,
@@ -77,6 +80,7 @@ class LLMClientConfig:
     api_version: str | None = None
     extra_headers: dict[str, str] | None = None
     reasoning_effort: str | None = None
+    source: Literal["platform", "byok"] = "platform"
     wire_api: str = "auto"
     api_format: str = "auto"
 
@@ -244,10 +248,15 @@ def build_openai_client(config: LLMClientConfig) -> Any:
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
-        return instrument_client(
-            _build_openai_client(config, disable_ssl_verify=disable_ssl_verify),
-            model=config.model or "",
+        return _wrap_token_quota(
+            instrument_client(
+                _build_openai_client(config, disable_ssl_verify=disable_ssl_verify),
+                model=config.model or "",
+                provider=config.binding,
+            ),
+            source=config.source,
             provider=config.binding,
+            model=config.model,
         )
 
     key = _client_cache_key(config, loop, disable_ssl_verify)
@@ -256,10 +265,15 @@ def build_openai_client(config: LLMClientConfig) -> Any:
         if cached is not None:
             _agentic_client_pool.move_to_end(key)
             return cached
-        client = instrument_client(
-            _build_openai_client(config, disable_ssl_verify=disable_ssl_verify),
-            model=config.model or "",
+        client = _wrap_token_quota(
+            instrument_client(
+                _build_openai_client(config, disable_ssl_verify=disable_ssl_verify),
+                model=config.model or "",
+                provider=config.binding,
+            ),
+            source=config.source,
             provider=config.binding,
+            model=config.model,
         )
         _agentic_client_pool[key] = client
         _agentic_client_pool.move_to_end(key)
@@ -785,3 +799,452 @@ def can_use_native_tool_calling(
     if supports_tools(binding, model):
         return True
     return bool(spec and backend == "openai_compat")
+
+
+def _estimate_tokens(value: Any) -> int:
+    """Conservative, provider-neutral estimate used for pre-call reservation."""
+    try:
+        serialized = json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
+    except (TypeError, ValueError):
+        serialized = str(value)
+    return max(1, math.ceil(len(serialized) / 3.5))
+
+
+def _request_token_estimate(kwargs: dict[str, Any]) -> tuple[int, int, int]:
+    # Agentic calls share the image-safe prompt estimator with the provider
+    # factory. Tool schemas remain a separate conservative text estimate.
+    prompt_tokens = estimate_prompt_tokens(kwargs.get("messages") or []) + _estimate_tokens(
+        {"tools": kwargs.get("tools") or []}
+    )
+    raw_output = kwargs.get("max_completion_tokens", kwargs.get("max_tokens", 4096))
+    try:
+        output_tokens = max(1, int(raw_output or 4096))
+    except (TypeError, ValueError):
+        output_tokens = 4096
+    return prompt_tokens + output_tokens, prompt_tokens, output_tokens
+
+
+def _request_commercial_token_bound(kwargs: dict[str, Any], output_tokens: int) -> int:
+    """Bound commercial usage without treating image transport bytes as text."""
+
+    message_bound = estimate_prompt_tokens(kwargs.get("messages") or [])
+    other_value = {
+        "tools": kwargs.get("tools") or [],
+    }
+    try:
+        serialized = json.dumps(
+            other_value,
+            ensure_ascii=False,
+            default=str,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError):
+        serialized = str(other_value)
+    return message_bound + _estimate_tokens(other_value) + output_tokens
+
+
+def _usage_total(value: Any) -> int:
+    usage = value
+    if usage is None:
+        return 0
+    if isinstance(usage, dict):
+        try:
+            return max(0, int(usage.get("total_tokens") or 0))
+        except (TypeError, ValueError):
+            return 0
+    try:
+        return max(0, int(getattr(usage, "total_tokens", 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _stream_chunk_text(chunk: Any) -> str:
+    choices = getattr(chunk, "choices", None) or []
+    if not choices:
+        return ""
+    delta = getattr(choices[0], "delta", None)
+    return str(getattr(delta, "content", "") or "") if delta is not None else ""
+
+
+
+def _wrap_token_quota(
+    client: Any,
+    *,
+    source: str = "platform",
+    provider: str | None = None,
+    model: str | None = None,
+) -> Any:
+    """Wrap generated clients with platform quota or BYOK safety accounting."""
+    from deeptutor.commercial.metering import commercial_usage_required
+    from deeptutor.multi_user.token_quota import current_user_quota_policy
+
+    # BYOK calls still need the request-rate/token safety gate; only the
+    # platform path may skip metering when no user quota is configured.  The
+    # source is carried by LLMClientConfig so this remains correct when the
+    # request ContextVar does not survive a thread/async boundary.
+    normalized_source: Literal["platform", "byok"] = "byok" if source == "byok" else "platform"
+    if (
+        normalized_source == "platform"
+        and current_user_quota_policy() is None
+        and not commercial_usage_required(source=normalized_source)
+    ):
+        # No metering is configured, but callers still attach internal kwargs
+        # (``_commercial_request_id``); wrap so they are stripped rather than
+        # leaked to the provider's ``create()``. ``meter=False`` makes the
+        # wrapper a pure passthrough with no reservation overhead.
+        return _TokenQuotaClient(
+            client,
+            source=normalized_source,
+            provider=provider,
+            model=model,
+            meter=False,
+        )
+    return _TokenQuotaClient(
+        client,
+        source=normalized_source,
+        provider=provider,
+        model=model,
+    )
+
+
+
+class _TokenQuotaClient:
+    def __init__(
+        self,
+        client: Any,
+        *,
+        source: Literal["platform", "byok"] = "platform",
+        provider: str | None = None,
+        model: str | None = None,
+        meter: bool = True,
+    ) -> None:
+        self._client = client
+        self.chat = SimpleNamespace(
+            completions=_TokenQuotaCompletions(
+                client.chat.completions,
+                source=source,
+                provider=provider,
+                model=model,
+                meter=meter,
+            ),
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._client, name)
+
+    @property
+    def __class__(self) -> type:
+        # Proxy the wrapped client's type so ``isinstance`` checks against
+        # provider adapters keep working through the quota wrapper.
+        return type(self._client)
+
+
+class _TokenQuotaCompletions:
+    def __init__(
+        self,
+        completions: Any,
+        *,
+        source: Literal["platform", "byok"] = "platform",
+        provider: str | None = None,
+        model: str | None = None,
+        meter: bool = True,
+    ) -> None:
+        self._completions = completions
+        self._source = source
+        self._provider = provider
+        self._model = model
+        # When False the wrapper still strips DeepTutor-internal kwargs (e.g.
+        # ``_commercial_request_id``) so they never reach the provider, but it
+        # skips every quota/commercial reservation. Used for the platform path
+        # when no quota policy and no commercial metering are configured.
+        self._meter = meter
+
+    async def create(self, **kwargs: Any) -> Any:
+        # DeepTutor-only accounting metadata must never reach the provider.
+        # Callers that can retry the same logical provider operation should
+        # reuse this value so PostgreSQL can return the durable reservation
+        # instead of booking a duplicate.
+        commercial_request_id = kwargs.pop("_commercial_request_id", None)
+        if not self._meter:
+            # No quota/commercial metering is configured — forward untouched
+            # apart from stripping the internal metadata already popped above.
+            return await self._completions.create(**kwargs)
+        requested, prompt_estimate, output_estimate = _request_token_estimate(kwargs)
+        commercial_requested = _request_commercial_token_bound(kwargs, output_estimate)
+        if self._source == "byok":
+            from deeptutor.commercial.metering import (
+                CommercialUsageLimitExceeded,
+                CommercialUsageUnavailable,
+                reserve_commercial_usage,
+            )
+            from deeptutor.multi_user.byok_usage import (
+                ByokUsageLimitExceeded,
+                ByokUsageUnavailable,
+                start_byok_usage,
+            )
+            from deeptutor.multi_user.execution_source import get_execution_source
+
+            execution_source = get_execution_source()
+            if execution_source is None:
+                from deeptutor.multi_user.context import get_current_user
+
+                user_id = get_current_user().id
+                profile_id = "unknown"
+            else:
+                user_id = execution_source.user_id
+                profile_id = execution_source.profile_id or "unknown"
+            try:
+                # BYOK tokens remain user-funded, but an expired hosted
+                # account must not bypass the subscription gate by selecting
+                # a private key.
+                await reserve_commercial_usage(
+                    meter="llm_tokens",
+                    quantity=commercial_requested,
+                    source="byok",
+                    provider=self._provider or "openai-compatible",
+                    model=str(kwargs.get("model") or self._model or "unknown"),
+                    request_id=commercial_request_id,
+                )
+            except CommercialUsageLimitExceeded as exc:
+                raise LLMRateLimitError(str(exc), provider="deeptutor") from exc
+            except CommercialUsageUnavailable as exc:
+                raise LLMProviderError(str(exc), provider="deeptutor") from exc
+            try:
+                byok_lease = start_byok_usage(
+                    service="llm",
+                    user_id=user_id,
+                    profile_id=profile_id,
+                    provider="openai-compatible",
+                    model=str(kwargs.get("model") or "unknown"),
+                    estimated_units=requested,
+                )
+            except ByokUsageLimitExceeded as exc:
+                raise LLMRateLimitError(str(exc), provider="deeptutor") from exc
+            except ByokUsageUnavailable as exc:
+                raise LLMProviderError(str(exc), provider="deeptutor") from exc
+            try:
+                response = await self._completions.create(**kwargs)
+            except BaseException:
+                byok_lease.release()
+                raise
+            if not kwargs.get("stream"):
+                actual = _usage_total(getattr(response, "usage", None)) or requested
+                byok_lease.finalize(actual)
+                return response
+            return _TokenQuotaStream(
+                response,
+                lease=None,
+                byok_lease=byok_lease,
+                commercial_lease=None,
+                requested_tokens=requested,
+                commercial_requested_tokens=0,
+                prompt_estimate=prompt_estimate,
+                output_estimate=output_estimate,
+            )
+        from deeptutor.commercial.metering import (
+            CommercialUsageLimitExceeded,
+            CommercialUsageUnavailable,
+            measurement_from_usage,
+            reserve_commercial_usage,
+        )
+        from deeptutor.multi_user.token_quota import (
+            TokenQuotaExceeded,
+            TokenQuotaUnavailable,
+            reserve_current_user_tokens,
+        )
+
+        provider = self._provider or "openai-compatible"
+        model = str(kwargs.get("model") or self._model or "unknown")
+        try:
+            commercial_lease = await reserve_commercial_usage(
+                meter="llm_tokens",
+                quantity=commercial_requested,
+                source="platform",
+                provider=provider,
+                model=model,
+                request_id=commercial_request_id,
+            )
+        except CommercialUsageLimitExceeded as exc:
+            raise LLMRateLimitError(str(exc), provider="deeptutor") from exc
+        except CommercialUsageUnavailable as exc:
+            raise LLMProviderError(str(exc), provider="deeptutor") from exc
+
+        try:
+            lease = reserve_current_user_tokens(
+                requested_tokens=requested,
+                prompt_tokens_estimate=prompt_estimate,
+                output_tokens_estimate=output_estimate,
+            )
+        except TokenQuotaExceeded as exc:
+            if commercial_lease is not None:
+                await commercial_lease.release()
+            raise LLMRateLimitError(str(exc), provider="deeptutor") from exc
+        except TokenQuotaUnavailable as exc:
+            if commercial_lease is not None:
+                await commercial_lease.release()
+            raise LLMProviderError(str(exc), provider="deeptutor") from exc
+
+        try:
+            response = await self._completions.create(**kwargs)
+        except BaseException:
+            try:
+                if lease is not None:
+                    lease.release()
+            finally:
+                if commercial_lease is not None:
+                    await commercial_lease.release()
+            raise
+
+        if not kwargs.get("stream"):
+            usage = getattr(response, "usage", None)
+            try:
+                if lease is not None:
+                    actual = _usage_total(usage)
+                    if actual <= 0:
+                        # Providers that omit usage are charged the reservation
+                        # upper bound; otherwise a user could bypass quota by
+                        # selecting a backend that does not report token counts.
+                        actual = requested
+                    lease.finalize(actual)
+            finally:
+                if commercial_lease is not None:
+                    measurement = measurement_from_usage(
+                        usage,
+                        fallback_quantity=commercial_requested,
+                        meter="llm_tokens",
+                    )
+                    try:
+                        await commercial_lease.finalize(
+                            measurement.quantity,
+                            usage_units=measurement.units,
+                            is_estimated=measurement.is_estimated,
+                        )
+                    except CommercialUsageUnavailable as exc:
+                        raise LLMProviderError(str(exc), provider="deeptutor") from exc
+            return response
+        if lease is None and commercial_lease is None:
+            return response
+        return _TokenQuotaStream(
+            response,
+            lease=lease,
+            commercial_lease=commercial_lease,
+            requested_tokens=requested,
+            commercial_requested_tokens=commercial_requested,
+            prompt_estimate=prompt_estimate,
+            output_estimate=output_estimate,
+        )
+
+
+class _TokenQuotaStream:
+    def __init__(
+        self,
+        stream: Any,
+        *,
+        lease: Any,
+        byok_lease: Any = None,
+        commercial_lease: Any = None,
+        requested_tokens: int,
+        commercial_requested_tokens: int = 0,
+        prompt_estimate: int,
+        output_estimate: int,
+    ) -> None:
+        self._stream = stream
+        self._lease = lease
+        self._byok_lease = byok_lease
+        self._commercial_lease = commercial_lease
+        self._requested_tokens = requested_tokens
+        self._commercial_requested_tokens = commercial_requested_tokens
+        self._prompt_estimate = prompt_estimate
+        self._output_estimate = output_estimate
+        self._usage_total = 0
+        self._usage_measurement: Any = None
+        self._output_chars = 0
+        self._finalized = False
+
+    def __aiter__(self) -> "_TokenQuotaStream":
+        return self
+
+    async def __anext__(self) -> Any:
+        try:
+            chunk = await self._stream.__anext__()
+        except StopAsyncIteration:
+            await self._finalize(status="success")
+            raise
+        except BaseException:
+            await self._finalize(status="failed")
+            raise
+        usage = getattr(chunk, "usage", None)
+        self._usage_total = max(self._usage_total, _usage_total(usage))
+        if usage is not None:
+            from deeptutor.commercial.metering import measurement_from_usage
+
+            measurement = measurement_from_usage(
+                usage,
+                fallback_quantity=(self._commercial_requested_tokens or self._requested_tokens),
+                meter="llm_tokens",
+            )
+            if not measurement.is_estimated:
+                self._usage_measurement = measurement
+        self._output_chars += len(_stream_chunk_text(chunk))
+        return chunk
+
+    async def _finalize(self, *, status: str = "success") -> None:
+        if self._finalized:
+            return
+        self._finalized = True
+        actual = self._usage_total
+        if actual <= 0:
+            estimated_output = max(
+                math.ceil(self._output_chars / 3.5),
+                min(self._output_estimate, 256) if self._output_chars else 0,
+            )
+            actual = max(self._requested_tokens, self._prompt_estimate + estimated_output)
+        try:
+            if self._lease is not None:
+                self._lease.finalize(actual)
+            if self._byok_lease is not None:
+                self._byok_lease.finalize(actual, status=status)
+        finally:
+            if self._commercial_lease is not None:
+                from deeptutor.commercial.metering import CommercialMeteringError
+
+                try:
+                    measurement = self._usage_measurement
+                    has_provider_usage = measurement is not None or self._usage_total > 0
+                    has_stream_output = self._output_chars > 0
+                    if status != "success" and not has_provider_usage and not has_stream_output:
+                        await self._commercial_lease.release()
+                    else:
+                        commercial_actual = (
+                            measurement.quantity
+                            if measurement is not None
+                            else min(
+                                self._commercial_requested_tokens or actual,
+                                max(1, actual),
+                            )
+                        )
+                        await self._commercial_lease.finalize(
+                            commercial_actual,
+                            usage_units=(
+                                measurement.units
+                                if measurement is not None
+                                else {"llm_tokens": commercial_actual}
+                            ),
+                            is_estimated=measurement is None,
+                        )
+                except CommercialMeteringError as exc:
+                    raise LLMProviderError(str(exc), provider="deeptutor") from exc
+
+    async def close(self) -> None:
+        await self._finalize(status="cancelled")
+        close = getattr(self._stream, "close", None)
+        if callable(close):
+            result = close()
+            if hasattr(result, "__await__"):
+                await result
+            return
+        aclose = getattr(self._stream, "aclose", None)
+        if callable(aclose):
+            result = aclose()
+            if hasattr(result, "__await__"):
+                await result

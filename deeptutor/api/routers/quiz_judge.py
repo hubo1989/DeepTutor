@@ -261,11 +261,19 @@ async def websocket_quiz_judge(websocket: WebSocket):
         {"type": "done"}
         {"type": "error", "content": "..."}
     """
-    from deeptutor.api.routers.auth import ws_auth_failed, ws_require_auth
+    from deeptutor.api.routers.auth import (
+        ws_auth_failed,
+        ws_require_auth,
+        ws_require_capability_access,
+    )
     from deeptutor.multi_user.context import reset_current_user
 
     user_token = await ws_require_auth(websocket)
     if user_token is ws_auth_failed:
+        return
+    if not await ws_require_capability_access(websocket):
+        if user_token is not None:
+            reset_current_user(user_token)
         return
 
     await websocket.accept()

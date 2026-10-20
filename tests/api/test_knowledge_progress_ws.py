@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 from pathlib import Path
+from types import SimpleNamespace
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -18,6 +19,12 @@ def _client(monkeypatch, base_dir: Path) -> TestClient:
 
     monkeypatch.setattr(auth, "ws_require_auth", allow)
     monkeypatch.setattr(knowledge_router, "_current_kb_base_dir", lambda: base_dir)
+    # The fork resolves KB ownership before accepting the progress socket.
+    monkeypatch.setattr(
+        knowledge_router,
+        "resolve_kb",
+        lambda _name: SimpleNamespace(name="kb", base_dir=base_dir),
+    )
     app = FastAPI()
     app.include_router(knowledge_router.ws_router, prefix="/ws")
     return TestClient(app)
@@ -155,7 +162,7 @@ def test_malformed_timestamp_with_task_id_warns_once(monkeypatch, tmp_path: Path
         async def receive_text(self) -> str:
             raise RuntimeError("client went away")
 
-        async def close(self) -> None:
+        async def close(self, code: int = 1000) -> None:
             return None
 
     async def allow(_websocket):
@@ -169,6 +176,12 @@ def test_malformed_timestamp_with_task_id_warns_once(monkeypatch, tmp_path: Path
     broadcaster = ProgressBroadcaster.get_instance()
     monkeypatch.setattr(auth, "ws_require_auth", allow)
     monkeypatch.setattr(knowledge_router, "_current_kb_base_dir", lambda: base_dir)
+    # The fork resolves KB ownership before accepting the progress socket.
+    monkeypatch.setattr(
+        knowledge_router,
+        "resolve_kb",
+        lambda _name: SimpleNamespace(name="kb", base_dir=base_dir),
+    )
     monkeypatch.setattr(knowledge_router, "KnowledgeBaseManager", _ReadyKBManager)
     monkeypatch.setattr(knowledge_router, "TaskIDManager", _LiveTaskManager)
     monkeypatch.setattr(broadcaster, "connect", _noop)
@@ -203,7 +216,7 @@ def test_cleanup_and_error_delivery_failures_are_logged_not_silent(
         async def send_json(self, payload: dict) -> None:
             raise RuntimeError("send pipe broken")
 
-        async def close(self) -> None:
+        async def close(self, code: int = 1000) -> None:
             raise RuntimeError("socket already closed")
 
     class _ExplodingTracker:
@@ -222,6 +235,11 @@ def test_cleanup_and_error_delivery_failures_are_logged_not_silent(
     broadcaster = ProgressBroadcaster.get_instance()
     monkeypatch.setattr(auth, "ws_require_auth", allow)
     monkeypatch.setattr(knowledge_router, "_current_kb_base_dir", lambda: tmp_path)
+    monkeypatch.setattr(
+        knowledge_router,
+        "resolve_kb",
+        lambda _name: SimpleNamespace(name="kb", base_dir=tmp_path),
+    )
     monkeypatch.setattr(knowledge_router, "ProgressTracker", _ExplodingTracker)
     monkeypatch.setattr(broadcaster, "connect", _noop)
     monkeypatch.setattr(broadcaster, "disconnect", _noop)

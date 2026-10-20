@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 from fastapi import WebSocketDisconnect
 import pytest
@@ -21,7 +22,10 @@ class _FakeWebSocket:
         self.query_params = {"token": token}
         self.cookies: dict[str, str] = {}
         self.headers = {} if origin is None else {"origin": origin}
-        self._messages = [json.dumps(message) for message in messages]
+        self.app = SimpleNamespace(state=SimpleNamespace())
+        self._messages = [
+            json.dumps({"protocol_version": "2.0", **message}) for message in messages
+        ]
         self.accepted = False
         self.sent: list[dict] = []
         self.close_codes: list[int] = []
@@ -101,7 +105,7 @@ async def test_connected_socket_processes_message_after_successful_revalidation(
 
     assert calls == 2  # handshake + one inbound-message validation
     assert ws.close_codes == []
-    assert ws.sent == [{"type": "pong"}]
+    assert ws.sent == [{"type": "pong", "protocol_version": "2.0"}]
 
 
 @pytest.mark.asyncio
@@ -128,7 +132,7 @@ async def test_connected_socket_refreshes_commercial_snapshot_for_each_frame(
     await unified_ws.unified_websocket(ws)  # type: ignore[arg-type]
 
     assert commercial_refreshes == 2  # handshake + inbound frame
-    assert ws.sent == [{"type": "pong"}]
+    assert ws.sent == [{"type": "pong", "protocol_version": "2.0"}]
 
 
 @pytest.mark.asyncio

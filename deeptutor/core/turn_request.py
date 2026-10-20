@@ -29,6 +29,8 @@ class LLMSelection(BaseModel):
 
     profile_id: str
     model_id: str
+    source: str | None = None
+    generation: int | None = None
 
 
 class OutgoingAttachment(BaseModel):
@@ -134,7 +136,7 @@ class TurnRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    content: str
+    content: str = ""
     # Browser-minted causal identity for a newly submitted user row. A retry
     # can then distinguish its own persisted row from identical text sent in
     # another tab without relying on clocks or stale transcript baselines.

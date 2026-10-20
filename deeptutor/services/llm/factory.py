@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import asyncio
 from collections.abc import AsyncGenerator, Mapping
 import contextlib
@@ -344,6 +346,98 @@ def _sanitize_call_kwargs(
     return extra_kwargs
 
 
+def _commercial_factory_request_tokens(
+    messages: list[dict[str, Any]],
+    *,
+    max_tokens: int,
+    request_options: Mapping[str, Any] | None = None,
+) -> int:
+    """Use serialized UTF-8 bytes as a tokenizer-independent request bound.
+
+    Tool and response schemas are billed input on several providers.  Keeping
+    the complete sanitized request options in the bound prevents a caller from
+    bypassing the reservation with a tiny message and a very large schema.
+    """
+
+    try:
+        serialized = json.dumps(
+            {"messages": messages, "options": dict(request_options or {})},
+            ensure_ascii=False,
+            default=str,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError):
+        serialized = str((messages, request_options))
+    return max(1, len(serialized.encode("utf-8"))) + max(1, int(max_tokens))
+
+
+async def _reserve_factory_commercial(
+    config: LLMConfig,
+    messages: list[dict[str, Any]],
+    *,
+    max_tokens: int,
+    request_options: Mapping[str, Any] | None = None,
+    request_id: str | None = None,
+) -> tuple[Any, int]:
+    from deeptutor.commercial.metering import (
+        CommercialUsageLimitExceeded,
+        CommercialUsageUnavailable,
+        reserve_commercial_usage,
+    )
+
+    from .exceptions import LLMProviderError, LLMRateLimitError
+
+    requested = _commercial_factory_request_tokens(
+        messages,
+        max_tokens=max_tokens,
+        request_options=request_options,
+    )
+    try:
+        lease = await reserve_commercial_usage(
+            meter="llm_tokens",
+            quantity=requested,
+            source=getattr(config, "source", "platform"),
+            provider=config.provider_name or config.binding,
+            model=config.model,
+            request_id=request_id,
+        )
+    except CommercialUsageLimitExceeded as exc:
+        raise LLMRateLimitError(str(exc), provider="deeptutor") from exc
+    except CommercialUsageUnavailable as exc:
+        raise LLMProviderError(str(exc), provider="deeptutor") from exc
+    return lease, requested
+
+
+async def _finalize_factory_commercial(
+    lease: Any,
+    usage: Any,
+    *,
+    requested: int,
+) -> None:
+    if lease is None:
+        return
+    from deeptutor.commercial.metering import (
+        CommercialUsageUnavailable,
+        measurement_from_usage,
+    )
+
+    from .exceptions import LLMProviderError
+
+    measurement = measurement_from_usage(
+        usage,
+        fallback_quantity=requested,
+        meter="llm_tokens",
+    )
+    try:
+        await lease.finalize(
+            measurement.quantity,
+            usage_units=measurement.units,
+            is_estimated=measurement.is_estimated,
+        )
+    except CommercialUsageUnavailable as exc:
+        raise LLMProviderError(str(exc), provider="deeptutor") from exc
+
+
 async def _complete_with_resolved_config(
     config: LLMConfig,
     provider_spec: Any,
@@ -360,6 +454,7 @@ async def _complete_with_resolved_config(
     image_filename: str,
     kwargs: dict[str, Any],
     provider: LLMProvider | None = None,
+    _usage_out: dict[str, Any] | None = None,
 ) -> str:
     """Execute one completion from an already resolved configuration."""
     provider = provider or get_runtime_provider(config)
@@ -395,6 +490,8 @@ async def _complete_with_resolved_config(
     except Exception as exc:
         raise map_error(exc, provider=config.provider_name) from exc
 
+    if _usage_out is not None:
+        _usage_out["usage"] = dict(response.usage or {})
     if response.finish_reason == "error":
         raise map_error(
             RuntimeError(response.content or "LLM request failed"), provider=config.provider_name
@@ -423,6 +520,7 @@ async def complete(
     allow_image_fallback: bool | None = None,
     **kwargs: Any,
 ) -> str:
+    commercial_request_id = kwargs.pop("_commercial_request_id", None)
     caller_extra_headers = kwargs.pop("extra_headers", None)
     reasoning_effort = kwargs.pop("reasoning_effort", None)
     image_data = kwargs.pop("image_data", None)
@@ -438,21 +536,42 @@ async def complete(
         extra_headers=caller_extra_headers,
         reasoning_effort=reasoning_effort,
     )
-    return await _complete_with_resolved_config(
+    commercial_lease, _reserved = await _reserve_factory_commercial(
         config,
-        provider_spec,
-        prompt=prompt,
-        system_prompt=system_prompt,
-        messages=messages,
-        max_retries=max_retries,
-        retry_delay=retry_delay,
-        exponential_backoff=exponential_backoff,
-        allow_image_fallback=allow_image_fallback,
-        image_data=image_data,
-        image_mime_type=str(image_mime_type or "image/png"),
-        image_filename=str(image_filename or "image.png"),
-        kwargs=kwargs,
+        _build_messages(prompt, system_prompt, messages),
+        max_tokens=int(kwargs.get("max_tokens") or 4096),
+        request_id=commercial_request_id,
     )
+    requested = _commercial_factory_request_tokens(
+        _build_messages(prompt, system_prompt, messages),
+        max_tokens=int(kwargs.get("max_tokens") or 4096),
+    )
+    usage_out: dict[str, Any] = {}
+    try:
+        result = await _complete_with_resolved_config(
+            config,
+            provider_spec,
+            prompt=prompt,
+            system_prompt=system_prompt,
+            messages=messages,
+            max_retries=max_retries,
+            retry_delay=retry_delay,
+            exponential_backoff=exponential_backoff,
+            allow_image_fallback=allow_image_fallback,
+            image_data=image_data,
+            image_mime_type=str(image_mime_type or "image/png"),
+            image_filename=str(image_filename or "image.png"),
+            kwargs=kwargs,
+            _usage_out=usage_out,
+        )
+    except BaseException:
+        if commercial_lease is not None:
+            await commercial_lease.release()
+        raise
+    await _finalize_factory_commercial(
+        commercial_lease, usage_out.get("usage"), requested=requested
+    )
+    return result
 
 
 async def complete_with_config(
@@ -538,6 +657,7 @@ async def stream(
     usage once the stream ends. A caller that parses the streamed text needs it
     to tell a complete response from one cut off at ``max_tokens`` (#1545).
     """
+    commercial_request_id = kwargs.pop("_commercial_request_id", None)
     caller_extra_headers = kwargs.pop("extra_headers", None)
     reasoning_effort = kwargs.pop("reasoning_effort", None)
     image_data = kwargs.pop("image_data", None)
@@ -562,6 +682,12 @@ async def stream(
     provider = get_runtime_provider(config)
     capability_binding = _capability_binding(config, provider_spec)
     request_messages = _build_messages(prompt, system_prompt, messages)
+    commercial_lease, commercial_requested = await _reserve_factory_commercial(
+        config,
+        request_messages,
+        max_tokens=int(kwargs.get("max_tokens") or 4096),
+        request_id=commercial_request_id,
+    )
     request_messages = _apply_inline_image_data(
         request_messages,
         binding=capability_binding,
@@ -622,6 +748,9 @@ async def stream(
             if outcome is not None:
                 outcome.finish_reason = str(response.finish_reason or "")
                 outcome.usage = dict(response.usage or {})
+            await _finalize_factory_commercial(
+                commercial_lease, dict(response.usage or {}), requested=commercial_requested
+            )
             if in_think_block:
                 in_think_block = False
                 await queue.put("</think>")
@@ -721,6 +850,9 @@ async def stream(
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+        if commercial_lease is not None and commercial_lease._state == "active":
+            with contextlib.suppress(Exception):
+                await commercial_lease.release()
 
 
 async def fetch_models(

@@ -9,7 +9,10 @@ import asyncio
 from contextlib import contextmanager
 from datetime import datetime
 import json
+import inspect
+from functools import wraps
 import logging
+from contextvars import ContextVar
 import mimetypes
 import os
 from pathlib import Path
@@ -38,6 +41,14 @@ from fastapi.responses import FileResponse, PlainTextResponse, Response, Streami
 from pydantic import BaseModel, Field
 
 from deeptutor.api.routers.auth import require_admin
+from deeptutor.commercial.entitlement_context import (
+    CommercialAccessDenied,
+    require_active_commercial_access,
+)
+from deeptutor.commercial.storage_limits import (
+    CommercialResourceLimitDenied,
+    enforce_upload_size_limits,
+)
 from deeptutor.api.utils.progress_broadcaster import ProgressBroadcaster
 from deeptutor.api.utils.task_id_manager import TaskIDManager
 from deeptutor.api.utils.task_log_stream import capture_task_logs, get_task_stream_manager
@@ -113,6 +124,9 @@ from deeptutor.utils.error_utils import format_exception_message
 config = load_config_with_main("main.yaml", PROJECT_ROOT)
 log_dir = config.get("paths", {}).get("user_log_dir") or config.get("logging", {}).get("log_dir")
 logger = logging.getLogger(__name__)
+
+_kb_background_owner: ContextVar[str] = ContextVar("kb_background_owner", default="")
+
 
 router = APIRouter()
 ws_router = APIRouter()
@@ -971,6 +985,85 @@ def _matching_index_is_valid(kb_name: str, matching_version: dict | None) -> boo
         return False
 
 
+def _owner_deletion_fenced(owner_id: str) -> bool:
+    from deeptutor.multi_user.models import LOCAL_ADMIN_ID
+    from deeptutor.services.account_lifecycle import is_account_deletion_fenced
+
+    return bool(owner_id and owner_id != LOCAL_ADMIN_ID and is_account_deletion_fenced(owner_id))
+
+
+def _ensure_kb_background_write_allowed() -> None:
+    if _owner_deletion_fenced(_kb_background_owner.get()):
+        raise asyncio.CancelledError("account_deletion_in_progress")
+
+
+def _tracked_kb_background_task(function):
+    """Register an ASGI background coroutine so account deletion can await it."""
+    signature = inspect.signature(function)
+
+    @wraps(function)
+    async def wrapped(*args, **kwargs):
+        bound = signature.bind_partial(*args, **kwargs)
+        task_id = str(bound.arguments.get("task_id") or "")
+        owner = get_current_user_or_none()
+        owner_id = owner.id if owner is not None else ""
+        manager = TaskIDManager.get_instance()
+        task = manager.register_current_task(task_id, owner_id)
+        token = _kb_background_owner.set(owner_id)
+        try:
+            if _owner_deletion_fenced(owner_id):
+                manager.update_task_status(task_id, "cancelled")
+                get_task_stream_manager().emit_failed(task_id, "Account deletion is in progress")
+                return None
+            return await function(*args, **kwargs)
+        except asyncio.CancelledError:
+            manager.update_task_status(task_id, "cancelled")
+            get_task_stream_manager().emit_failed(task_id, "Background task was cancelled")
+            raise
+        finally:
+            _kb_background_owner.reset(token)
+            manager.unregister_current_task(owner_id, task)
+
+    return wrapped
+
+
+def _commercial_denial_detail(
+    exc: CommercialAccessDenied | CommercialResourceLimitDenied,
+) -> dict[str, object]:
+    detail: dict[str, object] = {"code": exc.code, "message": str(exc)}
+    if isinstance(exc, CommercialResourceLimitDenied):
+        detail.update(exc.details)
+    return detail
+
+
+def _raise_commercial_http_denial(
+    exc: CommercialAccessDenied | CommercialResourceLimitDenied,
+) -> None:
+    raise HTTPException(status_code=402, detail=_commercial_denial_detail(exc)) from exc
+
+
+def _require_active_commercial_http() -> None:
+    try:
+        require_active_commercial_access()
+    except CommercialAccessDenied as exc:
+        _raise_commercial_http_denial(exc)
+
+
+def _enforce_upload_limits_http(files: list[UploadFile]) -> None:
+    try:
+        enforce_upload_size_limits(files)
+    except (CommercialAccessDenied, CommercialResourceLimitDenied) as exc:
+        _raise_commercial_http_denial(exc)
+
+
+def _enforce_kb_count_http(current_count: int) -> None:
+    try:
+        enforce_kb_count_limit(current_count)
+    except (CommercialAccessDenied, CommercialResourceLimitDenied) as exc:
+        _raise_commercial_http_denial(exc)
+
+
+@_tracked_kb_background_task
 async def run_initialization_task(
     initializer: KnowledgeBaseInitializer,
     task_id: str,
@@ -1008,6 +1101,8 @@ async def run_initialization_task(
 
     with capture_task_logs(task_id):
         try:
+            # Commercial gate before any document parsing or provider indexing.
+            require_active_commercial_access()
             if not initializer.progress_tracker:
                 initializer.progress_tracker = ProgressTracker(
                     initializer.kb_name, initializer.base_dir
@@ -1117,6 +1212,7 @@ async def run_initialization_task(
             task_stream_manager.emit_failed(task_id, error_msg, **failure_metadata)
 
 
+@_tracked_kb_background_task
 async def run_upload_processing_task(
     kb_name: str,
     base_dir: str,
@@ -3386,6 +3482,17 @@ async def delete_knowledge_base(kb_name: str):
 @router.get("/knowledge-bases/tasks/{task_id}/stream")
 async def stream_task_logs(task_id: str):
     """Stream task-specific logs for knowledge-base operations."""
+    task_metadata = TaskIDManager.get_instance().get_task_metadata(task_id)
+    if task_metadata is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    user = get_current_user()
+    task_owner = str(task_metadata.get("owner_id") or "")
+    if not user.is_admin and task_owner != user.id:
+        # Same response as an unknown task so callers cannot enumerate another
+        # account's background work from task ids.
+        raise HTTPException(status_code=404, detail="Task not found")
+
     manager = get_task_stream_manager()
     manager.ensure_task(task_id)
     return StreamingResponse(
@@ -3416,6 +3523,7 @@ async def upload_files(
     is how a caller adding one subtree at a time re-attaches it where it
     belongs instead of piling every batch at the root (#866).
     """
+    _require_active_commercial_http()
     try:
         manager, kb_name, kb_base_dir = _writable_kb(kb_name)
         requested_provider = None
@@ -3524,6 +3632,8 @@ async def create_knowledge_base(
     embedding_model: str = Form(""),
     storage_workspace_id: str | None = Form(None),
 ):
+    _require_active_commercial_http()
+    _enforce_upload_limits_http(files)
     from contextlib import nullcontext
 
     from deeptutor.services.rag.pipelines.lightrag.indexing_policy import IndexingPolicyError
@@ -3602,6 +3712,7 @@ async def _create_knowledge_base_owned(
     embedding_model: str = Form(""),
 ) -> dict[str, Any]:
     """Create a new knowledge base and initialize it with files."""
+    _require_active_commercial_http()
     try:
         try:
             name = validate_knowledge_base_name(name)
@@ -4116,6 +4227,7 @@ async def reindex_knowledge_base(
     providers keep synthetic provider-keyed versions, so they should rebuild
     without requiring an embedding-signature precheck.
     """
+    _require_active_commercial_http()
     try:
         manager, kb_name, kb_base_dir = _writable_kb(kb_name)
         kb_entry = _load_kb_entry_or_404(manager, kb_name)
@@ -4301,6 +4413,7 @@ async def retry_knowledge_base(
     background_tasks: BackgroundTasks,
 ) -> dict[str, Any]:
     """Retry a failed KB initialization/indexing run from its stored raw files."""
+    _require_active_commercial_http()
     try:
         manager, resolved_name, _ = _writable_kb(kb_name)
         kb_entry = _load_kb_entry_or_404(manager, resolved_name)
@@ -4442,16 +4555,24 @@ async def websocket_progress(websocket: WebSocket, kb_name: str):
     if user_token is ws_auth_failed:
         return
 
+    # Resolve ownership before accepting: an unowned KB must never observe
+    # another account's indexing progress.
+    try:
+        resource = resolve_kb(kb_name)
+    except HTTPException as exc:
+        code = 4004 if exc.status_code == 404 else 4003
+        await websocket.close(code=code)
+        if user_token is not None:
+            reset_current_user(user_token)
+        return
+
     await websocket.accept()
 
     broadcaster = ProgressBroadcaster.get_instance()
     subscription_key = kb_name
 
     try:
-        from deeptutor.services.workspace.knowledge import parse_kb_id
-
-        if parse_kb_id(kb_name) is not None:
-            resource = resolve_kb(kb_name)
+        if resource is not None:
             base_dir, kb_name = resource.base_dir, resource.name
             # Qualified catalogs use the durable polling path below, avoiding
             # the legacy broadcaster's unqualified name channel.
@@ -4785,13 +4906,19 @@ async def unlink_folder(kb_name: str, folder_id: str):
     "/knowledge-bases/{kb_name}/sync-folder/{folder_id}",
     response_model=SyncFolderResponse,
 )
-async def sync_folder(kb_name: str, folder_id: str, background_tasks: BackgroundTasks):
+async def sync_folder(
+    kb_name: str,
+    folder_id: str,
+    background_tasks: BackgroundTasks,
+    config: dict | None = None,
+):
     """
     Sync files from a linked folder to the knowledge base.
 
     This scans the linked folder for supported documents and processes
     any new files that haven't been added yet.
     """
+    _require_active_commercial_http()
     try:
         manager, kb_name, kb_base_dir = _writable_kb(kb_name)
         kb_entry = _load_kb_entry_or_404(manager, kb_name)

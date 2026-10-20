@@ -192,7 +192,7 @@ def test_edit_actions_preserve_model_selection_errors(
     assert response.json()["detail"] == (
         "No LLM model is assigned to your account. Please contact an administrator."
         if status == 403
-        else "Invalid LLM selection: profile_id and model_id are required."
+        else "Invalid LLM selection: model_id is required for platform."
     )
 
 
@@ -229,7 +229,11 @@ def test_llm_selection_uses_first_granted_model_for_ordinary_user(monkeypatch):
 
     selection = co_writer_router._validated_llm_selection(None)
 
-    assert selection == {"profile_id": "profile", "model_id": "granted-model"}
+    assert selection == {
+        "source": "platform",
+        "profile_id": "profile",
+        "model_id": "granted-model",
+    }
 
 
 def _reject_model_assignment(_selection):

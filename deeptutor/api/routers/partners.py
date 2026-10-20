@@ -26,6 +26,7 @@ from deeptutor.api.routers.auth import require_admin
 from deeptutor.app.container import get_application_container
 from deeptutor.multi_user.context import get_current_user
 from deeptutor.multi_user.partner_access import (
+    assert_partner_allowed,
     assert_partner_manageable,
     can_manage_partner,
     can_use_partner,
@@ -35,6 +36,7 @@ from deeptutor.multi_user.partner_access import (
 from deeptutor.partners.config.paths import get_partner_media_dir
 from deeptutor.partners.helpers import safe_filename
 from deeptutor.runtime.coordination import BackgroundCommandKind
+from deeptutor.multi_user.model_access import has_capability_access  # noqa: F401  (route + tests)
 from deeptutor.services.i18n import t
 from deeptutor.services.partners import (
     get_partner_manager,
@@ -88,10 +90,26 @@ ws_router = APIRouter()
 # enumerate other people's partners by probing ids.
 
 
+def _assert_partner_chat_access(partner_id: str) -> None:
+    """Authorize both the partner resource and the model it consumes."""
+    assert_partner_allowed(partner_id)
+    if not has_capability_access("llm"):
+        raise HTTPException(
+            status_code=403,
+            detail="No LLM model is assigned to your account",
+        )
+
+
 def usable_partner(partner_id: str) -> str:
-    """Path dependency: the partner exists and the caller may talk to it."""
-    if not get_partner_manager().partner_exists(partner_id) or not can_use_partner(partner_id):
+    """Path dependency: the partner exists and the caller may talk to it.
+
+    Unknown partners stay 404 (they do not exist for this caller); a partner
+    that exists but is not assigned to the caller is an explicit 403 via
+    ``assert_partner_allowed``.
+    """
+    if not get_partner_manager().partner_exists(partner_id):
         raise HTTPException(status_code=404, detail=t("api.partner_not_found"))
+    assert_partner_allowed(partner_id)
     return partner_id
 
 
@@ -1639,6 +1657,7 @@ async def partner_chat_http(partner_id: str, payload: ChatMessageRequest) -> dic
     # Web chat is a first-class entry point. Start the partner runtime on
     # demand even when external channel listeners are not configured for boot;
     # ``auto_start`` controls restart persistence, not chat access.
+    _assert_partner_chat_access(partner_id)
     await _ensure_running_partner(partner_id, allow_stopped=True)
     media_paths = _materialize_partner_attachments(partner_id, payload.attachments)
     if not content and media_paths:
@@ -1753,6 +1772,7 @@ async def partner_chat_http_stream(partner_id: str, payload: ChatMessageRequest)
     """Stream one HTTP message to a partner as server-sent events."""
     if not payload.content.strip() and not payload.attachments:
         raise HTTPException(status_code=400, detail=t("api.content_required"))
+    _assert_partner_chat_access(partner_id)
     await _ensure_running_partner(partner_id, allow_stopped=True)
     return StreamingResponse(
         _partner_chat_stream(partner_id, payload, get_current_user().id),
@@ -1776,12 +1796,27 @@ async def partner_chat_ws(ws: WebSocket, partner_id: str):
     * ``{"type": "ready"}`` — the runtime is ready to accept a web turn;
     * ``{"type": "done"}`` / ``{"type": "error"}`` / ``{"type": "proactive"}``.
     """
-    from deeptutor.api.routers.auth import ws_auth_failed, ws_require_auth
+    from deeptutor.api.routers.auth import (
+        ws_auth_failed,
+        ws_authorize_message,
+        ws_require_auth,
+        ws_require_capability_access,
+    )
     from deeptutor.multi_user.context import get_current_user_or_none, reset_current_user
+    from deeptutor.multi_user.partner_access import assert_partner_allowed
     from deeptutor.services.partners.interaction import personal_actor_id
 
     user_token = await ws_require_auth(ws)
     if user_token is ws_auth_failed:
+        return
+    if not await ws_require_capability_access(ws):
+        reset_current_user(user_token)
+        return
+    try:
+        assert_partner_allowed(partner_id)
+    except HTTPException as exc:
+        await ws.close(code=4003, reason=str(exc.detail)[:120])
+        reset_current_user(user_token)
         return
 
     mgr = get_partner_manager()

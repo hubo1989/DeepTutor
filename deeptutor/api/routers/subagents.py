@@ -54,14 +54,22 @@ class SubagentMessageRequest(BaseModel):
     message: str
 
 
-@router.get("/detect")
+def _require_host_backend_admin() -> None:
+    """Only admins may bind or execute a backend that can touch the host."""
+    from deeptutor.multi_user.context import get_current_user
+
+    if not get_current_user().is_admin:
+        raise HTTPException(status_code=403, detail="Admin access required for host agents")
+
+
+@router.get("/detect", dependencies=[Depends(require_admin)])
 async def detect_subagents():
     """Report which local and remote agent backends are usable."""
     detections = await detect_all()
     return {"backends": [d.to_dict() for d in detections]}
 
 
-@router.get("/backends/options")
+@router.get("/backends/options", dependencies=[Depends(require_admin)])
 async def backend_options():
     """Synced model + reasoning-effort options per backend (settings page sync)."""
     from deeptutor.services.subagent.models import list_backend_options
@@ -70,7 +78,7 @@ async def backend_options():
     return {"backends": [o.to_dict() for o in options]}
 
 
-@router.post("/backends/{kind}/sync")
+@router.post("/backends/{kind}/sync", dependencies=[Depends(require_admin)])
 async def sync_backend(kind: str):
     """Re-pull one backend's model catalog (the settings "sync" button).
 
@@ -126,7 +134,10 @@ async def create_connection(payload: ConnectSubagentRequest):
     resolved_cwd = ""
     from deeptutor.services.subagent import get_backend
 
+    # Host-touching backends (local CLI agents) are admin-only in the fork.
     backend = get_backend(agent_kind)
+    if backend is None or getattr(backend, "local_cli", True):
+        _require_host_backend_admin()
     raw_cwd = (payload.cwd or "").strip()
     if raw_cwd and backend is not None and getattr(backend, "local_cli", True):
         try:
@@ -185,6 +196,15 @@ async def message_connection(name: str, payload: SubagentMessageRequest):
     native run as newline-delimited JSON, in the same channel shape the chat WS
     uses, so the sidebar transcript renders it identically.
     """
+    from deeptutor.services.subagent import get_backend as _get_backend
+
+    _manager = account_kb_manager()
+    _meta = _manager.get_metadata(name) or {}
+    _backend = _get_backend(str(_meta.get("agent_kind") or ""))
+    # Host-touching backends (local CLI agents) are admin-only in the fork.
+    if _backend is None or getattr(_backend, "local_cli", True):
+        _require_host_backend_admin()
+
     message = (payload.message or "").strip()
     if not message:
         raise HTTPException(status_code=400, detail="A non-empty 'message' is required.")
@@ -261,7 +281,7 @@ async def message_connection(name: str, payload: SubagentMessageRequest):
     return StreamingResponse(event_stream(), media_type="application/x-ndjson")
 
 
-@router.get("/settings")
+@router.get("/settings", dependencies=[Depends(require_admin)])
 async def get_settings():
     """Read the consult budget and per-backend run config."""
     return load_subagent_settings().to_dict()

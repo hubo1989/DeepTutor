@@ -118,6 +118,7 @@ from deeptutor.services.auth import (
     set_learner_profile,
     set_role,
     validate_password_bytes,
+    delete_user,
 )
 from deeptutor.services.auth import (
     get_learner_profile as load_learner_profile,
@@ -262,6 +263,7 @@ class RegisterRequest(BaseModel):
 
     username: str
     password: str
+    preset: AccountPreset = "standard"
 
     @field_validator("username")
     @classmethod
@@ -914,6 +916,21 @@ async def ws_require_capability_access(ws: WebSocket, capability: str = "llm") -
         return True
     await _close_websocket(ws, 4003)
     return False
+
+
+async def ws_revalidate_identity(ws: WebSocket) -> bool:
+    """Apply account deletion/disable/password reset before an inbound frame."""
+    if not _websocket_principal_is_current(ws):
+        await _close_websocket(ws, 4001)
+        return False
+    return await _refresh_websocket_commercial_access(ws)
+
+
+async def ws_authorize_message(ws: WebSocket, capability: str = "llm") -> bool:
+    """Revalidate identity and model access before a consuming WS action."""
+    if not await ws_revalidate_identity(ws):
+        return False
+    return await ws_require_capability_access(ws, capability)
 
 
 async def ws_revalidate_identity(ws: WebSocket) -> bool:
@@ -2432,38 +2449,6 @@ async def admin_import_users(
             detail="Auth is disabled — user import is not available.",
         )
 
-    if POCKETBASE_ENABLED:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Account deletion is managed by the configured identity provider.",
-        )
-    canonical_username = username.strip().casefold() if "@" in username else username.strip()
-    target_info = get_user_info(canonical_username)
-    expected_user_id = str(target_info.get("id") or "") if target_info else None
-    try:
-        result = await _delete_account_saga(
-            canonical_username,
-            expected_user_id=expected_user_id,
-            actor_id=current.user_id,
-            actor_username=current.username,
-        )
-    except account_lifecycle.AccountNotFound as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found") from exc
-    except account_lifecycle.AccountLifecycleForbidden as exc:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
-    except account_lifecycle.AccountLifecycleError as exc:
-        logger.exception("Admin account deletion failed actor=%s", current.user_id or "unknown")
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Account deletion could not be completed. The account is disabled.",
-        ) from exc
-
-    logger.info(
-        "Admin '%s' deleted account (already_deleted=%s)",
-        current.username,
-        result.already_deleted,
-    )
-    return {"ok": result.deleted, "already_deleted": result.already_deleted}
     content = await file.read(_USER_IMPORT_MAX_BYTES + 1)
     await file.close()
     if len(content) > _USER_IMPORT_MAX_BYTES:
@@ -2596,11 +2581,35 @@ async def remove_user(
     username: str,
     current: TokenPayload = Depends(require_admin),
 ) -> dict:
-    """Delete a user. Admins cannot delete their own account."""
-    status_code, detail = _delete_admin_user(username, current)
-    if status_code != 200:
-        raise HTTPException(status_code=status_code, detail=detail)
-    return {"ok": True}
+    """Delete a user. Admins cannot delete their own own account."""
+    canonical_username = username.strip().casefold() if "@" in username else username.strip()
+    target_info = get_user_info(canonical_username)
+    expected_user_id = str(target_info.get("id") or "") if target_info else None
+    try:
+        result = await _delete_account_saga(
+            canonical_username,
+            expected_user_id=expected_user_id,
+            actor_id=current.user_id,
+            actor_username=current.username,
+        )
+    except account_lifecycle.AccountNotFound as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found") from exc
+    except account_lifecycle.AccountLifecycleForbidden as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except account_lifecycle.AccountLifecycleError as exc:
+        logger.exception("Admin account deletion failed actor=%s", current.user_id or "unknown")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Account deletion could not be completed. The account is disabled.",
+        ) from exc
+
+    logger.info(
+        "Admin '%s' deleted account (already_deleted=%s)",
+        current.username,
+        result.already_deleted,
+    )
+    return {"ok": result.deleted, "already_deleted": result.already_deleted}
+
 
 @router.post("/users/batch-delete")
 async def batch_remove_users(

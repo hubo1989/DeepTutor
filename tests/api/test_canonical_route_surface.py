@@ -36,10 +36,15 @@ def test_only_canonical_transport_and_resource_routes_are_registered() -> None:
         "/api/notebook",
         "/api/outputs",
     )
+    # Fork surface: BYOK and the plugins playground predate the v1 retirement
+    # and still live under /api/v1 until they are rehomed (see the matching
+    # exemptions in web/tests/no-v1-chat-surface.test.ts).
+    fork_prefixes = ("/api/v1/byok", "/api/v1/plugins", "/api/v1/admin")
     assert not {
         path
         for path in paths
         if any(path == prefix or path.startswith(prefix + "/") for prefix in retired_prefixes)
+        and not any(path == fp or path.startswith(fp + "/") for fp in fork_prefixes)
     }
     assert "/api/system/runtime-topology" not in paths
 

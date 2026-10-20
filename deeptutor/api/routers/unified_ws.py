@@ -42,7 +42,11 @@ def _clean_answers(value: Any) -> list[dict[str, Any]] | None:
 
 @router.websocket("/ws")
 async def unified_websocket(ws: WebSocket) -> None:
-    from deeptutor.api.routers.auth import ws_auth_failed, ws_require_auth
+    from deeptutor.api.routers.auth import (
+        ws_auth_failed,
+        ws_require_auth,
+        ws_revalidate_identity,
+    )
     from deeptutor.app.container import get_application_container
     from deeptutor.multi_user.context import reset_current_user
 
@@ -179,6 +183,11 @@ async def unified_websocket(ws: WebSocket) -> None:
     try:
         while not closed:
             raw = await ws.receive_text()
+            # Revalidate the socket principal before acting on the frame that
+            # just arrived: a revoked token, disabled account, or password
+            # reset must not keep serving turns.
+            if not await ws_revalidate_identity(ws):
+                return
             try:
                 decoded = json.loads(raw)
             except json.JSONDecodeError:
