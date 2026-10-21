@@ -120,231 +120,254 @@ async def lifespan(app: FastAPI):
     # Validate configuration consistency
     validate_tool_consistency()
 
-    # Build one process-level dependency graph.  Every adapter resolves turns
-    # through this container, so a WebSocket cannot accidentally construct a
-    # second store/runtime for the same authenticated scope.
-    from deeptutor.app.container import get_application_container
-
-    application_container = getattr(app.state, "application_container", None)
-    if application_container is None:
-        application_container = get_application_container()
-        app.state.application_container = application_container
-    await application_container.start()
-    from deeptutor.api.utils.progress_broadcaster import ProgressBroadcaster
-    from deeptutor.api.utils.task_log_stream import get_task_stream_manager
-    from deeptutor.knowledge.progress_events import install_progress_ports
-
-    install_progress_ports(
-        broadcast=ProgressBroadcaster.get_instance().broadcast,
-        emit_task_event=get_task_stream_manager().emit,
+    # Hosted commercial mode is fail-closed: validate auth/cookie/model
+    # invariants, then migrate, seed Trial v1, and reconcile existing
+    # identities before any request can be accepted. Disabled mode returns an
+    # inert runtime without touching PostgreSQL.
+    from deeptutor.commercial.integration import (
+        shutdown_commercial_foundation,
+        startup_commercial_foundation,
     )
-    migration_reports = await application_container.run_startup_data_migrations()
-    legacy_reports = migration_reports["legacy_chat"]
-    migrated_reports = [report for report in legacy_reports if report.get("source_hash")]
-    if migrated_reports:
-        logger.info(
-            "Legacy chat migration complete: imported=%s skipped=%s archived=%s",
-            sum(int(report.get("imported") or 0) for report in migrated_reports),
-            sum(int(report.get("skipped") or 0) for report in migrated_reports),
-            [report.get("archived_to", "") for report in migrated_reports],
-        )
-    workspace_migrated = sum(
-        int(report.get("migrated") or 0) for report in migration_reports["workspace_preferences"]
-    )
-    if workspace_migrated:
-        logger.info(
-            "Workspace session migration complete: migrated=%s scopes=%s",
-            workspace_migrated,
-            len(migration_reports["workspace_preferences"]),
-        )
 
+    commercial_runtime = await startup_commercial_foundation()
     try:
-        from deeptutor.learning.assessment import reconcile_linked_assessments
+        # Build one process-level dependency graph.  Every adapter resolves turns
+        # through this container, so a WebSocket cannot accidentally construct a
+        # second store/runtime for the same authenticated scope.
+        from deeptutor.app.container import get_application_container
 
-        recovered, failed = await reconcile_linked_assessments()
-        if recovered or failed:
-            logger.info("Linked assessment recovery: recovered=%s failed=%s", recovered, failed)
-    except Exception:
-        logger.exception("Failed to reconcile linked assessments at startup")
+        application_container = getattr(app.state, "application_container", None)
+        if application_container is None:
+            application_container = get_application_container()
+            app.state.application_container = application_container
+        await application_container.start()
+        from deeptutor.api.utils.progress_broadcaster import ProgressBroadcaster
+        from deeptutor.api.utils.task_log_stream import get_task_stream_manager
+        from deeptutor.knowledge.progress_events import install_progress_ports
 
-    # Initialize LLM client early so OPENAI_* env vars are available before
-    # any downstream provider integrations start.
-    try:
-        from deeptutor.services.llm import get_llm_client
-
-        llm_client = get_llm_client()
-        logger.info(f"LLM client initialized: model={llm_client.config.model}")
-    except Exception as e:
-        logger.warning(f"Failed to initialize LLM client at startup: {e}")
-
-    try:
-        from deeptutor.events.event_bus import get_event_bus
-
-        event_bus = get_event_bus()
-        await event_bus.start()
-        logger.info("EventBus started")
-    except Exception as e:
-        logger.warning(f"Failed to start EventBus: {e}")
-
-    async def _start_partners() -> None:
-        from deeptutor.services.partners import get_partner_manager
-
-        manager = get_partner_manager()
-        manager.configure_runtime_owner(application_container.worker_id)
-        await manager.auto_start_partners()
-
-    async def _stop_partners() -> None:
-        from deeptutor.services.partners import get_partner_manager
-
-        await get_partner_manager().stop_all(preserve_auto_start=True)
-
-    async def _start_cron() -> None:
-        from deeptutor.services.cron import get_cron_service
-
-        await get_cron_service().start()
-
-    async def _stop_cron() -> None:
-        from deeptutor.services.cron import get_cron_service
-
-        await get_cron_service().stop()
-
-    async def _start_github_sync() -> None:
-        from deeptutor.services.github_source.sync_service import get_sync_service
-
-        await get_sync_service().start()
-
-    async def _stop_github_sync() -> None:
-        from deeptutor.services.github_source.sync_service import get_sync_service
-
-        await get_sync_service().stop()
-
-    async def _start_web_source_sync() -> None:
-        from deeptutor.services.web_source.scheduler import (
-            start_web_source_sync_scheduler,
+        install_progress_ports(
+            broadcast=ProgressBroadcaster.get_instance().broadcast,
+            emit_task_event=get_task_stream_manager().emit,
         )
-
-        await start_web_source_sync_scheduler()
-
-    async def _stop_web_source_sync() -> None:
-        from deeptutor.services.web_source.scheduler import (
-            stop_web_source_sync_scheduler,
+        migration_reports = await application_container.run_startup_data_migrations()
+        legacy_reports = migration_reports["legacy_chat"]
+        migrated_reports = [report for report in legacy_reports if report.get("source_hash")]
+        if migrated_reports:
+            logger.info(
+                "Legacy chat migration complete: imported=%s skipped=%s archived=%s",
+                sum(int(report.get("imported") or 0) for report in migrated_reports),
+                sum(int(report.get("skipped") or 0) for report in migrated_reports),
+                [report.get("archived_to", "") for report in migrated_reports],
+            )
+        workspace_migrated = sum(
+            int(report.get("migrated") or 0)
+            for report in migration_reports["workspace_preferences"]
         )
+        if workspace_migrated:
+            logger.info(
+                "Workspace session migration complete: migrated=%s scopes=%s",
+                workspace_migrated,
+                len(migration_reports["workspace_preferences"]),
+            )
 
-        await stop_web_source_sync_scheduler()
+        try:
+            from deeptutor.learning.assessment import reconcile_linked_assessments
 
-    from deeptutor.runtime.coordination import BackgroundCommandKind
+            recovered, failed = await reconcile_linked_assessments()
+            if recovered or failed:
+                logger.info("Linked assessment recovery: recovered=%s failed=%s", recovered, failed)
+        except Exception:
+            logger.exception("Failed to reconcile linked assessments at startup")
 
-    async def _handle_background_command(command) -> None:
-        kind = str(command.kind)
-        if kind == BackgroundCommandKind.CRON_RELOAD:
+        # Initialize LLM client early so OPENAI_* env vars are available before
+        # any downstream provider integrations start.
+        try:
+            from deeptutor.services.llm import get_llm_client
+
+            llm_client = get_llm_client()
+            logger.info(f"LLM client initialized: model={llm_client.config.model}")
+        except Exception as e:
+            logger.warning(f"Failed to initialize LLM client at startup: {e}")
+
+        try:
+            from deeptutor.events.event_bus import get_event_bus
+
+            event_bus = get_event_bus()
+            await event_bus.start()
+            logger.info("EventBus started")
+        except Exception as e:
+            logger.warning(f"Failed to start EventBus: {e}")
+
+        async def _start_partners() -> None:
+            from deeptutor.services.partners import get_partner_manager
+
+            manager = get_partner_manager()
+            manager.configure_runtime_owner(application_container.worker_id)
+            await manager.auto_start_partners()
+
+        async def _stop_partners() -> None:
+            from deeptutor.services.partners import get_partner_manager
+
+            await get_partner_manager().stop_all(preserve_auto_start=True)
+
+        async def _start_cron() -> None:
             from deeptutor.services.cron import get_cron_service
 
-            get_cron_service().reload()
-            return
+            await get_cron_service().start()
 
-        from deeptutor.services.partners import get_partner_manager
+        async def _stop_cron() -> None:
+            from deeptutor.services.cron import get_cron_service
 
-        manager = get_partner_manager()
-        manager.configure_runtime_owner(application_container.worker_id)
-        partner_id = str(command.payload.get("partner_id") or "").strip()
-        if not partner_id:
-            raise ValueError(f"Background command {kind!r} needs partner_id")
-        if kind == BackgroundCommandKind.PARTNER_START:
-            instance = await manager.start_partner(partner_id)
-            if bool(command.payload.get("persist_auto_start", True)):
-                manager.save_config(partner_id, instance.config, auto_start=True)
-            return
-        if kind == BackgroundCommandKind.PARTNER_STOP:
-            await manager.stop_partner(
-                partner_id,
-                preserve_auto_start=bool(command.payload.get("preserve_auto_start", False)),
+            await get_cron_service().stop()
+
+        async def _start_github_sync() -> None:
+            from deeptutor.services.github_source.sync_service import get_sync_service
+
+            await get_sync_service().start()
+
+        async def _stop_github_sync() -> None:
+            from deeptutor.services.github_source.sync_service import get_sync_service
+
+            await get_sync_service().stop()
+
+        async def _start_web_source_sync() -> None:
+            from deeptutor.services.web_source.scheduler import (
+                start_web_source_sync_scheduler,
             )
-            return
-        if kind == BackgroundCommandKind.PARTNER_RELOAD:
-            instance = manager.get_partner(partner_id)
-            if instance is None or not instance.running:
+
+            await start_web_source_sync_scheduler()
+
+        async def _stop_web_source_sync() -> None:
+            from deeptutor.services.web_source.scheduler import (
+                stop_web_source_sync_scheduler,
+            )
+
+            await stop_web_source_sync_scheduler()
+
+        from deeptutor.runtime.coordination import BackgroundCommandKind
+
+        async def _handle_background_command(command) -> None:
+            kind = str(command.kind)
+            if kind == BackgroundCommandKind.CRON_RELOAD:
+                from deeptutor.services.cron import get_cron_service
+
+                get_cron_service().reload()
                 return
-            config = manager.load_config(partner_id)
-            if config is not None:
-                instance.config = config
-            await manager.reload_channels(partner_id)
-            return
-        raise ValueError(f"Unknown background command kind: {kind}")
 
-    cron_service = None
-    try:
-        from deeptutor.services.cron import get_cron_service
+            from deeptutor.services.partners import get_partner_manager
 
-        cron_service = get_cron_service()
-        loop = asyncio.get_running_loop()
-
-        def _notify_cron_change() -> None:
-            task = loop.create_task(
-                application_container.coordinator.submit_background_command(
-                    BackgroundCommandKind.CRON_RELOAD
+            manager = get_partner_manager()
+            manager.configure_runtime_owner(application_container.worker_id)
+            partner_id = str(command.payload.get("partner_id") or "").strip()
+            if not partner_id:
+                raise ValueError(f"Background command {kind!r} needs partner_id")
+            if kind == BackgroundCommandKind.PARTNER_START:
+                instance = await manager.start_partner(partner_id)
+                if bool(command.payload.get("persist_auto_start", True)):
+                    manager.save_config(partner_id, instance.config, auto_start=True)
+                return
+            if kind == BackgroundCommandKind.PARTNER_STOP:
+                await manager.stop_partner(
+                    partner_id,
+                    preserve_auto_start=bool(command.payload.get("preserve_auto_start", False)),
                 )
-            )
-            task.add_done_callback(
-                lambda completed: completed.exception() if not completed.cancelled() else None
-            )
+                return
+            if kind == BackgroundCommandKind.PARTNER_RELOAD:
+                instance = manager.get_partner(partner_id)
+                if instance is None or not instance.running:
+                    return
+                config = manager.load_config(partner_id)
+                if config is not None:
+                    instance.config = config
+                await manager.reload_channels(partner_id)
+                return
+            raise ValueError(f"Unknown background command kind: {kind}")
 
-        cron_service.change_notifier = _notify_cron_change
-    except Exception:
-        logger.exception("Failed to configure cron change notifications")
+        cron_service = None
+        try:
+            from deeptutor.services.cron import get_cron_service
 
-    from deeptutor.runtime.background_leader import BackgroundLeaderSupervisor
+            cron_service = get_cron_service()
+            loop = asyncio.get_running_loop()
 
-    background_supervisor = BackgroundLeaderSupervisor(
-        application_container.coordinator,
-        application_container.worker_id,
-        start_callbacks=[
-            _start_partners,
-            _start_cron,
-            _start_github_sync,
-            _start_web_source_sync,
-        ],
-        stop_callbacks=[
-            _stop_partners,
-            _stop_cron,
-            _stop_github_sync,
-            _stop_web_source_sync,
-        ],
-        recovery_callback=application_container.recover_once,
-        control_callback=_handle_background_command,
-        renew_interval_seconds=application_container.settings.renew_interval_seconds,
-        recovery_interval_seconds=application_container.settings.recovery_interval_seconds,
-    )
-    app.state.background_supervisor = background_supervisor
-    await background_supervisor.start()
+            def _notify_cron_change() -> None:
+                task = loop.create_task(
+                    application_container.coordinator.submit_background_command(
+                        BackgroundCommandKind.CRON_RELOAD
+                    )
+                )
+                task.add_done_callback(
+                    lambda completed: completed.exception() if not completed.cancelled() else None
+                )
 
-    # Ping PocketBase if configured — logs a warning (not an error) if unreachable
-    try:
-        from deeptutor.services.pocketbase_client import ping_pocketbase
+            cron_service.change_notifier = _notify_cron_change
+        except Exception:
+            logger.exception("Failed to configure cron change notifications")
 
-        await ping_pocketbase()
-    except Exception as e:
-        logger.warning(f"PocketBase startup check failed: {e}")
+        from deeptutor.runtime.background_leader import BackgroundLeaderSupervisor
 
-    # Migrate any v1 memory files (PROFILE.md / SOUL.md / SUMMARY.md) into a
-    # backup folder so the v2 three-layer subsystem starts clean.
-    try:
-        from deeptutor.services.memory import (
-            migrate_partner_surface_if_needed,
-            migrate_v1_if_needed,
+        background_supervisor = BackgroundLeaderSupervisor(
+            application_container.coordinator,
+            application_container.worker_id,
+            start_callbacks=[
+                _start_partners,
+                _start_cron,
+                _start_github_sync,
+                _start_web_source_sync,
+            ],
+            stop_callbacks=[
+                _stop_partners,
+                _stop_cron,
+                _stop_github_sync,
+                _stop_web_source_sync,
+            ],
+            recovery_callback=application_container.recover_once,
+            control_callback=_handle_background_command,
+            renew_interval_seconds=application_container.settings.renew_interval_seconds,
+            recovery_interval_seconds=application_container.settings.recovery_interval_seconds,
         )
-        from deeptutor.services.path_service import get_path_service
+        app.state.background_supervisor = background_supervisor
+        await background_supervisor.start()
 
-        get_path_service().migrate_legacy_memory_markdown()
-        backup = migrate_v1_if_needed()
-        if backup is not None:
-            logger.info("v1 memory archived to %s", backup)
-        # Rename the legacy ``tutorbot`` memory surface (footnote refs, L2
-        # doc, snapshot/trace dirs, L3 meta keys) to ``partner``.
-        migrate_partner_surface_if_needed()
-    except Exception as e:
-        logger.warning(f"v1 memory migration failed: {e}")
+        # Ping PocketBase if configured — logs a warning (not an error) if unreachable
+        try:
+            from deeptutor.services.pocketbase_client import ping_pocketbase
 
-    app.state.ready = True
+            await ping_pocketbase()
+        except Exception as e:
+            logger.warning(f"PocketBase startup check failed: {e}")
+
+        # Migrate any v1 memory files (PROFILE.md / SOUL.md / SUMMARY.md) into a
+        # backup folder so the v2 three-layer subsystem starts clean.
+        try:
+            from deeptutor.services.memory import (
+                migrate_partner_surface_if_needed,
+                migrate_v1_if_needed,
+            )
+            from deeptutor.services.path_service import get_path_service
+
+            get_path_service().migrate_legacy_memory_markdown()
+            backup = migrate_v1_if_needed()
+            if backup is not None:
+                logger.info("v1 memory archived to %s", backup)
+            # Rename the legacy ``tutorbot`` memory surface (footnote refs, L2
+            # doc, snapshot/trace dirs, L3 meta keys) to ``partner``.
+            migrate_partner_surface_if_needed()
+        except Exception as e:
+            logger.warning(f"v1 memory migration failed: {e}")
+
+        app.state.ready = True
+    except BaseException:
+        # A startup step after the commercial foundation failed. Unwind the
+        # commercial control plane so its PostgreSQL pool is not leaked by a
+        # crashed lifespan; the commercial startup itself already unwinds on
+        # its own failure before returning.
+        try:
+            await shutdown_commercial_foundation(commercial_runtime)
+        except Exception:
+            logger.exception("Failed to stop commercial control plane after failed startup")
+        raise
+
     yield
 
     # Execute on shutdown
@@ -403,6 +426,13 @@ async def lifespan(app: FastAPI):
         logger.info("EventBus stopped")
     except Exception as e:
         logger.warning(f"Failed to stop EventBus: {e}")
+
+    # Stop the commercial control plane last: request paths may still hold
+    # pooled entitlements/connections until the services above are torn down.
+    try:
+        await shutdown_commercial_foundation(commercial_runtime)
+    except Exception as e:
+        logger.error("Failed to stop commercial control plane: %s", e, exc_info=True)
 
 
 from deeptutor.services.workspace.activity import WorkspaceActivityMiddleware
@@ -586,9 +616,14 @@ from deeptutor.api.routers import byok  # noqa: E402
 from deeptutor.api.routers import plugins_api  # noqa: E402
 from deeptutor.api.routers.file_library import router as file_library_router  # noqa: E402
 from deeptutor.api.routers.multi_user import router as multi_user_router  # noqa: E402
+from deeptutor.commercial.api import router as commercial_router  # noqa: E402
 
 # Auth router is public — login/logout/register/status require no token
 app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
+# Commercial account surface (GET /api/v1/commercial/me). The route carries
+# its own require_commercial_access dependency, which no-ops while commercial
+# mode is disabled, so mounting here stays safe for local single-user runs.
+app.include_router(commercial_router, prefix="/api/v1", tags=["commercial"])
 app.include_router(outputs.router, prefix="/files/outputs", tags=["outputs"])
 app.include_router(
     workspace.files_router,
