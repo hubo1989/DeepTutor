@@ -2,8 +2,16 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import path from "node:path";
+import { EventEmitter } from "node:events";
+import http from "node:http";
 import { unstable_doesMiddlewareMatch } from "next/experimental/testing/server";
 import { config as proxyConfig } from "../proxy";
+import {
+  CONNECTION_IP_HEADER,
+  CONNECTION_STAMP_TOKEN,
+  CONNECTION_STAMP_TOKEN_HEADER,
+  stampConnectionAddress,
+} from "../lib/connection-stamp";
 
 // Unit tests for the pure middleware routing policy (web/lib/proxy-policy.ts).
 // The policy is deliberately decoupled from `next/server`, so it can be
@@ -154,6 +162,75 @@ test("backend forwarding replaces client identity headers with frontend host", (
   ]) {
     assert.equal(headers.has(name), false, name);
   }
+});
+
+test("backend forwarding re-asserts only the connection-stamped visitor address", () => {
+  // The stamp (connection-stamp.ts) overwrites any client copy at the socket
+  // layer AND pairs it with this boot's random token, so a browser can reach
+  // this branch only through the genuine socket value.
+  const headers = prepareBackendForwardHeaders(
+    new Headers({
+      host: "app.example",
+      [CONNECTION_IP_HEADER]: "203.0.113.9",
+      [CONNECTION_STAMP_TOKEN_HEADER]: CONNECTION_STAMP_TOKEN,
+      "x-deeptutor-client-ip": "198.51.100.77",
+    }),
+  );
+
+  assert.equal(headers.get("x-deeptutor-client-ip"), "203.0.113.9");
+  assert.equal(headers.has(CONNECTION_IP_HEADER), false);
+  assert.equal(headers.has(CONNECTION_STAMP_TOKEN_HEADER), false);
+});
+
+test("backend forwarding asserts no visitor address without a valid stamp token", () => {
+  // No token → no assertion: the backend rate-limits on its own peer address
+  // (shared-bucket degradation) rather than trusting anything header-borne.
+  // This also covers the boot race before the emit patch is installed, where
+  // a client-supplied connection-ip must not be treated as a stamp.
+  const forged = prepareBackendForwardHeaders(
+    new Headers({
+      host: "app.example",
+      "x-deeptutor-client-ip": "198.51.100.77",
+      [CONNECTION_IP_HEADER]: "198.51.100.77",
+    }),
+  );
+  assert.equal(forged.has("x-deeptutor-client-ip"), false);
+  assert.equal(forged.has(CONNECTION_IP_HEADER), false);
+
+  const wrongToken = prepareBackendForwardHeaders(
+    new Headers({
+      host: "app.example",
+      [CONNECTION_IP_HEADER]: "198.51.100.77",
+      [CONNECTION_STAMP_TOKEN_HEADER]: "not-the-boot-token",
+    }),
+  );
+  assert.equal(wrongToken.has("x-deeptutor-client-ip"), false);
+  assert.equal(wrongToken.has(CONNECTION_IP_HEADER), false);
+});
+
+test("connection stamp overwrites any client-supplied identity headers", () => {
+  // The socket-level patch must SET (never append) the stamped pair, so a
+  // forged client copy cannot survive into the handler or the proxy forward.
+  const req = new EventEmitter() as unknown as {
+    headers: Record<string, string>;
+    socket: { remoteAddress: string };
+  };
+  req.headers = {
+    "x-deeptutor-connection-ip": "198.51.100.77",
+    "x-deeptutor-connection-stamp": "client-guess",
+    "x-deeptutor-client-ip": "198.51.100.77",
+  };
+  req.socket = { remoteAddress: "203.0.113.9" };
+
+  stampConnectionAddress();
+  (http.Server.prototype as unknown as { emit(...args: unknown[]): boolean }).emit.call(
+    {},
+    "request",
+    req,
+  );
+
+  assert.equal(req.headers[CONNECTION_IP_HEADER], "203.0.113.9");
+  assert.equal(req.headers[CONNECTION_STAMP_TOKEN_HEADER], CONNECTION_STAMP_TOKEN);
 });
 
 test("backend forwarding does not invent a frontend host from the Next URL", () => {

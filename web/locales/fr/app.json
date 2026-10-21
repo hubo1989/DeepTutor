@@ -5899,5 +5899,18 @@
   "Applies to Chat, Solve, Ask Questions, Guided Learning, Reading, Course Study and standard visualizations. Changes take effect on the next turn.": "S’applique au chat, à la résolution, aux questions, à l’apprentissage guidé, à la lecture, aux cours et aux visualisations standard. Les changements prennent effet au prochain tour.",
   "Clear instructions": "Effacer les instructions",
   "{{used}} / {{limit}} characters": "{{used}} / {{limit}} caractères",
-  "contextBudget.segment.workspace_instructions": "Instructions de l’espace de travail"
+  "contextBudget.segment.workspace_instructions": "Instructions de l’espace de travail",
+  "Could not send verification code": "Could not send verification code",
+  "Email": "Email",
+  "Email verification code": "Email verification code",
+  "If this email can register, a verification code has been sent.": "If this email can register, a verification code has been sent.",
+  "Request a verification code first": "Request a verification code first",
+  "Resend in {{seconds}}s": "Resend in {{seconds}}s",
+  "Resend verification code": "Resend verification code",
+  "Send verification code": "Send verification code",
+  "Sending verification code…": "Sending verification code…",
+  "Verify and create account": "Verify and create account",
+  "auth.brandTagline": "LearnLeader · Agent-Native Learning",
+  "commercial.registration.trialLimits": "Includes core learning features, up to 2 knowledge bases, 1 active learning task, and 25 MiB per file. Code sandboxing and high-cost video rendering are not included.",
+  "commercial.registration.trialSummary": "{{days}}-day free trial · no card · no automatic charge"
 }

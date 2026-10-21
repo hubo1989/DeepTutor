@@ -10,7 +10,7 @@ from deeptutor.services import email_verification
 
 
 def _request(ip: str = "127.0.0.1"):
-    return SimpleNamespace(client=SimpleNamespace(host=ip))
+    return SimpleNamespace(client=SimpleNamespace(host=ip), headers={})
 
 
 async def _request_code(
@@ -74,6 +74,7 @@ async def test_registration_requires_code_and_then_auto_logs_in(auth_registratio
     with pytest.raises(HTTPException) as invalid:
         await auth_router.register(
             auth_router.VerifyRegistrationRequest(email="user@example.com", code="000000"),
+            _request(),
             Response(),
         )
     assert invalid.value.status_code == 400
@@ -92,6 +93,7 @@ async def test_registration_requires_code_and_then_auto_logs_in(auth_registratio
     response = Response()
     registered = await auth_router.register(
         auth_router.VerifyRegistrationRequest(email="user@example.com", code=challenge.code),
+        _request(),
         response,
     )
     assert registered["ok"] is True
@@ -104,6 +106,7 @@ async def test_registration_requires_code_and_then_auto_logs_in(auth_registratio
     with pytest.raises(HTTPException) as replay:
         await auth_router.register(
             auth_router.VerifyRegistrationRequest(email="user@example.com", code=challenge.code),
+            _request(),
             Response(),
         )
     assert replay.value.status_code == 400
@@ -124,6 +127,7 @@ async def test_explicit_bootstrap_admin_email_is_promoted(
     challenge = sent_challenges[0]
     registered = await auth_router.register(
         auth_router.VerifyRegistrationRequest(email="owner@example.com", code=challenge.code),
+        _request(),
         Response(),
     )
 
@@ -146,6 +150,7 @@ async def test_bootstrap_admin_can_register_after_a_regular_user(
         auth_router.VerifyRegistrationRequest(
             email="first@example.com", code=sent_challenges[-1].code
         ),
+        _request(),
         Response(),
     )
     assert first["role"] == "user"
@@ -159,6 +164,7 @@ async def test_bootstrap_admin_can_register_after_a_regular_user(
         auth_router.VerifyRegistrationRequest(
             email="owner@example.com", code=sent_challenges[-1].code
         ),
+        _request(),
         Response(),
     )
 
@@ -270,6 +276,7 @@ async def test_public_registration_survives_deferred_trial_provisioning(
         auth_router.VerifyRegistrationRequest(
             email="pending@example.com", code=sent_challenges[0].code
         ),
+        _request(),
         Response(),
     )
 

@@ -70,6 +70,10 @@ const Guardian = dynamic(
     loading,
   },
 );
+const Byok = dynamic(
+  () => import("@/features/settings/sections/ByokSettingsSection"),
+  { loading },
+);
 const Connections = dynamic(
   () =>
     import("@/features/settings/sections/models/ConnectionsSettingsSection"),
@@ -198,6 +202,7 @@ const PAGES: Record<string, React.ComponentType> = {
   capabilities: Capabilities,
   starters: Starters,
   attachments: Attachments,
+  byok: Byok,
 };
 const AGENTS = {
   "agent-claude-code": "claude_code",

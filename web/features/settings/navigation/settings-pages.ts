@@ -14,7 +14,7 @@ export const SETTINGS_PAGE_GROUPS: { label: Lang; keys: string[] }[] = [
   { label: { en: 'Personal', zh: '个人' }, keys: ['general', 'workspace', 'data-migration', 'appearance', 'usage'] },
   {
     label: { en: 'Models & services', zh: '模型与服务' },
-    keys: ['connections', 'llm', 'task-models', 'embedding', 'search', 'voice', 'multimodal'],
+    keys: ['connections', 'llm', 'task-models', 'embedding', 'search', 'voice', 'multimodal', 'byok'],
   },
   {
     label: { en: 'Learning & conversation', zh: '学习与对话' },

@@ -138,6 +138,17 @@ const MODEL_CHILDREN: SettingsLeaf[] = [
     tile: "bg-violet-500/10 text-violet-600",
   },
   {
+    key: "byok",
+    href: "/settings/byok",
+    label: { zh: "自带密钥（BYOK）", en: "Bring your own key" },
+    blurb: {
+      zh: "为语言、嵌入与解析服务绑定你自己的 API 密钥。",
+      en: "Bind your own API keys for LLM, embedding, and parsing services.",
+    },
+    icon: KeyRound,
+    tile: "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400",
+  },
+  {
     key: "connections",
     href: "/settings#connections",
     label: { zh: "提供方", en: "Providers" },

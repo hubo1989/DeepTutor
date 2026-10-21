@@ -4,7 +4,7 @@ import { Suspense, useCallback, useState, useEffect } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { useTranslation } from "react-i18next";
-import { login, fetchAuthStatus, checkIsFirstUser } from "@/lib/auth";
+import { login, fetchAuthStatus } from "@/lib/auth";
 import {
   inheritLoginHash,
   normalizeInternalReturnPath,
@@ -38,10 +38,10 @@ function LoginPageContent() {
         router.replace(resolvedNext());
         return;
       }
-      // No users registered yet — send straight to the registration page
-      checkIsFirstUser().then((first) => {
-        if (first) router.replace("/register");
-      });
+      // Fork deployments provision the bootstrap admin from the environment
+      // and register everyone else through email verification, so there is no
+      // first-user funnel to route to (the endpoint is enumeration-guarded
+      // and always answers false anyway).
     });
   }, [router, resolvedNext]);
 

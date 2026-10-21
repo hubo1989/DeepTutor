@@ -9,7 +9,7 @@ from deeptutor.api.routers import auth as auth_router
 
 
 def _request(ip: str = "127.0.0.1"):
-    return SimpleNamespace(client=SimpleNamespace(host=ip))
+    return SimpleNamespace(client=SimpleNamespace(host=ip), headers={})
 
 
 async def _request_code(email: str):

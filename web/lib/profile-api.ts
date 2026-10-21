@@ -107,7 +107,7 @@ export async function removeAvatarImage(): Promise<void> {
 
 /** Download a privacy-safe archive of the signed-in account. */
 export async function getAccountExport(): Promise<Blob> {
-  const res = await apiFetch(apiUrl("/api/v1/auth/profile/export"), {
+  const res = await apiFetch(apiUrl("/api/auth/profile/export"), {
     cache: "no-store",
   });
   if (!res.ok) {
@@ -119,7 +119,7 @@ export async function getAccountExport(): Promise<Blob> {
 
 /** Permanently erase the signed-in regular account after password proof. */
 export async function deleteOwnAccount(password: string): Promise<void> {
-  const res = await apiFetch(apiUrl("/api/v1/auth/profile"), {
+  const res = await apiFetch(apiUrl("/api/auth/profile"), {
     method: "DELETE",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ password }),

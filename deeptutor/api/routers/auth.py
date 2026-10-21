@@ -137,6 +137,11 @@ _USER_IMPORT_MAX_BYTES = 2 * 1024 * 1024
 _USER_IMPORT_MAX_ROWS = 500
 _USER_BATCH_MAX_ROWS = 500
 _FRONTEND_HOST_HEADER = "x-deeptutor-frontend-host"
+# The bundled frontend proxy asserts the visitor address it observed on its
+# own socket (web/instrumentation.ts stamps it beyond client reach). A direct
+# caller's copy of this header is never trusted: it is honored only from
+# AUTH_TRUSTED_FRONTEND_PROXY_IPS peers.
+_CLIENT_IP_ASSERTION_HEADER = "x-deeptutor-client-ip"
 _AUTH_RUNTIME_SETTINGS = load_auth_settings()
 PRIVATE_LOGIN_HOSTS = frozenset(
     str(host).lower().rstrip(".") for host in _AUTH_RUNTIME_SETTINGS.get("private_login_hosts", [])
@@ -144,7 +149,8 @@ PRIVATE_LOGIN_HOSTS = frozenset(
 
 
 # Only a frontend proxy on an explicitly trusted peer may assert the browser
-# host. Never derive this identity from Host or X-Forwarded-* on a direct API call.
+# host or the client address. Never derive either identity from Host or
+# X-Forwarded-* on a direct API call.
 # The frontend's incoming Host is meaningful only when its public ingress
 # rejects forged private hosts and direct access to its raw listener.
 def _trusted_proxy_ips() -> frozenset[str]:
@@ -159,6 +165,16 @@ def _trusted_proxy_ips() -> frozenset[str]:
 
 
 TRUSTED_FRONTEND_PROXY_IPS = _trusted_proxy_ips()
+
+
+def _trusted_peer(request: Request) -> str:
+    """Canonical IP of the connecting peer when it is a trusted proxy."""
+    peer = request.client.host if request.client else ""
+    try:
+        peer_ip = str(ipaddress.ip_address(str(peer)))
+    except ValueError:
+        return ""
+    return peer_ip if peer_ip in TRUSTED_FRONTEND_PROXY_IPS else ""
 
 
 def _cookie_attrs() -> dict:
@@ -180,18 +196,39 @@ def _cookie_attrs() -> dict:
 
 
 def _request_frontend_host(request: Request) -> str:
-    peer = request.client.host if request.client else ""
-    try:
-        peer_ip = str(ipaddress.ip_address(peer))
-    except ValueError:
-        return ""
-    if peer_ip not in TRUSTED_FRONTEND_PROXY_IPS:
+    peer_ip = _trusted_peer(request)
+    if not peer_ip:
         return ""
     raw = request.headers.get(_FRONTEND_HOST_HEADER, "")
     try:
         return canonical_host(raw)
     except HandoffError:
         return ""
+
+
+def _asserted_client_ip(request: Request) -> str:
+    """Visitor address asserted by a trusted frontend proxy, or "".
+
+    The bundled Next proxy copies its own connection-layer stamp
+    (``x-deeptutor-connection-ip``, overwritten on the server socket in
+    web/instrumentation.ts) into ``_CLIENT_IP_ASSERTION_HEADER``. Trusting
+    that assertion is safe only because (a) the peer is an explicitly trusted
+    proxy address and (b) the stamped value originates from the proxy's TCP
+    peer, so a browser cannot inject it through headers. Anything unparseable
+    degrades to "" and the caller falls back to the real peer address.
+    """
+    if not _trusted_peer(request):
+        return ""
+    raw = str(request.headers.get(_CLIENT_IP_ASSERTION_HEADER, "") or "").strip()[:128]
+    try:
+        asserted = ipaddress.ip_address(raw)
+    except ValueError:
+        return ""
+    # A dual-stack proxy may present IPv4 visitors as IPv4-mapped addresses;
+    # normalize so both forms share one limiter bucket.
+    if isinstance(asserted, ipaddress.IPv6Address) and asserted.ipv4_mapped is not None:
+        asserted = asserted.ipv4_mapped
+    return str(asserted)
 
 
 def _require_private_frontend(request: Request) -> None:
@@ -536,8 +573,18 @@ def _extract_token(authorization: str | None, dt_token: str | None) -> str | Non
 
 
 def _client_ip(request: Request) -> str:
-    """Use the ASGI peer address; trusted proxy handling belongs to the server."""
-    return request.client.host if request.client else "unknown"
+    """Rate-limit identity for this request.
+
+    Through the trusted bundled frontend proxy, all visitors would otherwise
+    share the proxy's address and one global limiter bucket, so the proxy's
+    connection-level visitor assertion is used. Every other caller — including
+    direct requests that try to forge the assertion header — is identified by
+    its own socket address, which keeps direct-request rate limiting and
+    cross-account protection exactly as strict as before.
+    """
+    return _asserted_client_ip(request) or (
+        request.client.host if request.client else "unknown"
+    )
 
 
 def _check_login_rate_limit(username: str, client_ip: str) -> None:
@@ -1681,8 +1728,12 @@ async def request_registration_code(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Email registration is not available in PocketBase mode.",
         )
+    # Private-host deployments gate credential issuance behind their private
+    # origins exactly like /login; a public visitor must not be able to mint
+    # registration codes (each one is a delivered email) for the deployment.
+    _require_private_frontend(request)
     email = body.email
-    client_ip = request.client.host if request.client else "unknown"
+    client_ip = _client_ip(request)
     try:
         # Do the cheap persistent limiter check before bcrypt, which is
         # intentionally expensive and must not become an unauthenticated DoS
@@ -1724,84 +1775,7 @@ async def request_registration_code(
     }
 
 @router.post("/register", status_code=status.HTTP_201_CREATED)
-async def register(body: RegisterRequest, request: Request, response: Response) -> dict:
-    """
-    Bootstrap-only registration.
-
-    Public endpoint that creates the *first* admin account when the user store
-    is empty. Once an admin exists, this endpoint is closed; further accounts
-    must be created by an admin via ``POST /api/auth/users``.
-
-    Only available when AUTH_ENABLED=true.
-    """
-    if not AUTH_ENABLED:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Auth is disabled — registration is not available.",
-        )
-
-    _require_private_frontend(request)
-    _no_store(response)
-
-    if POCKETBASE_ENABLED:
-        # PocketBase deployments are documented as single-user. Keep registration
-        # closed and require admins to provision users in the PocketBase admin UI.
-        if not is_first_user():
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Self-registration is closed. Ask an administrator to create your account.",
-            )
-        result = register_pb(username=body.username, email=body.username, password=body.password)
-        if not result:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Registration failed — username or email may already be taken.",
-            )
-        logger.info(f"First user registered via PocketBase: '{body.username}'")
-        return {
-            "ok": True,
-            "user_id": result.get("id", ""),
-            "username": body.username,
-            "role": "user",
-            "is_first_user": True,
-            "is_admin": False,
-        }
-
-    # Standard mode — only allowed before the first admin exists.
-    if not is_first_user():
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Self-registration is closed. Ask an administrator to create your account.",
-        )
-
-    existing = {u["username"] for u in list_users()}
-    if body.username in existing:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Username already taken",
-        )
-
-    add_user(body.username, body.password)
-    user_id = ""
-    role = "user"
-    for item in list_users():
-        if item.get("username") == body.username:
-            user_id = str(item.get("id") or "")
-            role = str(item.get("role") or "user")
-            break
-    logger.info(f"First user (admin) registered: '{body.username}'")
-    return {
-        "ok": True,
-        "user_id": user_id,
-        "username": body.username,
-        "role": role,
-        "is_first_user": True,
-        "is_admin": role == "admin",
-    }
-
-
-@router.post("/register", status_code=status.HTTP_201_CREATED)
-async def register(body: VerifyRegistrationRequest, response: Response) -> dict:
+async def register(body: VerifyRegistrationRequest, request: Request, response: Response) -> dict:
     """Consume a code and create the verified account exactly once."""
     if not AUTH_ENABLED:
         raise HTTPException(
@@ -1824,6 +1798,9 @@ async def register(body: VerifyRegistrationRequest, response: Response) -> dict:
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Email registration is not available in PocketBase mode.",
         )
+    # Mirror the request-code gate: with private login hosts configured, a
+    # stolen one-time code must not complete registration from a public origin.
+    _require_private_frontend(request)
     password_hash = email_verification.consume_challenge(body.email, body.code)
     if not password_hash:
         raise HTTPException(
