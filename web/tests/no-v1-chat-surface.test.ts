@@ -44,8 +44,7 @@ test("the frontend has no retired transport, URL, or compatibility surface", () 
     return (
       normalized.includes("features/byok/") ||
       normalized.includes("features/commercial/") ||
-      normalized.includes("lib/admin-api.") ||
-      normalized.includes("lib/profile-api.")
+      normalized.includes("lib/admin-api.")
     );
   };
 
