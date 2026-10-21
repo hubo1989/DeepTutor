@@ -17,7 +17,7 @@ async def test_path_mutation_waits_for_waiting_turn_and_releases_lease(monkeypat
     )
     turns = SimpleNamespace(cancel_turn_and_wait=AsyncMock(return_value=True))
     monkeypatch.setattr(router, "LearningStore", lambda: learning_store)
-    monkeypatch.setattr(router, "_turn_runtime_manager", lambda: turns)
+    monkeypatch.setattr(router, "_turn_application_service", lambda: turns)
 
     await router._cancel_active_learning_turn("path")
 
@@ -35,7 +35,7 @@ async def test_path_mutation_keeps_lease_when_cancellation_times_out(monkeypatch
     )
     turns = SimpleNamespace(cancel_turn_and_wait=AsyncMock(return_value=False))
     monkeypatch.setattr(router, "LearningStore", lambda: learning_store)
-    monkeypatch.setattr(router, "_turn_runtime_manager", lambda: turns)
+    monkeypatch.setattr(router, "_turn_application_service", lambda: turns)
 
     with pytest.raises(HTTPException) as exc:
         await router._cancel_active_learning_turn("path")
@@ -60,7 +60,7 @@ async def test_legacy_mastery_session_lookup_uses_application_cancellation(monke
     turns = SimpleNamespace(cancel_turn_and_wait=AsyncMock(return_value=True))
     monkeypatch.setattr(router, "LearningStore", lambda: learning_store)
     monkeypatch.setattr("deeptutor.services.session.get_session_store", lambda: session_store)
-    monkeypatch.setattr(router, "_turn_runtime_manager", lambda: turns)
+    monkeypatch.setattr(router, "_turn_application_service", lambda: turns)
 
     await router._cancel_active_learning_turn("path")
 

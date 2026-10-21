@@ -1,6 +1,8 @@
+import { browserStorage } from "@/shared/storage";
 import { apiFetch, apiUrl, setRuntimeAuthEnabled } from "@/lib/api";
+import { updateRecoveryPrincipal } from "@/lib/recovery-principal";
 
-// Auth state is resolved at runtime from the backend (`/api/v1/auth/status`),
+// Auth state is resolved at runtime from the backend (`/api/auth/status`),
 // not from a build-time/env constant: the browser bundle never sees
 // `DEEPTUTOR_AUTH_ENABLED` (not a `NEXT_PUBLIC_` var), and auth is runtime
 // config that must not be baked into the bundle. Components observe it via the
@@ -14,29 +16,98 @@ export interface AuthStatus {
   username?: string;
   role?: string;
   is_admin?: boolean;
+  /** Server-side account preset; null for identities without a local account. */
+  preset?: "standard" | "learner" | "custom" | null;
   /** Avatar marker: "", "icon:<name>:<color>", or "img:<version>". */
   avatar?: string;
-  /** Public deployment contract used to show Trial terms before registration. */
-  commercial_enabled?: boolean;
-  trial_days?: number | null;
+  learning_policy?: {
+    age_band: string;
+    locked_persona: string;
+    allowed_capabilities: string[];
+    default_capability: string;
+    allowed_surfaces?: string[];
+    reading?: {
+      allow_upload: boolean;
+      material_ids: string[];
+      extensions: string[];
+    };
+  } | null;
+}
+
+const AUTH_STATUS_CACHE_MS = 5_000;
+const AUTH_BOUNDARY_KEY = "deeptutor.authBoundary";
+let authGeneration = 0;
+let boundaryListenerInstalled = false;
+let authStatusRequest: Promise<AuthStatus | null> | null = null;
+let cachedAuthStatus: { value: AuthStatus | null; expiresAt: number } | null =
+  null;
+
+export function invalidateAuthStatusCache(): void {
+  authGeneration += 1;
+  authStatusRequest = null;
+  cachedAuthStatus = null;
+  updateRecoveryPrincipal(null);
+}
+
+function broadcastAuthBoundary(): void {
+  // Notify other tabs to re-check the server, never convey/trust a principal
+  // through shared browser storage. No private recovery records are deleted.
+  if (typeof window === "undefined") return;
+  try { browserStorage.writeRaw("local", AUTH_BOUNDARY_KEY, `${Date.now()}:${Math.random()}`); }
+  catch { /* Storage may be unavailable; this tab still fails closed. */ }
+}
+
+function listenForAuthBoundary(): void {
+  if (boundaryListenerInstalled || typeof window === "undefined") return;
+  boundaryListenerInstalled = true;
+  window.addEventListener("storage", (event) => {
+    if (event.key !== AUTH_BOUNDARY_KEY) return;
+    invalidateAuthStatusCache();
+    void fetchAuthStatus();
+  });
 }
 
 /**
  * Call the backend to check whether the current session is authenticated.
  * Returns null on network error so callers can decide how to handle it.
  */
-export async function fetchAuthStatus(): Promise<AuthStatus | null> {
-  try {
-    const res = await apiFetch(apiUrl("/api/v1/auth/status"));
-    if (!res.ok) return null;
-    const status: AuthStatus = await res.json();
-    // Record the real auth state so apiFetch's in-session 401 → /login redirect
-    // fires only when auth is actually enabled.
-    setRuntimeAuthEnabled(Boolean(status.enabled));
-    return status;
-  } catch {
-    return null;
+export function fetchAuthStatus(): Promise<AuthStatus | null> {
+  listenForAuthBoundary();
+  if (cachedAuthStatus && cachedAuthStatus.expiresAt > Date.now()) {
+    return Promise.resolve(cachedAuthStatus.value);
   }
+  if (!authStatusRequest) {
+    const generation = authGeneration;
+    const request = (async () => {
+      try {
+        const res = await apiFetch(apiUrl("/api/auth/status"));
+        if (!res.ok) return null;
+        const status: AuthStatus = await res.json();
+        // Record the real auth state so apiFetch's in-session 401 → /login redirect
+        // fires only when auth is actually enabled.
+        return status;
+      } catch {
+        return null;
+      }
+    })()
+      .then((status) => {
+        if (generation !== authGeneration) return null;
+        if (status !== null) setRuntimeAuthEnabled(Boolean(status.enabled));
+        updateRecoveryPrincipal(status);
+        cachedAuthStatus = {
+          value: status,
+          // Retry unavailable backends quickly; stable answers can be shared
+          // across the shell and Settings providers for one navigation.
+          expiresAt: Date.now() + (status === null ? 1_000 : AUTH_STATUS_CACHE_MS),
+        };
+        return status;
+      })
+      .finally(() => {
+        if (authStatusRequest === request) authStatusRequest = null;
+      });
+    authStatusRequest = request;
+  }
+  return authStatusRequest;
 }
 
 /**
@@ -47,7 +118,7 @@ export async function login(
   password: string,
 ): Promise<{ ok: boolean; error?: string }> {
   try {
-    const res = await apiFetch(apiUrl("/api/v1/auth/login"), {
+    const res = await apiFetch(apiUrl("/api/auth/login"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ username, password }),
@@ -56,7 +127,11 @@ export async function login(
       skipAuthRedirect: true,
     });
 
-    if (res.ok) return { ok: true };
+    if (res.ok) {
+      invalidateAuthStatusCache();
+      broadcastAuthBoundary();
+      return { ok: true };
+    }
 
     const data = await res.json().catch(() => ({}));
     return { ok: false, error: extractDetail(data.detail) ?? "Login failed" };
@@ -81,34 +156,11 @@ function extractDetail(detail: unknown): string {
 }
 
 /**
- * Ask the backend to send a mailbox verification code. The backend keeps the
- * response generic so the browser cannot enumerate existing accounts.
- */
-export async function requestRegistrationCode(
-  email: string,
-  password: string,
-): Promise<{ ok: boolean; error?: string }> {
-  try {
-    const res = await apiFetch(apiUrl("/api/v1/auth/register/request-code"), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email, password }),
-      skipAuthRedirect: true,
-    });
-    const data = await res.json().catch(() => ({}));
-    if (res.ok) return { ok: true };
-    return { ok: false, error: extractDetail(data.detail) };
-  } catch {
-    return { ok: false, error: "Could not reach the server" };
-  }
-}
-
-/**
- * Complete a new account with the one-time email verification code.
+ * Register a new account. The first user to register becomes admin.
  */
 export async function register(
-  email: string,
-  code: string,
+  username: string,
+  password: string,
 ): Promise<{
   ok: boolean;
   role?: string;
@@ -116,18 +168,21 @@ export async function register(
   error?: string;
 }> {
   try {
-    const res = await apiFetch(apiUrl("/api/v1/auth/register"), {
+    const res = await apiFetch(apiUrl("/api/auth/register"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email, code }),
+      body: JSON.stringify({ username, password }),
       // Registration validation failures (e.g. 400/401) should surface inline
       // rather than bounce the user through the global login redirect.
       skipAuthRedirect: true,
     });
 
     const data = await res.json().catch(() => ({}));
-    if (res.ok)
+    if (res.ok) {
+      invalidateAuthStatusCache();
+      broadcastAuthBoundary();
       return { ok: true, role: data.role, is_first_user: data.is_first_user };
+    }
     return { ok: false, error: extractDetail(data.detail) };
   } catch {
     return { ok: false, error: "Could not reach the server" };
@@ -139,7 +194,7 @@ export async function register(
  */
 export async function checkIsFirstUser(): Promise<boolean> {
   try {
-    const res = await apiFetch(apiUrl("/api/v1/auth/is_first_user"));
+    const res = await apiFetch(apiUrl("/api/auth/is_first_user"));
     if (!res.ok) return false;
     const data = await res.json();
     return Boolean(data.is_first_user);
@@ -152,11 +207,15 @@ export async function checkIsFirstUser(): Promise<boolean> {
  * POST to the logout endpoint to clear the session cookie.
  */
 export async function logout(): Promise<void> {
+  invalidateAuthStatusCache();
   try {
-    await apiFetch(apiUrl("/api/v1/auth/logout"), {
+    await apiFetch(apiUrl("/api/auth/logout"), {
       method: "POST",
     });
   } catch {
     // Ignore — we'll redirect regardless
+  } finally {
+    invalidateAuthStatusCache();
+    broadcastAuthBoundary();
   }
 }

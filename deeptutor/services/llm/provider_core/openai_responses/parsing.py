@@ -12,7 +12,7 @@ import json_repair
 from loguru import logger
 
 from deeptutor.services.llm.provider_core.base import LLMResponse, ToolCallRequest
-from deeptutor.services.llm.usage_frame import token_counts
+from deeptutor.services.llm.usage_frame import usage_breakdown
 
 FINISH_REASON_MAP = {
     "completed": "stop",
@@ -21,9 +21,106 @@ FINISH_REASON_MAP = {
     "cancelled": "error",
 }
 
+# Output-item types a provider's server-side web search emits. OpenAI and
+# DeepSeek name the item "web_search_call"; "web_search" is accepted
+# defensively for providers that shorten it.
+_WEB_SEARCH_ITEM_TYPES = {"web_search_call", "web_search"}
 
-def map_finish_reason(status: str | None) -> str:
-    return FINISH_REASON_MAP.get(status or "completed", "stop")
+# Stateless Responses endpoints require selected output items to be replayed
+# verbatim on the next request. DeepSeek V4 is especially strict here: when
+# thinking is enabled, omitting the preceding ``reasoning`` item produces a
+# 400 ("reasoning_text ... must be passed back"). Keep adjacent messages and
+# function calls so their original chronology survives the compatibility
+# layer as well.
+_REPLAYABLE_OUTPUT_ITEM_TYPES = {
+    "reasoning",
+    "message",
+    "function_call",
+    *_WEB_SEARCH_ITEM_TYPES,
+}
+
+#: Reports a function call's arguments *as they stream*, so a caller can put a
+#: partially written call on screen instead of waiting for the closing brace.
+#: Called with ``(call_id, tool_name, arguments_so_far)`` — the accumulated
+#: text, not the fragment, so a consumer never has to reassemble it. Purely a
+#: side channel: the dispatched call is still built from the finished
+#: arguments by :func:`_build_tool_call`.
+ToolArgsDeltaHook = Callable[[str, str, str], Awaitable[None]]
+
+
+def _dump_model(value: Any) -> Any:
+    """Normalize an SDK object / dict into a plain dict."""
+    if isinstance(value, dict):
+        return value
+    dump = getattr(value, "model_dump", None)
+    return dump() if callable(dump) else vars(value)
+
+
+def _citation_from_annotation(annotation: Any) -> dict[str, str] | None:
+    """Extract {url, title} from a url_citation annotation, else None."""
+    if not isinstance(annotation, dict):
+        annotation = _dump_model(annotation)
+    if not isinstance(annotation, dict):
+        return None
+    if annotation.get("type") not in {None, "url_citation", "url"}:
+        return None
+    url = str(annotation.get("url") or "").strip()
+    if not url:
+        return None
+    return {"url": url, "title": str(annotation.get("title") or "")}
+
+
+def _citations_from_content_blocks(blocks: Any) -> list[dict[str, str]]:
+    """Collect url_citation annotations attached to message content blocks."""
+    citations: list[dict[str, str]] = []
+    for block in blocks or []:
+        block = _dump_model(block)
+        if not isinstance(block, dict):
+            continue
+        for annotation in block.get("annotations") or []:
+            citation = _citation_from_annotation(annotation)
+            if citation:
+                citations.append(citation)
+    return citations
+
+
+def map_finish_reason(
+    status: str | None,
+    incomplete_reason: str | None = None,
+) -> str:
+    """Map a Responses terminal status to the chat-completions vocabulary.
+
+    ``response.incomplete`` is not always a token-limit event: DeepSeek also
+    uses it for content filtering.  The nested reason is therefore part of the
+    mapping instead of treating every incomplete response as ``length``.
+    """
+    normalized_status = str(status or "completed").strip().lower()
+    normalized_reason = str(incomplete_reason or "").strip().lower()
+    if normalized_status == "incomplete":
+        if normalized_reason == "content_filter":
+            return "content_filter"
+        return "length"
+    return FINISH_REASON_MAP.get(normalized_status, "stop")
+
+
+def _response_field(response: Any, key: str) -> Any:
+    if isinstance(response, dict):
+        return response.get(key)
+    return getattr(response, key, None)
+
+
+def _incomplete_reason(response: Any) -> str | None:
+    details = _response_field(response, "incomplete_details")
+    reason = _response_field(details, "reason")
+    return str(reason) if reason is not None else None
+
+
+def _response_usage(response: Any) -> dict[str, int]:
+    return usage_breakdown(
+        _response_field(response, "usage"),
+        prompt="input_tokens",
+        completion="output_tokens",
+    )
 
 
 @dataclass(slots=True)
@@ -100,20 +197,98 @@ class _ToolCallBuffers:
             buffer.arguments = value
 
 
+def _looks_truncated(arguments: Any) -> bool:
+    """Whether the arguments simply stop rather than close.
+
+    Worth separating from ordinary syntax errors: an unescaped quote inside a
+    string is repaired losslessly, but arguments that were *cut off* are
+    repaired into something plausible and wrong — the fragment closes as a
+    shorter value, so a card silently loses the options the model had not
+    written yet and the last one keeps whatever bytes followed the break. A
+    model that spends its token budget on thinking hits this, and the reply
+    still reads as a finished question.
+
+    Judged by the last character, not by the decoder's message: an
+    unterminated string and a stray quote mid-prose raise the same
+    ``Expecting ',' delimiter``, whereas a complete object always ends in
+    ``}`` however mangled its middle is.
+    """
+    if not isinstance(arguments, str):
+        return False
+    stripped = arguments.rstrip()
+    return bool(stripped) and not stripped.endswith(("}", "]"))
+
+
 def _parse_tool_arguments(arguments: Any, tool_name: str) -> dict[str, Any]:
-    """Parse function arguments consistently across all response modes."""
+    """Parse function arguments consistently across all response modes.
+
+    Strict JSON first, then ``json_repair``. A model writing prose into an
+    argument routinely leaves an unescaped quote in it (an option described
+    as ``路径名"1"``), which strict parsing rejects and repair recovers
+    losslessly — expected, and logged at debug.
+
+    Truncated arguments are a different story and stay at warning: repair
+    still returns an object, so the call proceeds with content the model
+    never finished writing. Only arguments repair cannot make an object of
+    reach the tool as ``{"raw": ...}``.
+    """
     try:
-        parsed = json.loads(arguments) if isinstance(arguments, str) else arguments
+        return _as_arguments_dict(
+            json.loads(arguments) if isinstance(arguments, str) else arguments
+        )
     except Exception:
+        pass
+    repaired: Any = arguments
+    if isinstance(arguments, str):
+        try:
+            repaired = json_repair.loads(arguments)
+        except Exception:
+            repaired = None
+    if not isinstance(repaired, dict):
         logger.warning(
-            "Failed to parse tool call arguments for '{}': {}",
+            "Could not parse tool call arguments for '{}': {}",
             tool_name,
             str(arguments)[:200],
         )
-        parsed = json_repair.loads(arguments) if isinstance(arguments, str) else arguments
-        if not isinstance(parsed, dict):
-            return {"raw": arguments}
+        return {"raw": arguments}
+    if _looks_truncated(arguments):
+        logger.warning(
+            "Tool call arguments for '{}' were cut off after {} chars; the "
+            "repaired call is missing whatever the model had not written yet: {}",
+            tool_name,
+            len(arguments) if isinstance(arguments, str) else 0,
+            str(arguments)[-200:],
+        )
+        return repaired
+    logger.debug(
+        "Repaired malformed tool call arguments for '{}': {}",
+        tool_name,
+        str(arguments)[:200],
+    )
+    return repaired
+
+
+def _as_arguments_dict(parsed: Any) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
+
+
+async def _report_args_delta(
+    hook: ToolArgsDeltaHook,
+    buffers: _ToolCallBuffers,
+    *,
+    call_id: str | None,
+    item_id: str | None,
+) -> None:
+    """Hand the accumulated arguments of one in-flight call to *hook*.
+
+    Silent when the delta cannot be correlated to a buffer or the provider has
+    not named the tool yet: a preview no consumer can attribute is worth less
+    than the round it would interrupt.
+    """
+    buffer = buffers.get(call_id=call_id, item_id=item_id)
+    if buffer is None or not buffer.name:
+        return
+    await hook(buffer.call_id, buffer.name, buffer.arguments)
 
 
 def _build_tool_call(
@@ -183,12 +358,15 @@ async def iter_sse(response: httpx.Response) -> AsyncGenerator[dict[str, Any], N
 async def consume_sse(
     response: httpx.Response,
     on_content_delta: Callable[[str], Awaitable[None]] | None = None,
+    on_provider_event: Callable[[str, dict[str, Any]], None] | None = None,
+    on_tool_args_delta: ToolArgsDeltaHook | None = None,
 ) -> tuple[str, list[ToolCallRequest], str]:
     """Consume a Responses API SSE stream."""
     content = ""
     tool_calls: list[ToolCallRequest] = []
     tool_call_buffers = _ToolCallBuffers()
     finish_reason = "stop"
+    seen_web_search_items: set[str] = set()
 
     async for event in iter_sse(response):
         event_type = event.get("type")
@@ -209,12 +387,23 @@ async def consume_sse(
             content += delta_text
             if on_content_delta and delta_text:
                 await on_content_delta(delta_text)
+        elif event_type == "response.output_text.annotation.added":
+            citation = _citation_from_annotation(event.get("annotation"))
+            if citation and on_provider_event:
+                on_provider_event("citation", citation)
         elif event_type == "response.function_call_arguments.delta":
             tool_call_buffers.append(
                 event.get("delta") or "",
                 call_id=event.get("call_id"),
                 item_id=event.get("item_id"),
             )
+            if on_tool_args_delta:
+                await _report_args_delta(
+                    on_tool_args_delta,
+                    tool_call_buffers,
+                    call_id=event.get("call_id"),
+                    item_id=event.get("item_id"),
+                )
         elif event_type == "response.function_call_arguments.done":
             tool_call_buffers.replace(
                 event.get("arguments") or "",
@@ -223,6 +412,13 @@ async def consume_sse(
             )
         elif event_type == "response.output_item.done":
             item = event.get("item") or {}
+            if item.get("type") in _WEB_SEARCH_ITEM_TYPES:
+                item_id = str(item.get("id") or "")
+                if item_id and item_id not in seen_web_search_items:
+                    seen_web_search_items.add(item_id)
+                    if on_provider_event:
+                        on_provider_event("output_item", dict(item))
+                continue
             if item.get("type") == "function_call":
                 call_id = item.get("call_id")
                 if not call_id:
@@ -240,9 +436,17 @@ async def consume_sse(
                         arguments=(buf.arguments if buf else "") or item.get("arguments") or "{}",
                     )
                 )
-        elif event_type == "response.completed":
-            status = (event.get("response") or {}).get("status")
-            finish_reason = map_finish_reason(status)
+        elif event_type in {"response.completed", "response.incomplete"}:
+            # The documented shape nests the terminal payload under
+            # ``response``; a few gateways flatten it onto the event itself.
+            response = event.get("response") or event
+            status = _response_field(response, "status") or (
+                "incomplete" if event_type == "response.incomplete" else "completed"
+            )
+            finish_reason = map_finish_reason(status, _incomplete_reason(response))
+            usage = _response_usage(response)
+            if usage and on_provider_event:
+                on_provider_event("usage", usage)
         elif event_type in {"error", "response.failed"}:
             raise RuntimeError(f"Response failed: {_response_error_detail(event)[:500]}")
 
@@ -259,28 +463,47 @@ def parse_response_output(response: Any) -> LLMResponse:
     content_parts: list[str] = []
     tool_calls: list[ToolCallRequest] = []
     reasoning_content: str | None = None
+    native_output_items: list[dict[str, Any]] = []
+    native_citations: list[dict[str, str]] = []
 
     for item in output:
+        item = _dump_model(item)
         if not isinstance(item, dict):
-            dump = getattr(item, "model_dump", None)
-            item = dump() if callable(dump) else vars(item)
+            continue
 
         item_type = item.get("type")
         if item_type == "message":
+            native_output_items.append(dict(item))
             for block in item.get("content") or []:
+                block = _dump_model(block)
                 if not isinstance(block, dict):
-                    dump = getattr(block, "model_dump", None)
-                    block = dump() if callable(dump) else vars(block)
+                    continue
                 if block.get("type") == "output_text":
                     content_parts.append(block.get("text") or "")
+                    native_citations.extend(_citations_from_content_blocks([block]))
         elif item_type == "reasoning":
+            native_output_items.append(dict(item))
+            for block in item.get("content") or []:
+                block = _dump_model(block)
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "reasoning_text" and block.get("text"):
+                    reasoning_content = (reasoning_content or "") + block["text"]
             for summary in item.get("summary") or []:
+                summary = _dump_model(summary)
                 if not isinstance(summary, dict):
-                    dump = getattr(summary, "model_dump", None)
-                    summary = dump() if callable(dump) else vars(summary)
+                    continue
                 if summary.get("type") == "summary_text" and summary.get("text"):
                     reasoning_content = (reasoning_content or "") + summary["text"]
+        elif item_type in _WEB_SEARCH_ITEM_TYPES:
+            # This action already ran inside the provider and accompanies a
+            # terminal answer. Preserve it verbatim as provider metadata; do
+            # not synthesize a local ToolCallRequest and trigger a fake second
+            # agent-loop round.
+            native_output_items.append(dict(item))
+            native_citations.extend(_citations_from_content_blocks(item.get("results")))
         elif item_type == "function_call":
+            native_output_items.append(dict(item))
             call_id = item.get("call_id") or ""
             item_id = item.get("id") or _ToolCallBuffers.PLACEHOLDER_ITEM_ID
             args_raw = item.get("arguments") or "{}"
@@ -294,15 +517,32 @@ def parse_response_output(response: Any) -> LLMResponse:
             )
 
     # The Responses API names its counters input_/output_tokens.
-    usage = token_counts(response.get("usage"), prompt="input_tokens", completion="output_tokens")
+    usage = _response_usage(response)
 
-    finish_reason = map_finish_reason(response.get("status"))
+    finish_reason = map_finish_reason(
+        response.get("status"),
+        _incomplete_reason(response),
+    )
+    if not any(item.get("type") == "reasoning" for item in native_output_items):
+        # Preserve the established metadata contract for ordinary native web
+        # search responses. Message/function-call items only need verbatim
+        # replay when they accompany provider-private reasoning state.
+        native_output_items = [
+            item for item in native_output_items if item.get("type") in _WEB_SEARCH_ITEM_TYPES
+        ]
+    provider_specific_fields: dict[str, Any] = {}
+    if native_output_items or native_citations:
+        provider_specific_fields = {
+            "native_output_items": native_output_items,
+            "citations": native_citations,
+        }
     return LLMResponse(
         content="".join(content_parts) or None,
         tool_calls=tool_calls,
         finish_reason=finish_reason,
         usage=usage,
         reasoning_content=reasoning_content if isinstance(reasoning_content, str) else None,
+        provider_specific_fields=provider_specific_fields,
     )
 
 
@@ -310,6 +550,8 @@ async def consume_sdk_stream(
     stream: Any,
     on_content_delta: Callable[[str], Awaitable[None]] | None = None,
     on_reasoning_delta: Callable[[str], Awaitable[None]] | None = None,
+    on_provider_event: Callable[[str, dict[str, Any]], None] | None = None,
+    on_tool_args_delta: ToolArgsDeltaHook | None = None,
 ) -> tuple[str, list[ToolCallRequest], str, dict[str, int], str | None]:
     """Consume an SDK async stream from client.responses.create(stream=True)."""
     content = ""
@@ -318,6 +560,7 @@ async def consume_sdk_stream(
     finish_reason = "stop"
     usage: dict[str, int] = {}
     reasoning_content: str | None = None
+    seen_web_search_items: set[str] = set()
 
     async for event in stream:
         event_type = getattr(event, "type", None)
@@ -338,12 +581,23 @@ async def consume_sdk_stream(
             content += delta_text
             if on_content_delta and delta_text:
                 await on_content_delta(delta_text)
+        elif event_type == "response.output_text.annotation.added":
+            citation = _citation_from_annotation(getattr(event, "annotation", None))
+            if citation and on_provider_event:
+                on_provider_event("citation", citation)
         elif event_type == "response.function_call_arguments.delta":
             tool_call_buffers.append(
                 getattr(event, "delta", "") or "",
                 call_id=getattr(event, "call_id", None),
                 item_id=getattr(event, "item_id", None),
             )
+            if on_tool_args_delta:
+                await _report_args_delta(
+                    on_tool_args_delta,
+                    tool_call_buffers,
+                    call_id=getattr(event, "call_id", None),
+                    item_id=getattr(event, "item_id", None),
+                )
         elif event_type == "response.function_call_arguments.done":
             tool_call_buffers.replace(
                 getattr(event, "arguments", "") or "",
@@ -352,6 +606,18 @@ async def consume_sdk_stream(
             )
         elif event_type == "response.output_item.done":
             item = getattr(event, "item", None)
+            item_dict = _dump_model(item) if item is not None else None
+            if (
+                isinstance(item_dict, dict)
+                and item_dict.get("type") in _REPLAYABLE_OUTPUT_ITEM_TYPES
+                and on_provider_event
+            ):
+                on_provider_event("output_item", dict(item_dict))
+            if isinstance(item_dict, dict) and item_dict.get("type") in _WEB_SEARCH_ITEM_TYPES:
+                item_id = str(item_dict.get("id") or "")
+                if item_id and item_id not in seen_web_search_items:
+                    seen_web_search_items.add(item_id)
+                continue
             if item and getattr(item, "type", None) == "function_call":
                 call_id = getattr(item, "call_id", None)
                 if not call_id:
@@ -369,19 +635,31 @@ async def consume_sdk_stream(
                         or "{}",
                     )
                 )
-        elif event_type == "response.reasoning_summary_text.delta":
+        elif event_type in {
+            "response.reasoning_summary_text.delta",
+            "response.reasoning_text.delta",
+        }:
             delta_text = getattr(event, "delta", "") or ""
             reasoning_content = (reasoning_content or "") + delta_text
             if on_reasoning_delta and delta_text:
                 await on_reasoning_delta(delta_text)
-        elif event_type == "response.completed":
-            response = getattr(event, "response", None)
-            status = getattr(response, "status", None) if response is not None else None
-            usage_obj = getattr(response, "usage", None) if response is not None else None
-            finish_reason = map_finish_reason(status)
+        elif event_type in {"response.completed", "response.incomplete"}:
+            response = getattr(event, "response", None) or event
+            status = _response_field(response, "status")
+            usage_obj = _response_field(response, "usage")
+            if status is None and event_type == "response.incomplete":
+                status = "incomplete"
+            finish_reason = map_finish_reason(status, _incomplete_reason(response))
             usage = (
-                token_counts(usage_obj, prompt="input_tokens", completion="output_tokens") or usage
+                usage_breakdown(
+                    usage_obj,
+                    prompt="input_tokens",
+                    completion="output_tokens",
+                )
+                or usage
             )
+            if usage and on_provider_event:
+                on_provider_event("usage", usage)
         elif event_type in {"error", "response.failed"}:
             raise RuntimeError(f"Response failed: {_response_error_detail(event)[:500]}")
 

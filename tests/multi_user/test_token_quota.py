@@ -215,7 +215,7 @@ def test_mineru_reserves_pdf_pages_before_parse(as_user, tmp_path, monkeypatch) 
 
 
 def test_bounded_user_call_is_rejected_before_provider_call(as_user, tmp_path, monkeypatch) -> None:
-    from deeptutor.core.agentic.client import _TokenQuotaCompletions
+    from deeptutor.runtime.agentic.client import _TokenQuotaCompletions
     from deeptutor.multi_user import token_quota
 
     monkeypatch.setattr(token_quota, "quota_db_path", lambda: tmp_path / "usage.sqlite3")
@@ -247,7 +247,7 @@ def test_bounded_user_call_is_rejected_before_provider_call(as_user, tmp_path, m
 
 
 def test_stream_reservation_is_finalized_after_iteration(as_user, tmp_path, monkeypatch) -> None:
-    from deeptutor.core.agentic.client import _TokenQuotaCompletions
+    from deeptutor.runtime.agentic.client import _TokenQuotaCompletions
     from deeptutor.multi_user import token_quota
 
     monkeypatch.setattr(token_quota, "quota_db_path", lambda: tmp_path / "usage.sqlite3")
@@ -318,6 +318,7 @@ def test_services_factory_path_is_quota_gated(as_user, tmp_path, monkeypatch) ->
             calls.append(kwargs)
             return SimpleNamespace(
                 content="ok",
+                reasoning_content="",
                 finish_reason="stop",
                 usage={"total_tokens": 9},
             )

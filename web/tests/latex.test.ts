@@ -4,9 +4,32 @@ import {
   convertFlowFenceToMermaid,
   convertLatexDelimiters,
   convertSequenceFenceToMermaid,
+  hasMarkdownMath,
   processLatexContent,
   processMarkdownContent,
 } from "../lib/latex";
+
+// ---------------------------------------------------------------------------
+// hasMarkdownMath — shared Simple/Rich renderer routing
+// ---------------------------------------------------------------------------
+
+test("hasMarkdownMath: detects plain inline formulas from chat prose", () => {
+  const content = "假设有一个函数 $f(x)$，在 $x=2$ 这个点上，函数值趋近 $5$。";
+
+  assert.equal(hasMarkdownMath(content), true);
+  assert.equal(hasMarkdownMath("The limit is $2$."), true);
+});
+
+test("hasMarkdownMath: detects display and backslash delimiters while streaming", () => {
+  assert.equal(hasMarkdownMath("Working... $$"), true);
+  assert.equal(hasMarkdownMath("Solve \\(x=2"), true);
+  assert.equal(hasMarkdownMath("Then \\[x^2"), true);
+});
+
+test("hasMarkdownMath: does not confuse ordinary currency or escaped dollars", () => {
+  assert.equal(hasMarkdownMath("Tickets cost $5 and $10 respectively."), false);
+  assert.equal(hasMarkdownMath("Write \\$5 and \\$10 literally."), false);
+});
 
 // ---------------------------------------------------------------------------
 // convertLatexDelimiters
@@ -87,6 +110,34 @@ test("headings: does not split 7+ consecutive hashes", () => {
   assert.equal(result.trim(), "#######");
 });
 
+test("headings: leaves heading-like fenced code verbatim", () => {
+  const input = [
+    "```c",
+    "##define FEATURE",
+    "```",
+    "",
+    "~~~text",
+    "###literal",
+    "~~~",
+  ].join("\n");
+
+  assert.equal(processMarkdownContent(input), input);
+});
+
+test("headings: leaves raw HTML code blocks verbatim", () => {
+  const input = [
+    "<pre>",
+    "###literal",
+    "</pre>",
+    "",
+    "<code>",
+    "##define FEATURE",
+    "</code>",
+  ].join("\n");
+
+  assert.equal(processMarkdownContent(input), input);
+});
+
 // ---------------------------------------------------------------------------
 // processMarkdownContent — inline math normalisation ($$...$$ → $...$)
 // ---------------------------------------------------------------------------
@@ -103,6 +154,37 @@ test("inline math: standalone one-line $$...$$ → split to block", () => {
   assert.equal(lines[0], "$$");
   assert.ok(lines[1].includes("\\frac{a}{b}"));
   assert.equal(lines[2], "$$");
+});
+
+test("display math: $$ hugging a multi-line formula → fences on their own lines (#1623)", () => {
+  const input = "$$Testing\\ Latex \\rightarrow\n\\leftarrow ENTER\\ HERE$$";
+  const lines = processMarkdownContent(input).trim().split("\n");
+  assert.deepEqual(lines, [
+    "$$",
+    "Testing\\ Latex \\rightarrow",
+    "\\leftarrow ENTER\\ HERE",
+    "$$",
+  ]);
+});
+
+test("display math: aligned block with the opening fence hugging, closing alone", () => {
+  const input = "$$\\begin{aligned}\na &= b \\\\\nc &= d\n\\end{aligned}\n$$";
+  const lines = processMarkdownContent(input).trim().split("\n");
+  assert.equal(lines[0], "$$");
+  assert.equal(lines[1], "\\begin{aligned}");
+  assert.equal(lines[lines.length - 2], "\\end{aligned}");
+  assert.equal(lines[lines.length - 1], "$$");
+});
+
+test("display math: fences already on their own lines are left alone", () => {
+  const input = "$$\na = b\nc = d\n$$";
+  assert.equal(processMarkdownContent(input).trim(), input);
+});
+
+test("display math: an unclosed $$ across a blank line is not rewritten", () => {
+  const input = "$$x = 1\n\nprice is 5$ tomorrow";
+  const result = processMarkdownContent(input);
+  assert.ok(result.includes("$$x = 1"));
 });
 
 // ---------------------------------------------------------------------------

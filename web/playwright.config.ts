@@ -21,22 +21,37 @@ export default defineConfig({
     {
       name: "ui-audit",
       testMatch: "**/*.audit.ts",
+      testIgnore: [
+        "**/epub-reader.audit.ts",
+        "**/e2e/turn-lifecycle.audit.ts",
+        "**/e2e/multi-worker-turns.audit.ts",
+      ],
       use: { ...devices["Desktop Chrome"] },
     },
     {
-      name: "responsive-phone",
-      testMatch: "**/responsive.audit.ts",
-      use: { ...devices["Pixel 5"] },
+      name: "critical-turns",
+      testMatch: "**/e2e/turn-lifecycle.audit.ts",
+      use: { ...devices["Desktop Chrome"] },
     },
     {
-      name: "responsive-tablet",
-      testMatch: "**/responsive.audit.ts",
-      use: { viewport: { width: 768, height: 1024 }, isMobile: true },
+      name: "multi-worker-turns-desktop",
+      testMatch: "**/e2e/multi-worker-turns.audit.ts",
+      use: { ...devices["Desktop Chrome"], reducedMotion: "reduce" },
     },
     {
-      name: "responsive-desktop",
-      testMatch: "**/responsive.audit.ts",
-      use: { viewport: { width: 1280, height: 800 } },
+      name: "multi-worker-turns-mobile",
+      testMatch: "**/e2e/multi-worker-turns.audit.ts",
+      use: { ...devices["iPhone 13"], reducedMotion: "reduce" },
+    },
+    {
+      name: "epub-reader-chromium",
+      testMatch: "**/epub-reader.audit.ts",
+      use: { ...devices["Desktop Chrome"] },
+    },
+    {
+      name: "epub-reader-webkit",
+      testMatch: "**/epub-reader.audit.ts",
+      use: { ...devices["iPhone 13"] },
     },
   ],
 });

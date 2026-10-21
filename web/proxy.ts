@@ -1,5 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { parseAuthEnabled } from "./lib/api";
+import { resolveBackendApiBase } from "./lib/backend-runtime-config";
+import { prepareBackendForwardHeaders } from "./lib/backend-forward";
 import {
   CODEX_CALLBACK_API_PATH,
   COOKIE_NAME,
@@ -8,6 +10,8 @@ import {
   isAuthExempt,
   isBackendPath,
   isCodexCallbackPath,
+  isRetiredPagePath,
+  isWebSocketPath,
 } from "./lib/proxy-policy";
 
 // Backend base URL for `/api/*` and `/ws/*` rewrites. The container entrypoint
@@ -19,10 +23,11 @@ import {
 // The loopback is spelled as the IPv4 literal, not `localhost`: on a dual-stack
 // host that name resolves to ::1 first, while uvicorn binds 0.0.0.0 (IPv4
 // only), so every rewrite would fail to connect.
-const API_BASE_URL =
-  process.env.DEEPTUTOR_API_BASE_URL ?? "http://127.0.0.1:8001";
+const API_BASE_URL = resolveBackendApiBase();
 
-const AUTH_ENABLED = parseAuthEnabled(process.env.DEEPTUTOR_AUTH_ENABLED);
+const AUTH_ENABLED = parseAuthEnabled(
+  process.env.DEEPTUTOR_AUTH_ENABLED ?? process.env.NEXT_PUBLIC_AUTH_ENABLED,
+);
 
 // Redirect to the login page, preserving the intended destination in `next`.
 // A present-but-invalid cookie is cleared so the browser stops resending it;
@@ -33,7 +38,11 @@ function redirectToLogin(
 ): NextResponse {
   const loginUrl = req.nextUrl.clone();
   loginUrl.pathname = LOGIN_PATH;
-  loginUrl.searchParams.set("next", req.nextUrl.pathname);
+  loginUrl.search = "";
+  loginUrl.searchParams.set(
+    "next",
+    `${req.nextUrl.pathname}${req.nextUrl.search}`,
+  );
   const response = NextResponse.redirect(loginUrl);
   if (clearCookie) response.cookies.delete(COOKIE_NAME);
   return response;
@@ -48,11 +57,22 @@ export function proxy(req: NextRequest): NextResponse {
     );
   }
 
+  if (isRetiredPagePath(pathname)) {
+    return new NextResponse(null, { status: 404 });
+  }
+
   // 1. Bridge the origin gap: forward backend-relative paths to the API server.
   //    This keeps the URL knowledge in one place (the entrypoint + system.json)
   //    rather than baked into the frontend bundle.
   if (isBackendPath(pathname)) {
-    return NextResponse.rewrite(new URL(pathname + search, API_BASE_URL));
+    return NextResponse.rewrite(new URL(pathname + search, API_BASE_URL), {
+      request: {
+        headers: prepareBackendForwardHeaders(req.headers, {
+          allowWebSocketUpgrade:
+            req.method === "GET" && isWebSocketPath(pathname),
+        }),
+      },
+    });
   }
 
   // 2. Auth gate — multi-user mode only. Disabled by default, and never blocks
@@ -74,13 +94,16 @@ export function proxy(req: NextRequest): NextResponse {
 export const config = {
   // Run on every request except Next.js internals and the favicon. The /api/*
   // and /ws/* paths are explicitly handled above (rewritten to the backend);
-  // large knowledge create/upload requests are handled by dedicated App Router
-  // endpoints that stream directly to FastAPI. Excluding them here is crucial:
+  // Knowledge-base creation and upload requests that carry multipart bodies
+  // are handled by dedicated App Router endpoints that stream directly to
+  // FastAPI. The browser's list call uses /api/knowledge-bases/list so it can
+  // pass through the normal backend rewrite below. Excluding multipart routes
+  // here is crucial:
   // merely entering Proxy makes Next clone and cap the multipart body.
   // the browser's /_next/image optimizer requests are excluded here, while the
   // optimizer's loopback fetch for the source image (e.g. /logo.png) is let
   // through the auth gate by isAuthExempt.
   matcher: [
-    "/((?!_next/static|_next/image|favicon.ico|api/v1/knowledge/(?:create|[^/]+/upload)(?:/|$)).*)",
+    "/((?!_next/static|_next/image|favicon.ico|api/knowledge-bases(?:$|/[^/]+/upload(?:/|$))).*)",
   ],
 };

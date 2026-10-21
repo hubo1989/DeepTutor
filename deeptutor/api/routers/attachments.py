@@ -8,7 +8,7 @@ sanitised to defend against directory traversal.
 
 URL shape::
 
-    GET /api/attachments/{session_id}/{attachment_id}/{filename}
+    GET /files/attachments/{session_id}/{attachment_id}/{filename}
 
 Authentication installs the current user's storage scope before this router
 runs. Session and attachment identifiers are therefore resolved only inside

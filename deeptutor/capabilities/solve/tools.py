@@ -4,13 +4,14 @@ Three tools auto-mounted only when a solve turn is active (via the solve loop
 capability). The chat agent loop IS the solver; these tools give it a deterministic
 spine — a plan it commits to, a per-step "done" gate, and a bounded replan —
 while the reasoning (how to actually solve each step) stays the model's job in
-the loop, using the shared built-in tools (rag / code_execution / geogebra / …).
+the loop, using the shared built-in tools (rag / exec / geogebra / …).
 
 The active session id is injected server-side by the pipeline as
 ``_solve_session_id``; the model never supplies it. ``solve_finish_step`` emits
 a ``_context_checkpoint`` so the loop folds the just-finished step's tool
 chatter into a one-line summary — the loop-native equivalent of the old
-pipeline's per-step message reset.
+pipeline's per-step message reset — and carries the current plan as the
+checkpoint's ``state``, which each fold replaces with the latest copy.
 """
 
 from __future__ import annotations
@@ -194,12 +195,16 @@ class SolveFinishStepTool(BaseTool):
             ),
         }
         # The checkpoint summary persists this step's outcome while the loop
-        # folds its intermediate tool messages away (see AgentLoop).
+        # folds its intermediate tool messages away (see AgentLoop). The fold
+        # also drops this result and the solve_plan one, so the plan rides
+        # along as checkpoint state: the loop keeps only its latest copy.
         checkpoint = f"[{step.id}] {step.goal} — done. {summary}".strip()
         return _json_result(
             payload,
             meta_key="solve_finish_step",
-            extra_meta={"_context_checkpoint": {"summary": checkpoint}},
+            extra_meta={
+                "_context_checkpoint": {"summary": checkpoint, "state": session.progress_text()}
+            },
         )
 
 

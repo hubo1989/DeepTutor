@@ -23,6 +23,21 @@ is testable on its own and the capability that drives it
 
 from __future__ import annotations
 
+from deeptutor.reading.catalog_models import (
+    IngestionStatus,
+    MaterialRecord,
+    ReadingSessionRecord,
+    SourceKind,
+    WorkspaceRecord,
+    WorkspaceTab,
+)
+from deeptutor.reading.catalog_store import ReadingCatalogStore
+from deeptutor.reading.epub_bilingual import (
+    create_epub_pairing,
+    delete_epub_pairing,
+    list_epub_pairings,
+    recommend_epub_candidates,
+)
 from deeptutor.reading.export import ExportFormat, ExportResult, export_material
 from deeptutor.reading.extract import Extraction, extract_material
 from deeptutor.reading.models import (
@@ -32,10 +47,18 @@ from deeptutor.reading.models import (
     MaterialManifest,
     MaterialNotFound,
     OutlineEntry,
+    ReadingBookmark,
     ReadingError,
+    ReadingPosition,
+    ReadingUpgradeConflict,
     Rect,
+    RenderMode,
     SearchHit,
+    TextPositionSelector,
+    TextQuoteSelector,
+    TextSelector,
     UnitKind,
+    UnitReference,
 )
 from deeptutor.reading.search import SearchResult, search_units
 from deeptutor.reading.service import (
@@ -46,6 +69,7 @@ from deeptutor.reading.service import (
     render_outline,
     render_units,
     search_material,
+    unit_timestamps,
     verify_quote,
 )
 from deeptutor.reading.store import ReadingStore, content_hash
@@ -57,24 +81,44 @@ __all__ = [
     "ExportFormat",
     "ExportResult",
     "Extraction",
+    "IngestionStatus",
+    "MaterialRecord",
     "MaterialManifest",
     "MaterialNotFound",
     "OutlineEntry",
     "QuoteCheck",
     "ReadingError",
+    "ReadingCatalogStore",
+    "ReadingBookmark",
+    "ReadingPosition",
+    "ReadingSessionRecord",
+    "ReadingUpgradeConflict",
     "ReadingStore",
     "Rect",
     "RenderedUnits",
     "SearchHit",
     "SearchResult",
+    "SourceKind",
+    "RenderMode",
+    "TextPositionSelector",
+    "TextQuoteSelector",
+    "TextSelector",
     "UnitKind",
+    "UnitReference",
+    "WorkspaceRecord",
+    "WorkspaceTab",
     "content_hash",
+    "create_epub_pairing",
+    "delete_epub_pairing",
     "export_material",
     "extract_material",
+    "list_epub_pairings",
     "material_summary",
     "parse_locators",
     "render_outline",
+    "recommend_epub_candidates",
     "render_units",
+    "unit_timestamps",
     "search_material",
     "search_units",
     "verify_quote",

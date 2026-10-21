@@ -21,9 +21,16 @@ from typing import Any, Literal
 
 # What one locator addresses, per source format. Purely presentational for the
 # model and the UI ("page 12" vs "chapter 3"); the addressing is identical.
-UnitKind = Literal["page", "chapter", "slide", "section"]
+UnitKind = Literal["page", "chapter", "slide", "section", "segment"]
+RenderMode = Literal["text", "pdf", "epub", "video", "audio"]
+ContentFormat = Literal["plain_text", "web_markdown"]
 
-AnnotationKind = Literal["highlight", "underline", "note"]
+AnnotationKind = Literal["highlight", "underline", "note", "citation"]
+TextSelectorType = Literal["TextQuoteSelector", "TextPositionSelector"]
+
+AnnotationResolution = Literal["resolved", "unresolved", "ambiguous"]
+
+MAX_TEXT_SELECTOR_CHARS = 2000
 
 # Palette offered by the reader toolbar. Kept server-side too so an annotation
 # arriving from an older client (or a tool call) can be validated rather than
@@ -50,6 +57,10 @@ class ReadingError(RuntimeError):
 
 class MaterialNotFound(ReadingError):
     """The requested material id does not exist in this user's store."""
+
+
+class ReadingUpgradeConflict(ReadingError):
+    """A source-faithful upgrade would invalidate existing annotations."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,6 +136,8 @@ class OutlineEntry:
     title: str
     level: int = 1
     synthesised: bool = False
+    source_href: str = ""
+    source_anchor: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -132,7 +145,44 @@ class OutlineEntry:
             "title": self.title,
             "level": self.level,
             "synthesised": self.synthesised,
+            "source_href": self.source_href,
+            "source_anchor": self.source_anchor,
         }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "OutlineEntry":
+        return cls(
+            locator=max(1, int(data["locator"])),
+            title=str(data.get("title") or ""),
+            level=max(1, int(data.get("level") or 1)),
+            synthesised=bool(data.get("synthesised")),
+            source_href=str(data.get("source_href") or ""),
+            source_anchor=str(data.get("source_anchor") or ""),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class UnitReference:
+    """Source address for one numeric locator in a faithful renderer."""
+
+    locator: int
+    source_href: str = ""
+    title: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "locator": self.locator,
+            "source_href": self.source_href,
+            "title": self.title,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "UnitReference":
+        return cls(
+            locator=max(1, int(data.get("locator") or 1)),
+            source_href=str(data.get("source_href") or ""),
+            title=str(data.get("title") or ""),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,8 +222,18 @@ class MaterialManifest:
     # (today: PDF). Other formats read from extracted text, so the reader shows
     # its text view and the export falls back to a Markdown excerpt.
     has_raw_view: bool = False
-    # Embedded images stored under media/ and indexed by media.json.
+    # Selects the faithful renderer without overloading ``has_raw_view``.
+    # The legacy boolean remains PDF-only until every client understands EPUB.
+    render_mode: RenderMode = "text"
+    # Embedded images stored under ``media/`` (DOCX/PPTX today; PDFs render
+    # their own images in the raw view). Zero for older materials.
     media_count: int = 0
+    # Uploaded Markdown remains literal source text; only captured web pages
+    # opt into structured rendering.
+    content_format: ContentFormat = "plain_text"
+    source_type: str = "upload"
+    source_url: str = ""
+    revision: int = 1
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -189,16 +249,27 @@ class MaterialManifest:
             "char_count": self.char_count,
             "created_at": self.created_at,
             "has_raw_view": self.has_raw_view,
+            "render_mode": self.render_mode,
             "media_count": self.media_count,
+            "content_format": self.content_format,
+            "source_type": self.source_type,
+            "source_url": self.source_url,
+            "revision": self.revision,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "MaterialManifest":
         unit = str(data.get("unit") or "page")
+        render_mode = str(data.get("render_mode") or "")
+        if render_mode not in ("text", "pdf", "epub", "video", "audio"):
+            render_mode = "pdf" if data.get("has_raw_view") else "text"
+        content_format = str(data.get("content_format") or "")
+        if content_format not in ("plain_text", "web_markdown"):
+            content_format = "plain_text"
         return cls(
             material_id=str(data.get("material_id") or ""),
             filename=str(data.get("filename") or ""),
-            unit=unit if unit in ("page", "chapter", "slide", "section") else "page",  # type: ignore[arg-type]
+            unit=(unit if unit in ("page", "chapter", "slide", "section", "segment") else "page"),  # type: ignore[arg-type]
             unit_count=int(data.get("unit_count") or 0),
             mime=str(data.get("mime") or ""),
             title=str(data.get("title") or ""),
@@ -208,8 +279,80 @@ class MaterialManifest:
             char_count=int(data.get("char_count") or 0),
             created_at=float(data.get("created_at") or 0.0),
             has_raw_view=bool(data.get("has_raw_view")),
-            media_count=max(0, int(data.get("media_count") or 0)),
+            render_mode=render_mode,  # type: ignore[arg-type]
+            media_count=int(data.get("media_count") or 0),
+            content_format=content_format,  # type: ignore[arg-type]
+            source_type=str(data.get("source_type") or "upload"),
+            source_url=str(data.get("source_url") or ""),
+            revision=max(1, int(data.get("revision") or 1)),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class TextQuoteSelector:
+    """W3C TextQuoteSelector used to re-anchor text after content reflows."""
+
+    exact: str
+    prefix: str = ""
+    suffix: str = ""
+    type: Literal["TextQuoteSelector"] = "TextQuoteSelector"
+
+    def to_dict(self) -> dict[str, Any]:
+        row: dict[str, Any] = {"type": self.type, "exact": self.exact}
+        if self.prefix:
+            row["prefix"] = self.prefix
+        if self.suffix:
+            row["suffix"] = self.suffix
+        return row
+
+
+@dataclass(frozen=True, slots=True)
+class TextPositionSelector:
+    """W3C TextPositionSelector in a rendered unit's text-content space."""
+
+    start: int
+    end: int
+    type: Literal["TextPositionSelector"] = "TextPositionSelector"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"type": self.type, "start": self.start, "end": self.end}
+
+
+TextSelector = TextQuoteSelector | TextPositionSelector
+
+
+def parse_text_selectors(value: Any) -> tuple[TextSelector, ...]:
+    """Parse only the two bounded selector shapes supported by the reader."""
+
+    if not isinstance(value, (list, tuple)):
+        return ()
+    parsed: list[TextSelector] = []
+    for raw in value[:2]:
+        if not isinstance(raw, dict):
+            continue
+        selector_type = str(raw.get("type") or "")
+        if selector_type == "TextQuoteSelector":
+            exact = str(raw.get("exact") or "")[:2000]
+            if exact:
+                parsed.append(
+                    TextQuoteSelector(
+                        exact=exact,
+                        # W3C prefix is the text immediately before ``exact``;
+                        # when legacy data exceeds the bound, its tail is the
+                        # part that still touches the selection.
+                        prefix=str(raw.get("prefix") or "")[-128:],
+                        suffix=str(raw.get("suffix") or "")[:128],
+                    )
+                )
+        elif selector_type == "TextPositionSelector":
+            try:
+                start = max(0, int(raw.get("start") or 0))
+                end = max(start, int(raw.get("end") or 0))
+            except (TypeError, ValueError):
+                continue
+            if end > start:
+                parsed.append(TextPositionSelector(start=start, end=end))
+    return tuple(parsed)
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,11 +367,25 @@ class Annotation:
 
     annotation_id: str
     locator: int
+    # Content revision the verified locator/selectors were captured against.
+    # Legacy rows predate revisioned web snapshots and therefore resolve to 1.
+    material_revision: int = 1
     kind: AnnotationKind = "highlight"
     color: str = DEFAULT_ANNOTATION_COLOR
     quote: str = ""
     note: str = ""
     rects: tuple[Rect, ...] = ()
+    # Opaque renderer-native position. EPUB clients store a CFI here.
+    source_anchor: str = ""
+    # Portable W3C selectors for reflowing text. Existing annotations omit
+    # them and continue to resolve through ``quote`` and/or ``rects``.
+    selectors: tuple[TextSelector, ...] = ()
+    # Selector validity against the current content revision. Legacy rows
+    # predate this field and default to ``resolved`` so they are not hidden
+    # from readers who already had them visible. Revision migration flips
+    # rows to ``unresolved`` or ``ambiguous`` when the stored quote no longer
+    # identifies exactly one passage in the new unit text.
+    resolution: AnnotationResolution = "resolved"
     author: str = "user"
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
@@ -240,11 +397,15 @@ class Annotation:
         return {
             "annotation_id": self.annotation_id,
             "locator": self.locator,
+            "material_revision": self.material_revision,
             "kind": self.kind,
             "color": self.color,
             "quote": self.quote,
             "note": self.note,
             "rects": [r.to_list() for r in self.rects],
+            "source_anchor": self.source_anchor,
+            "selectors": [selector.to_dict() for selector in self.selectors],
+            "resolution": self.resolution,
             "author": self.author,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -262,13 +423,91 @@ class Annotation:
         return cls(
             annotation_id=str(data.get("annotation_id") or ""),
             locator=max(1, int(data.get("locator") or 1)),
-            kind=kind if kind in ("highlight", "underline", "note") else "highlight",  # type: ignore[arg-type]
+            material_revision=max(1, int(data.get("material_revision") or 1)),
+            kind=(kind if kind in ("highlight", "underline", "note", "citation") else "highlight"),  # type: ignore[arg-type]
             color=color if color in ANNOTATION_COLORS else DEFAULT_ANNOTATION_COLOR,
             quote=str(data.get("quote") or ""),
             note=str(data.get("note") or ""),
             rects=rects,
+            source_anchor=str(data.get("source_anchor") or ""),
+            selectors=parse_text_selectors(data.get("selectors")),
+            resolution=(
+                data["resolution"]
+                if data.get("resolution") in ("resolved", "unresolved", "ambiguous")
+                else "resolved"
+            ),
             author=str(data.get("author") or "user"),
             created_at=float(data.get("created_at") or 0.0),
+            updated_at=float(data.get("updated_at") or 0.0),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ReadingBookmark:
+    """A place in a material the reader chose to keep.
+
+    Distinct from the reading position, which the reader never asks for: that
+    is one automatically-updated "where I got to", overwritten every time they
+    move. A bookmark is deliberate and plural — the three passages worth
+    coming back to in a 400-page book — so it is addressed by its own id and
+    carries a label.
+
+    The label is optional. An empty one means "this page", and the reader sees
+    the outline heading for that locator instead of a name they had to invent
+    before they were allowed to save the spot.
+    """
+
+    bookmark_id: str
+    locator: int
+    label: str = ""
+    # Opaque renderer-native position, for formats where the locator alone is
+    # coarse. EPUB clients store a CFI here, exactly as annotations do.
+    source_anchor: str = ""
+    created_at: float = field(default_factory=time.time)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "bookmark_id": self.bookmark_id,
+            "locator": self.locator,
+            "label": self.label,
+            "source_anchor": self.source_anchor,
+            "created_at": self.created_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ReadingBookmark":
+        return cls(
+            bookmark_id=str(data.get("bookmark_id") or ""),
+            locator=max(1, int(data.get("locator") or 1)),
+            label=str(data.get("label") or ""),
+            source_anchor=str(data.get("source_anchor") or ""),
+            created_at=float(data.get("created_at") or 0.0),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ReadingPosition:
+    """Last durable viewport for a material."""
+
+    locator: int = 1
+    source_anchor: str = ""
+    percentage: float = 0.0
+    updated_at: float = field(default_factory=time.time)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "locator": self.locator,
+            "source_anchor": self.source_anchor,
+            "percentage": self.percentage,
+            "updated_at": self.updated_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ReadingPosition":
+        return cls(
+            locator=max(1, int(data.get("locator") or 1)),
+            source_anchor=str(data.get("source_anchor") or ""),
+            percentage=min(1.0, max(0.0, float(data.get("percentage") or 0.0))),
             updated_at=float(data.get("updated_at") or 0.0),
         )
 
@@ -278,11 +517,22 @@ __all__ = [
     "DEFAULT_ANNOTATION_COLOR",
     "Annotation",
     "AnnotationKind",
+    "AnnotationResolution",
+    "ContentFormat",
     "MaterialManifest",
     "MaterialNotFound",
     "OutlineEntry",
+    "ReadingBookmark",
     "ReadingError",
+    "ReadingPosition",
+    "ReadingUpgradeConflict",
+    "RenderMode",
     "Rect",
     "SearchHit",
+    "TextPositionSelector",
+    "TextQuoteSelector",
+    "TextSelector",
+    "TextSelectorType",
     "UnitKind",
+    "UnitReference",
 ]

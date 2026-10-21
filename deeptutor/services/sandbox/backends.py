@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
+import locale
 import os
 from pathlib import Path
 import shutil
@@ -44,6 +45,30 @@ class SandboxBackend:
     async def health(self) -> tuple[bool, str]:
         """Return ``(available, detail)`` — whether the backend can run now."""
         return True, ""
+
+
+def _active_python_prefix(*, inherit: bool) -> tuple[Path | None, bool]:
+    """Return DeepTutor's Python prefix, including a base Conda environment.
+
+    ``sys.prefix != sys.base_prefix`` detects venv/uv environments but is false
+    for Conda.  In that case the interpreter still lives below ``sys.prefix``
+    and its ``bin``/``Scripts`` directory must lead PATH; otherwise a model can
+    run system ``python3`` with a different ``pip`` and install incompatible
+    binary wheels.  The boolean reports whether a separate base-Python runtime
+    may also need mounting (the uv/venv case).
+    """
+    if not inherit:
+        return None, False
+    prefix = Path(sys.prefix).resolve()
+    uses_external_runtime = sys.prefix != sys.base_prefix
+    if not uses_external_runtime:
+        executable = Path(sys.executable).resolve()
+        try:
+            executable.relative_to(prefix)
+        except ValueError:
+            return None, False
+    bin_dir = prefix / ("Scripts" if sys.platform == "win32" else "bin")
+    return (prefix, uses_external_runtime) if bin_dir.is_dir() else (None, False)
 
 
 class RunnerSidecarBackend(SandboxBackend):
@@ -127,18 +152,19 @@ class BwrapBackend(SandboxBackend):
         inherit_virtualenv: bool = True,
     ) -> None:
         self._bwrap = bwrap_path
-        detected_virtualenv = (
-            venv_path is None and inherit_virtualenv and sys.prefix != sys.base_prefix
-        )
+        detected_prefix, uses_external_runtime = _active_python_prefix(inherit=inherit_virtualenv)
         if venv_path is not None:
             candidate = Path(venv_path).resolve()
-        elif detected_virtualenv:
-            candidate = Path(sys.prefix).resolve()
+            uses_external_runtime = False
+        elif detected_prefix is not None:
+            candidate = detected_prefix
         else:
             candidate = None
         self._venv_path = candidate if candidate is not None and candidate.is_dir() else None
         self._python_runtime_mounts = (
-            self._detect_python_runtime_mounts() if self._venv_path and detected_virtualenv else ()
+            self._detect_python_runtime_mounts()
+            if self._venv_path and uses_external_runtime
+            else ()
         )
 
     @classmethod
@@ -243,10 +269,17 @@ class BwrapBackend(SandboxBackend):
             return False, "bwrap not installed"
         # bwrap needs unprivileged user namespaces; a default-seccomp Docker
         # container blocks them, so confirm a trivial sandbox actually runs.
+        # A non-zero exit with empty ``error`` still means the sandbox cannot
+        # run (Ubuntu 24.04 loopback RTM_NEWADDR denial is the usual case).
         probe = ExecRequest(command="true")
         result = await self.exec(probe)
-        if result.error:
-            return False, result.error
+        if result.error or result.exit_code != 0 or result.timed_out:
+            detail = (
+                result.error
+                or (result.stderr.strip() if result.stderr else "")
+                or f"bwrap probe exited with code {result.exit_code}"
+            )
+            return False, detail
         return True, "bwrap functional"
 
 
@@ -256,6 +289,47 @@ class RestrictedSubprocessBackend(SandboxBackend):
     level = IsolationLevel.APPLICATION
 
     _SAFE_ENV_KEYS = ("PATH", "PATHEXT", "HOME", "LANG", "LC_ALL", "TMPDIR", "SYSTEMROOT")
+
+    def __init__(
+        self,
+        *,
+        venv_path: str | Path | None = None,
+        inherit_virtualenv: bool = True,
+    ) -> None:
+        """Keep model-authored ``python`` and ``pip`` on one interpreter.
+
+        Desktop installs run DeepTutor from a virtual environment but can
+        inherit a host ``PATH`` whose first Python belongs to MSYS, Conda, or a
+        system install.  Prepending the environment that launched DeepTutor
+        prevents a bare ``pip install`` followed by ``python -c`` from silently
+        targeting two different environments.
+        """
+        if venv_path is not None:
+            candidate = Path(venv_path).resolve()
+        elif inherit_virtualenv:
+            candidate, _uses_external_runtime = _active_python_prefix(inherit=True)
+        else:
+            candidate = None
+        self._venv_path = candidate if candidate is not None and candidate.is_dir() else None
+
+    def _build_env(self, request_env: dict[str, str]) -> dict[str, str]:
+        env = {key: os.environ[key] for key in self._SAFE_ENV_KEYS if key in os.environ}
+        env.update(request_env)
+        if self._venv_path is None:
+            return env
+
+        venv = str(self._venv_path)
+        venv_bin = str(self._venv_path / ("Scripts" if sys.platform == "win32" else "bin"))
+        base_path = env.get("PATH") or ""
+        normalized_venv_bin = os.path.normcase(os.path.normpath(venv_bin))
+        path_entries = [
+            entry
+            for entry in base_path.split(os.pathsep)
+            if entry and os.path.normcase(os.path.normpath(entry)) != normalized_venv_bin
+        ]
+        env["PATH"] = os.pathsep.join([venv_bin, *path_entries])
+        env["VIRTUAL_ENV"] = venv
+        return env
 
     @staticmethod
     def _powershell_executable() -> str:
@@ -284,8 +358,7 @@ class RestrictedSubprocessBackend(SandboxBackend):
         )
 
     async def exec(self, request: ExecRequest) -> ExecResult:
-        env = {k: os.environ[k] for k in self._SAFE_ENV_KEYS if k in os.environ}
-        env.update(request.env)
+        env = self._build_env(request.env)
         cwd = request.workdir or None
         try:
             if request.argv:
@@ -427,10 +500,27 @@ async def _communicate(
             await asyncio.wait_for(process.wait(), timeout=5.0)
         return ExecResult(timed_out=True, exit_code=124)
     return ExecResult(
-        stdout=stdout.decode("utf-8", errors="replace") if stdout else "",
-        stderr=stderr.decode("utf-8", errors="replace") if stderr else "",
+        stdout=_decode_process_output(stdout),
+        stderr=_decode_process_output(stderr),
         exit_code=process.returncode if process.returncode is not None else 0,
     )
+
+
+def _decode_process_output(data: bytes | None) -> str:
+    """Decode native-process output without turning Windows errors into mojibake."""
+    if not data:
+        return ""
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    if sys.platform == "win32":
+        for encoding in (locale.getpreferredencoding(False), "mbcs"):
+            try:
+                return data.decode(encoding)
+            except (LookupError, UnicodeDecodeError):
+                continue
+    return data.decode("utf-8", errors="replace")
 
 
 __all__ = [

@@ -5,6 +5,7 @@ from __future__ import annotations
 from deeptutor.services.llm.provider_core.openai_responses import (
     adapt_chat_kwargs_to_responses,
     convert_messages,
+    convert_tool_choice,
 )
 
 
@@ -58,7 +59,12 @@ class TestAdaptChatKwargsToResponses:
 class TestConvertMessages:
     def test_replays_persisted_native_output_items(self) -> None:
         native_items = [
-            {"type": "reasoning", "id": "rs_1", "summary": []},
+            {
+                "type": "reasoning",
+                "id": "rs_1",
+                "content": [{"type": "reasoning_text", "text": "Need to inspect the MCP status."}],
+                "summary": [],
+            },
             {
                 "type": "message",
                 "id": "msg_1",
@@ -78,3 +84,35 @@ class TestConvertMessages:
         )
 
         assert input_items == native_items
+
+
+class TestConvertToolChoice:
+    """The two endpoints name a forced tool differently.
+
+    Ask Questions forces ``ask_user`` on its first round. Sent in the Chat
+    Completions shape, a Responses endpoint rejects the whole request with
+    "tool_choice: missing field `name`", so the capability failed before the
+    model was ever called.
+    """
+
+    def test_lifts_the_nested_chat_completions_name_to_the_top_level(self) -> None:
+        assert convert_tool_choice({"type": "function", "function": {"name": "ask_user"}}) == {
+            "type": "function",
+            "name": "ask_user",
+        }
+
+    def test_a_choice_already_in_responses_shape_is_untouched(self) -> None:
+        choice = {"type": "function", "name": "ask_user"}
+        assert convert_tool_choice(choice) == choice
+
+    def test_mode_strings_and_none_pass_through(self) -> None:
+        assert convert_tool_choice("auto") == "auto"
+        assert convert_tool_choice("required") == "required"
+        assert convert_tool_choice(None) is None
+
+    def test_a_hosted_tool_choice_is_left_for_the_provider_to_validate(self) -> None:
+        assert convert_tool_choice({"type": "web_search"}) == {"type": "web_search"}
+
+    def test_a_function_choice_with_no_name_is_not_invented(self) -> None:
+        choice = {"type": "function", "function": {}}
+        assert convert_tool_choice(choice) == choice

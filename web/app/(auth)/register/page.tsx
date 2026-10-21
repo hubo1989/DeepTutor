@@ -1,90 +1,50 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { useTranslation } from "react-i18next";
-import {
-  fetchAuthStatus,
-  register,
-  requestRegistrationCode,
-} from "@/lib/auth";
+import { register, checkIsFirstUser, fetchAuthStatus } from "@/lib/auth";
 
 export default function RegisterPage() {
   const { t } = useTranslation();
   const router = useRouter();
 
-  const [email, setEmail] = useState("");
+  const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
-  const [code, setCode] = useState("");
-  const [codeSent, setCodeSent] = useState(false);
-  const [countdown, setCountdown] = useState(0);
   const [error, setError] = useState("");
-  const [notice, setNotice] = useState("");
   const [loading, setLoading] = useState(false);
-  const [trialDays, setTrialDays] = useState<number | null>(null);
+  const [isFirst, setIsFirst] = useState(false);
+  const [checkingFirst, setCheckingFirst] = useState(true);
 
   useEffect(() => {
+    // Redirect if already logged in
     fetchAuthStatus().then((status) => {
       if (status?.authenticated) router.replace("/");
-      if (
-        status?.commercial_enabled &&
-        typeof status.trial_days === "number" &&
-        status.trial_days > 0
-      ) {
-        setTrialDays(status.trial_days);
-      }
+    });
+
+    // Check if this will be the first (admin) user
+    checkIsFirstUser().then((first) => {
+      setIsFirst(first);
+      setCheckingFirst(false);
     });
   }, [router]);
 
-  useEffect(() => {
-    if (countdown <= 0) return;
-    const timer = window.setInterval(() => {
-      setCountdown((value) => Math.max(0, value - 1));
-    }, 1000);
-    return () => window.clearInterval(timer);
-  }, [countdown]);
-
-  async function handleRequestCode(e: React.SyntheticEvent) {
+  async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setError("");
-    setNotice("");
 
     if (password !== confirmPassword) {
       setError(t("Passwords do not match"));
       return;
     }
-    if (countdown > 0) return;
 
     setLoading(true);
-    const result = await requestRegistrationCode(email, password);
-    if (result.ok) {
-      setCodeSent(true);
-      setCountdown(60);
-      setNotice(t("If this email can register, a verification code has been sent."));
-    } else {
-      setError(result.error ?? t("Could not send verification code"));
-    }
-    setLoading(false);
-  }
-
-  async function handleSubmit(e: React.FormEvent) {
-    e.preventDefault();
-    setError("");
-    setNotice("");
-
-    if (!codeSent) {
-      setError(t("Request a verification code first"));
-      return;
-    }
-
-    setLoading(true);
-    const result = await register(email, code);
+    const result = await register(username, password);
 
     if (result.ok) {
-      // The backend sets the session cookie after the code is consumed.
-      router.replace("/");
+      router.replace("/login?registered=1");
     } else {
       setError(result.error ?? t("Registration failed"));
       setLoading(false);
@@ -93,43 +53,44 @@ export default function RegisterPage() {
 
   return (
     <div className="w-full max-w-sm">
+      {/* Logo / Title */}
       <div className="text-center mb-8">
         <h1 className="font-serif text-2xl font-semibold text-[var(--foreground)] tracking-tight">
-          导学吧
+          LearnLeader
         </h1>
         <p className="mt-1 text-sm text-[var(--muted-foreground)]">
           {t("Create your account")}
         </p>
       </div>
 
+      {/* First-user notice */}
+      {!checkingFirst && isFirst && (
+        <div className="mb-4 rounded-lg border border-blue-500/30 bg-blue-500/10 px-4 py-3 text-sm text-blue-600 dark:text-blue-400">
+          <strong>{t("First user:")}</strong>{" "}
+          {t(
+            "You will be granted admin privileges and can manage other users from the admin dashboard.",
+          )}
+        </div>
+      )}
+
+      {/* Card */}
       <div className="bg-[var(--card)] border border-[var(--border)] rounded-2xl shadow-sm px-8 py-8">
-        {trialDays !== null && (
-          <div className="mb-5 rounded-xl border border-amber-500/25 bg-amber-500/10 px-4 py-3">
-            <p className="text-sm font-medium text-[var(--foreground)]">
-              {t("commercial.registration.trialSummary", {
-                days: trialDays,
-              })}
-            </p>
-            <p className="mt-1 text-xs leading-relaxed text-[var(--muted-foreground)]">
-              {t("commercial.registration.trialLimits")}
-            </p>
-          </div>
-        )}
         <form onSubmit={handleSubmit} className="space-y-5">
+          {/* Email or username */}
           <div>
             <label
-              htmlFor="email"
+              htmlFor="username"
               className="block text-sm font-medium text-[var(--foreground)] mb-1.5"
             >
-              {t("Email")}
+              {t("Email or username")}
             </label>
             <input
-              id="email"
-              type="email"
-              autoComplete="email"
+              id="username"
+              type="text"
+              autoComplete="username"
               required
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
               className="w-full px-3.5 py-2.5 rounded-lg border border-[var(--border)]
                          bg-[var(--background)] text-[var(--foreground)]
                          placeholder:text-[var(--muted-foreground)]
@@ -139,6 +100,7 @@ export default function RegisterPage() {
             />
           </div>
 
+          {/* Password */}
           <div>
             <label
               htmlFor="password"
@@ -165,6 +127,7 @@ export default function RegisterPage() {
             </p>
           </div>
 
+          {/* Confirm Password */}
           <div>
             <label
               htmlFor="confirmPassword"
@@ -188,77 +151,30 @@ export default function RegisterPage() {
             />
           </div>
 
-          <button
-            type="button"
-            onClick={handleRequestCode}
-            disabled={loading || countdown > 0}
-            className="w-full py-2.5 px-4 rounded-lg border border-[var(--border)] font-medium text-sm
-                       text-[var(--foreground)] hover:bg-[var(--background)]
-                       disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-          >
-            {loading
-              ? t("Sending verification code…")
-              : countdown > 0
-                ? t("Resend in {{seconds}}s", { seconds: countdown })
-                : codeSent
-                  ? t("Resend verification code")
-                  : t("Send verification code")}
-          </button>
-
-          {codeSent && (
-            <div>
-              <label
-                htmlFor="code"
-                className="block text-sm font-medium text-[var(--foreground)] mb-1.5"
-              >
-                {t("Email verification code")}
-              </label>
-              <input
-                id="code"
-                type="text"
-                inputMode="numeric"
-                autoComplete="one-time-code"
-                pattern="[0-9]{6}"
-                maxLength={6}
-                required
-                value={code}
-                onChange={(e) => setCode(e.target.value.replace(/\D/g, ""))}
-                className="w-full px-3.5 py-2.5 rounded-lg border border-[var(--border)]
-                           bg-[var(--background)] text-[var(--foreground)] tracking-[0.35em]
-                           focus:outline-none focus:ring-2 focus:ring-[var(--primary)] focus:border-transparent
-                           transition-shadow text-sm"
-              />
-            </div>
-          )}
-
+          {/* Error message */}
           {error && (
             <p className="text-sm text-red-500 bg-red-500/10 rounded-lg px-3 py-2">
               {error}
             </p>
           )}
 
-          {notice && (
-            <p className="text-sm text-green-600 dark:text-green-400 bg-green-500/10 rounded-lg px-3 py-2">
-              {notice}
-            </p>
-          )}
-
+          {/* Submit */}
           <button
             type="submit"
-            disabled={loading || !codeSent}
+            disabled={loading}
             className="w-full py-2.5 px-4 rounded-lg font-medium text-sm
                        bg-[var(--primary)] text-[var(--primary-foreground)]
                        hover:opacity-90 active:opacity-80
                        disabled:opacity-50 disabled:cursor-not-allowed
                        transition-opacity"
           >
-            {loading ? t("Creating account…") : t("Verify and create account")}
+            {loading ? t("Creating account…") : t("Create account")}
           </button>
         </form>
       </div>
 
       <p className="mt-6 text-center text-sm text-[var(--muted-foreground)]">
-        {t("Already have an account?")} {" "}
+        {t("Already have an account?")}{" "}
         <Link
           href="/login"
           className="text-[var(--primary)] hover:underline font-medium"
@@ -268,7 +184,7 @@ export default function RegisterPage() {
       </p>
 
       <p className="mt-3 text-center text-xs text-[var(--muted-foreground)]">
-        {t("auth.brandTagline")}
+        {t("LearnLeader · Agent-Native Learning")}
       </p>
     </div>
   );

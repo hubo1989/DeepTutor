@@ -5,39 +5,29 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import sys
+import math
 from typing import Any
 
-from deeptutor.capabilities.ima import IMA_TOOL_TYPES
-from deeptutor.capabilities.marginnote4 import MARGINNOTE_TOOL_TYPES
-from deeptutor.capabilities.mastery import MASTERY_TOOL_TYPES
-from deeptutor.capabilities.obsidian import OBSIDIAN_TOOL_TYPES
-from deeptutor.capabilities.reading import READING_TOOL_TYPES
-from deeptutor.capabilities.setup import SETUP_TOOL_TYPES
-from deeptutor.capabilities.solve import SOLVE_TOOL_TYPES
-from deeptutor.capabilities.subagent import SUBAGENT_TOOL_TYPES
-from deeptutor.core.tool_protocol import BaseTool, ToolDefinition, ToolParameter, ToolResult
+from deeptutor.core.tool_protocol import (
+    TOOL_EVENT_PROJECTION,
+    BaseTool,
+    ToolDefinition,
+    ToolParameter,
+    ToolResult,
+)
 from deeptutor.knowledge.manifest import KB_FILES_DEFAULT_LIMIT, KB_FILES_MAX_LIMIT
-from deeptutor.tools.exec_tool import ExecTool
-from deeptutor.tools.media_gen_tool import ImagegenTool, VideogenTool
-from deeptutor.tools.partner_memory import (
+from deeptutor.tools.builtin_specs import (
+    BUILTIN_TOOL_NAMES,
+    BUILTIN_TOOL_SPECS,
     PARTNER_BUILTIN_TOOL_NAMES,
-    PartnerMemorizeTool,
-    PartnerReadTool,
-    PartnerSearchTool,
+    TOOL_ALIASES,
+    LazyBuiltinToolTypes,
 )
 from deeptutor.tools.prompting import load_prompt_hints
 from deeptutor.tools.question_bank import ACTIONS as QB_ACTIONS
 from deeptutor.tools.question_bank import FILTERS as QB_FILTERS
 
 logger = logging.getLogger(__name__)
-
-
-def _unique_run_token() -> str:
-    """Short collision-resistant token for naming per-call code run dirs."""
-    import uuid
-
-    return uuid.uuid4().hex[:12]
 
 
 class _PromptHintsMixin:
@@ -83,31 +73,354 @@ class BrainstormTool(_PromptHintsMixin, BaseTool):
 
 
 def _rag_sources(result: dict[str, Any], *, query: str, kb_name: str) -> list[dict[str, Any]]:
-    """Citations for one rag call, with verified visual preview URLs."""
-    from urllib.parse import quote
+    """Citations for one ``rag`` call, from the retrieval's own provenance.
 
+    Every pipeline normalises what it retrieved into ``result["sources"]``
+    (``{title, content, source, page, chunk_id, score}`` — see the GraphRAG and
+    LightRAG-server pipelines). Forward those so a grounded claim is traceable
+    to the chunk / entity / report behind it; without this the tool reported
+    only an echo of its own query (issue #694). ``type``/``kb_name`` are kept on
+    every entry so consumers that key on them still work. Only a successful
+    non-empty answer may use the query echo as a fallback; an empty or failed
+    search has no source to cite (issue #1500).
+    """
     retrieved = [item for item in (result.get("sources") or []) if isinstance(item, dict)]
+    if not retrieved and (
+        result.get("error_type")
+        or result.get("needs_reindex")
+        or not (result.get("answer") or result.get("content"))
+    ):
+        return []
     if not retrieved:
         return [{"type": "rag", "query": query, "kb_name": kb_name}]
-    sources: list[dict[str, Any]] = []
+    from urllib.parse import quote
+
+    from deeptutor.services.workspace.context import workspace_url
+
+    sources = []
     for item in retrieved:
         source = {"type": "rag", "kb_name": kb_name, **item}
         asset_id = source.get("visual_asset_id")
         if asset_id:
-            source["visual_asset_url"] = (
-                f"/api/v1/knowledge/{quote(str(kb_name), safe='')}"
-                f"/visual-assets/{quote(str(asset_id), safe='')}"
+            source["visual_asset_url"] = workspace_url(
+                f"/api/knowledge-bases/{quote(kb_name, safe='')}/visual-assets/{asset_id}"
             )
         sources.append(source)
     return sources
 
 
+def _rag_selector_error(message: str) -> ToolResult:
+    return ToolResult(
+        content=message,
+        success=False,
+        metadata={"evidence_kind": "exact_source_visual", "error_type": "invalid_selector"},
+    )
+
+
+def _normalize_rag_selectors(kwargs: dict[str, Any]) -> dict[str, Any] | str:
+    """Validate the optional exact-source selectors at the LLM boundary.
+
+    Returns the normalized selector map, or a correctable error string.
+    A legacy ``region=[]`` placeholder counts as omission (full page); every
+    other malformed selector is rejected visibly — never clamped, dropped,
+    or rerouted to replacement evidence (issue #1928).
+    """
+    selectors = {
+        key: kwargs.get(key)
+        for key in ("source_path", "asset_id", "figure", "page", "region", "source_hash")
+    }
+    page = selectors["page"]
+    if page is not None:
+        if isinstance(page, bool) or not isinstance(page, int):
+            return (
+                f"Invalid page {page!r}: PDF pages are one-based integers. "
+                "Resend with an integer page >= 1, or null to omit the page."
+            )
+        if page < 1:
+            return (
+                f"Invalid page {page}: PDF pages are one-based. "
+                "Resend with a page >= 1, or null to omit the page."
+            )
+    region = selectors["region"]
+    if region is not None:
+        if isinstance(region, list) and not region:
+            selectors["region"] = None
+        elif not (
+            isinstance(region, list)
+            and len(region) == 4
+            and all(
+                not isinstance(x, bool)
+                and isinstance(x, (int, float))
+                and math.isfinite(x)
+                and 0 <= x <= 1
+                for x in region
+            )
+        ):
+            return (
+                f"Invalid region {region!r}: a crop must be four finite numbers "
+                "[x0, y0, x1, y1] within 0..1. Resend with a valid crop, or "
+                "null to inspect the full page."
+            )
+    return selectors
+
+
+class RAGTool(_PromptHintsMixin, BaseTool):
+    def get_definition(self) -> ToolDefinition:
+        definition = ToolDefinition(
+            name="rag",
+            description=(
+                "Retrieve relevant passages from one of the knowledge bases the "
+                "user attached to this turn. Call once per knowledge base you "
+                "want to consult; the system runs them in parallel."
+            ),
+            parameters=[
+                ToolParameter(name="query", type="string", description="Search query."),
+                ToolParameter(
+                    name="kb_name",
+                    type="string",
+                    description="Knowledge base to search. Must be one of the attached knowledge bases.",
+                ),
+                ToolParameter(
+                    name="source_path",
+                    type="string",
+                    required=False,
+                    nullable=True,
+                    description="Exact document path from kb_files for visual/page inspection; prevents substitution across sources.",
+                ),
+                ToolParameter(
+                    name="asset_id",
+                    type="string",
+                    required=False,
+                    nullable=True,
+                    description="Exact immutable source visual ID to inspect again on a follow-up.",
+                ),
+                ToolParameter(
+                    name="figure",
+                    type="string",
+                    required=False,
+                    nullable=True,
+                    description="Exact figure/table label, e.g. Figure 3.2 or 图3.2. Ambiguous references require source/page selection.",
+                ),
+                ToolParameter(
+                    name="page",
+                    type="integer",
+                    required=False,
+                    nullable=True,
+                    minimum=1,
+                    description="One-based PDF page for vector diagrams, sparse captions, tables or missing crops. Requires source_path.",
+                ),
+                ToolParameter(
+                    name="region",
+                    type="array",
+                    items={"type": "number", "minimum": 0, "maximum": 1},
+                    required=False,
+                    nullable=True,
+                    min_items=4,
+                    max_items=4,
+                    description="Optional PDF crop [x0,y0,x1,y1] normalized to 0..1; retains original layout at higher detail. Omitted or null means the full page.",
+                ),
+                ToolParameter(
+                    name="source_hash",
+                    type="string",
+                    required=False,
+                    nullable=True,
+                    description="Source document ID from an earlier citation; rejects changed source-page references.",
+                ),
+                ToolParameter(
+                    name="presentation",
+                    type="string",
+                    required=False,
+                    description="In Guided Learning, inspect (default) keeps source evidence private. Use teaching only to intentionally show an exact source view while explaining it; reveal requests a source view after answering. The server checks pending questions and records assistance. Preparation never displays a page automatically.",
+                    enum=["inspect", "teaching", "reveal"],
+                ),
+            ],
+        )
+        schema = definition.to_openai_schema()["function"]["parameters"]
+        schema["properties"]["presentation"]["type"] = ["string", "null"]
+        schema["properties"]["presentation"]["enum"].append(None)
+        definition.raw_parameters = schema
+        return definition
+
+    async def execute(self, **kwargs: Any) -> ToolResult:
+        result = await self._retrieve(**kwargs)
+        if kwargs.get("_mastery_source_context"):
+            result.public_result = {"content": "Source evidence inspected privately."}
+            presentation = kwargs.get("presentation") or "inspect"
+            if presentation != "inspect":
+                presenter = kwargs.get("_present_mastery_sources")
+                if presentation not in {"teaching", "reveal"} or not callable(presenter):
+                    result.success = False
+                    result.content += (
+                        "\nSource presentation is unavailable; no source was displayed."
+                    )
+                elif not result.success or not result.metadata.get("presentation_sources"):
+                    result.success = False
+                    result.content += "\nPresentation requires an exact verified PDF view; retrieve its source_path and page."
+                else:
+                    from deeptutor.learning.service import MasteryInteractionError
+
+                    try:
+                        sources = await presenter(
+                            result.metadata["presentation_sources"], presentation
+                        )
+                        result.public_result = {
+                            "content": "Selected source view presented.",
+                            "sources": [{**row, "presentation": presentation} for row in sources],
+                        }
+                        result.content += "\nThe selected source view was publicly presented."
+                    except (ValueError, MasteryInteractionError) as exc:
+                        result.success = False
+                        result.content += f"\nSource presentation was withheld: {exc}"
+            if not result.success:
+                result.public_result["content"] = (
+                    "Source evidence could not be presented or verified."
+                )
+        return result
+
+    async def _retrieve(self, **kwargs: Any) -> ToolResult:
+        from deeptutor.tools.rag_tool import rag_search
+
+        query = str(kwargs.get("query") or "").strip()
+        if not query:
+            raise ValueError("RAG query must be a non-empty string.")
+        kb_name = str(kwargs.get("kb_name") or "").strip()
+        if not kb_name:
+            raise ValueError("RAG requires an explicit kb_name.")
+        event_sink = None if kwargs.get("_mastery_source_context") else kwargs.get("event_sink")
+        vision_supported = bool(kwargs.get("_vision_supported", False))
+        from deeptutor.services.rag.source_visuals import figure_labels, retrieve_visual
+
+        exact_keys = ("source_path", "asset_id", "figure", "page", "region", "source_hash")
+        selectors = _normalize_rag_selectors(kwargs)
+        if isinstance(selectors, str):
+            return _rag_selector_error(selectors)
+        if any(
+            selectors.get(key) is not None and selectors.get(key) != "" for key in exact_keys
+        ) or figure_labels(query):
+            from deeptutor.multi_user.knowledge_access import resolve_for_rag
+            from deeptutor.services.rag.kb_paths import resolve_kb_dir
+
+            resource = resolve_for_rag(kb_name)
+            if resource is None:
+                return ToolResult(
+                    content=f"Knowledge base '{kb_name}' is not accessible.", success=False
+                )
+            try:
+                evidence = await asyncio.to_thread(
+                    retrieve_visual,
+                    resolve_kb_dir(resource.base_dir, resource.name),
+                    kb_name,
+                    query=query,
+                    **{key: selectors[key] for key in exact_keys if selectors.get(key) is not None},
+                )
+            except (OSError, ValueError, TypeError) as exc:
+                return ToolResult(content=f"Source visual inspection failed: {exc}", success=False)
+            content = (
+                (evidence.private_content or evidence.content)
+                if kwargs.get("_mastery_source_context")
+                else evidence.content
+            )
+            if not vision_supported and evidence.images:
+                content += "\nThe selected model cannot inspect pixels; interpret only the text evidence. Open the source or select a vision-capable model for visual claims."
+            presentation_sources = []
+            if kwargs.get("_mastery_source_context") and kwargs.get("presentation") in {
+                "teaching",
+                "reveal",
+            }:
+                from deeptutor.services.rag.source_pages import SourceRef, public_source
+
+                for record, _pixels in evidence.images:
+                    if not record.get("page_number") or not str(
+                        record.get("source_path", "")
+                    ).lower().endswith(".pdf"):
+                        continue
+                    ref = SourceRef(
+                        kb_ref=kb_name,
+                        document_key=record["source_path"],
+                        source_digest=record["source_document_id"],
+                        page_index=record["page_number"] - 1,
+                        crop=record.get("region"),
+                    )
+                    row = public_source(ref)
+                    row.pop("url", None)
+                    presentation_sources.append(row)
+            return ToolResult(
+                content=content,
+                sources=evidence.sources,
+                success=not bool(evidence.error),
+                metadata={
+                    "evidence_kind": "exact_source_visual",
+                    "error_type": evidence.error or None,
+                    "presentation_sources": presentation_sources,
+                },
+                model_message=evidence.model_message() if vision_supported else None,
+            )
+        normalized_away = {key for key in exact_keys if selectors.get(key) is None}
+        extra_kwargs = {
+            key: value
+            for key, value in kwargs.items()
+            if key
+            not in {
+                "query",
+                "kb_name",
+                "event_sink",
+                "_vision_supported",
+                "presentation",
+                "_mastery_source_context",
+                "_present_mastery_sources",
+                TOOL_EVENT_PROJECTION,
+            }
+            and key not in normalized_away
+        }
+
+        result = await rag_search(
+            query=query,
+            kb_name=kb_name,
+            event_sink=event_sink,
+            **extra_kwargs,
+        )
+        content = result.get("answer") or result.get("content", "")
+        failed = bool(result.get("error_type") or result.get("needs_reindex"))
+        if not content and result.get("error_type"):
+            content = f"Knowledge base '{kb_name}' search failed ({result['error_type']})."
+        elif not content and result.get("needs_reindex"):
+            content = f"Knowledge base '{kb_name}' needs reindexing before it can be searched."
+        elif not content and not result.get("sources"):
+            content = (
+                f"No matching content was found in knowledge base '{kb_name}'. "
+                "The search completed successfully."
+            )
+        visual_sources = [
+            source
+            for source in (result.get("sources") or [])
+            if isinstance(source, dict) and source.get("visual_asset_id")
+        ]
+        model_message = None
+        if visual_sources and vision_supported:
+            model_message = _rag_visual_model_message(kb_name, visual_sources)
+            if model_message is None:
+                content += "\nRetrieved source visuals were unavailable for pixel inspection."
+        elif visual_sources:
+            content += (
+                "\nThe selected model cannot inspect source image pixels. "
+                "Use the retrieved caption and text context; do not claim to have seen the image."
+            )
+        return ToolResult(
+            content=content,
+            sources=_rag_sources(result, query=query, kb_name=kb_name),
+            metadata=result,
+            success=not failed,
+            model_message=model_message,
+        )
+
+
 def _rag_visual_model_message(kb_name: str, sources: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """Hydrate retrieved source pixels only after resolving the user's KB scope."""
+    """Hydrate retrieved source pixels only after resolving this user's KB scope."""
     import base64
 
     from deeptutor.multi_user.knowledge_access import resolve_for_rag
     from deeptutor.services.rag.kb_paths import resolve_kb_dir
+    from deeptutor.services.rag.source_visuals import source_state
     from deeptutor.services.rag.visual_assets import MAX_MODEL_IMAGES, VisualAssetStore
 
     resource = resolve_for_rag(kb_name)
@@ -118,13 +431,15 @@ def _rag_visual_model_message(kb_name: str, sources: list[dict[str, Any]]) -> di
     seen: set[str] = set()
     for source in sources:
         asset_id = str(source.get("visual_asset_id") or "")
-        if not asset_id or asset_id in seen:
+        if asset_id in seen:
             continue
         seen.add(asset_id)
         loaded = store.read(asset_id)
         if loaded is None:
             continue
         record, data = loaded
+        if source_state(store.kb_dir, record) in {"changed", "missing"}:
+            continue
         parts.append(
             {
                 "type": "text",
@@ -145,72 +460,6 @@ def _rag_visual_model_message(kb_name: str, sources: list[dict[str, Any]]) -> di
         if len(parts) // 2 >= MAX_MODEL_IMAGES:
             break
     return {"role": "user", "content": parts} if parts else None
-
-
-class RAGTool(_PromptHintsMixin, BaseTool):
-    def get_definition(self) -> ToolDefinition:
-        return ToolDefinition(
-            name="rag",
-            description=(
-                "Retrieve relevant passages from one of the knowledge bases the "
-                "user attached to this turn. Call once per knowledge base you "
-                "want to consult; the system runs them in parallel."
-            ),
-            parameters=[
-                ToolParameter(name="query", type="string", description="Search query."),
-                ToolParameter(
-                    name="kb_name",
-                    type="string",
-                    description="Knowledge base to search. Must be one of the attached knowledge bases.",
-                ),
-            ],
-        )
-
-    async def execute(self, **kwargs: Any) -> ToolResult:
-        from deeptutor.tools.rag_tool import rag_search
-
-        query = str(kwargs.get("query") or "").strip()
-        if not query:
-            raise ValueError("RAG query must be a non-empty string.")
-        kb_name = str(kwargs.get("kb_name") or "").strip()
-        if not kb_name:
-            raise ValueError("RAG requires an explicit kb_name.")
-        event_sink = kwargs.get("event_sink")
-        vision_supported = bool(kwargs.get("_vision_supported", False))
-        extra_kwargs = {
-            key: value
-            for key, value in kwargs.items()
-            if key not in {"query", "kb_name", "event_sink", "_vision_supported"}
-        }
-
-        result = await rag_search(
-            query=query,
-            kb_name=kb_name,
-            event_sink=event_sink,
-            **extra_kwargs,
-        )
-        content = result.get("answer") or result.get("content", "")
-        visual_sources = [
-            source
-            for source in (result.get("sources") or [])
-            if isinstance(source, dict) and source.get("visual_asset_id")
-        ]
-        model_message = None
-        if visual_sources and vision_supported:
-            model_message = _rag_visual_model_message(kb_name, visual_sources)
-            if model_message is None:
-                content += "\nRetrieved source visuals were unavailable for pixel inspection."
-        elif visual_sources:
-            content += (
-                "\nThe selected model cannot inspect source image pixels. "
-                "Use the retrieved caption and text context; do not claim to have seen the image."
-            )
-        return ToolResult(
-            content=content,
-            sources=_rag_sources(result, query=query, kb_name=kb_name),
-            metadata=result,
-            model_message=model_message,
-        )
 
 
 class KbFilesTool(_PromptHintsMixin, BaseTool):
@@ -292,6 +541,12 @@ class KbFilesTool(_PromptHintsMixin, BaseTool):
         )
 
 
+# How many of a skill's files a not-found message names before it truncates.
+# Enough to identify the right path in any skill shaped like the ones shipped;
+# short enough that a skill carrying a reference tree cannot flood the turn.
+_SKILL_FILE_LIST_LIMIT = 40
+
+
 def _kb_files_limit(raw: Any) -> int:
     """Clamp a model-supplied ``limit`` into range; fall back on anything unusable."""
     try:
@@ -301,6 +556,89 @@ def _kb_files_limit(raw: Any) -> int:
     if requested <= 0:
         return KB_FILES_DEFAULT_LIMIT
     return min(requested, KB_FILES_MAX_LIMIT)
+
+
+class KnowledgeFrontierTool(_PromptHintsMixin, BaseTool):
+    """Discover recent research that extends an attached knowledge base."""
+
+    def get_definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="knowledge_frontier",
+            description=(
+                "Summarize the themes and gaps in one attached knowledge base, "
+                "then search arXiv for recent work that may extend it. Use when "
+                "the learner asks for frontier papers, new research, or what to "
+                "study next; the tool recommends but never imports sources."
+            ),
+            parameters=[
+                ToolParameter(
+                    name="kb_name",
+                    type="string",
+                    description="Knowledge base to inspect. Must be one of the attached knowledge bases.",
+                ),
+                ToolParameter(
+                    name="focus",
+                    type="string",
+                    description=(
+                        "Optional narrower research goal, method, or topic. "
+                        "Omit to cover the knowledge base broadly."
+                    ),
+                    required=False,
+                ),
+                ToolParameter(
+                    name="max_papers",
+                    type="integer",
+                    description="Maximum recommendations to return (default 5, max 10).",
+                    required=False,
+                    default=5,
+                ),
+                ToolParameter(
+                    name="years_limit",
+                    type="integer",
+                    description="Only include preprints from the last N years (default 3, max 10).",
+                    required=False,
+                    default=3,
+                ),
+            ],
+        )
+
+    async def execute(self, **kwargs: Any) -> ToolResult:
+        from deeptutor.multi_user.knowledge_access import resolve_kb_manifest
+        from deeptutor.tools.knowledge_frontier import discover_frontier
+
+        kb_name = str(kwargs.get("kb_name") or "").strip()
+        if not kb_name:
+            raise ValueError("knowledge_frontier requires an explicit kb_name.")
+
+        manifest = await asyncio.to_thread(resolve_kb_manifest, kb_name, limit=20)
+        if manifest is None:
+            raise ValueError(f"Knowledge base '{kb_name}' is not accessible.")
+
+        result = await discover_frontier(
+            kb_name=kb_name,
+            manifest=manifest,
+            focus=kwargs.get("focus", ""),
+            max_papers=kwargs.get("max_papers", 5),
+            years_limit=kwargs.get("years_limit", 3),
+            api_key=kwargs.get("api_key"),
+            base_url=kwargs.get("base_url"),
+            model=kwargs.get("model"),
+        )
+        paper_sources = [
+            {
+                "type": "paper",
+                "provider": "arxiv",
+                "url": paper.get("url", ""),
+                "title": paper.get("title", ""),
+                "arxiv_id": paper.get("arxiv_id", ""),
+            }
+            for paper in result["metadata"]["papers"]
+        ]
+        return ToolResult(
+            content=result["content"],
+            sources=[*result["kb_sources"], *paper_sources],
+            metadata=result["metadata"],
+        )
 
 
 class WebSearchTool(_PromptHintsMixin, BaseTool):
@@ -340,210 +678,6 @@ class WebSearchTool(_PromptHintsMixin, BaseTool):
                 for citation in citations
             ],
             metadata=result if isinstance(result, dict) else {"raw": answer},
-        )
-
-
-class CodeExecutionTool(_PromptHintsMixin, BaseTool):
-    """Compile and run a code snippet inside the execution sandbox.
-
-    A typed front-end over the same sandbox ``exec`` uses: the model passes
-    ready-to-run source as ``code`` + a ``language``; we write it into the
-    turn's workspace, build the per-language compile/run command, and execute
-    it through :mod:`deeptutor.services.sandbox`. No second LLM call, and the
-    same OS-level isolation + quota as ``exec`` — so it inherits exec's gating
-    (unavailable when no sandbox backend is configured).
-    """
-
-    # language -> (source filename, shell command template). ``{src}`` is the
-    # source file, ``{bin}`` the compiled binary, ``{stdin}`` an optional
-    # ``< file`` redirect (empty when no stdin is supplied). Commands run with
-    # the workspace subdir as cwd, so plain relative names are enough.
-    _LANGUAGES: dict[str, tuple[str, str]] = {
-        "python": ("main.py", "python3 {src} {stdin}"),
-        "c": ("main.c", "cc {src} -O2 -o prog && ./prog {stdin}"),
-        "cpp": ("main.cpp", "c++ -std=c++17 -O2 {src} -o prog && ./prog {stdin}"),
-    }
-    _LANGUAGE_ALIASES: dict[str, str] = {
-        "py": "python",
-        "python3": "python",
-        "c++": "cpp",
-        "cxx": "cpp",
-        "cc": "c",
-    }
-
-    @classmethod
-    def _command_for_platform(cls, language: str, *, has_stdin: bool) -> str:
-        """Build the shell command understood by the selected host platform."""
-        if sys.platform != "win32":
-            source_name, command_template = cls._LANGUAGES[language]
-            stdin_redirect = "< stdin.txt" if has_stdin else ""
-            return command_template.format(src=source_name, stdin=stdin_redirect).strip()
-
-        commands = {
-            "python": "python main.py",
-            # Use syntax supported by Windows PowerShell 5 as well as 7;
-            # ``&&`` only exists in PowerShell 7.
-            "c": "gcc main.c -O2 -o prog.exe; if ($LASTEXITCODE -eq 0) { .\\prog.exe }",
-            "cpp": "g++ -std=c++17 -O2 main.cpp -o prog.exe; if ($LASTEXITCODE -eq 0) { .\\prog.exe }",
-        }
-        command = commands[language]
-        # PowerShell's pipeline supplies stdin without relying on POSIX `<`.
-        if not has_stdin:
-            return command
-        if language == "python":
-            return "Get-Content stdin.txt | python main.py"
-        compiler, source = ("gcc", "main.c") if language == "c" else ("g++", "main.cpp")
-        flags = "-O2" if language == "c" else "-std=c++17 -O2"
-        return (
-            "$stdinText = Get-Content -Raw stdin.txt; "
-            f"{compiler} {flags} {source} -o prog.exe; "
-            "if ($LASTEXITCODE -eq 0) { $stdinText | .\\prog.exe }"
-        )
-
-    def get_definition(self) -> ToolDefinition:
-        return ToolDefinition(
-            name="code_execution",
-            description=(
-                "Run a code snippet in an isolated sandbox and return its "
-                "stdout/stderr. Pass complete, ready-to-run source in `code` "
-                "and pick `language` (python, c, or cpp). Use for calculation, "
-                "algorithm checking, and numerical verification — print results "
-                "to stdout. Not a substitute for explaining your reasoning."
-            ),
-            parameters=[
-                ToolParameter(
-                    name="language",
-                    type="string",
-                    description="Source language: 'python', 'c', or 'cpp'.",
-                ),
-                ToolParameter(
-                    name="code",
-                    type="string",
-                    description="The complete source code to compile/run.",
-                ),
-                ToolParameter(
-                    name="stdin",
-                    type="string",
-                    description="Optional text piped to the program's stdin.",
-                    required=False,
-                ),
-                ToolParameter(
-                    name="timeout",
-                    type="integer",
-                    description="Max execution time in seconds (default 30, max 300).",
-                    required=False,
-                    default=30,
-                ),
-            ],
-        )
-
-    def _resolve_language(self, raw: Any) -> str:
-        name = str(raw or "").strip().lower()
-        name = self._LANGUAGE_ALIASES.get(name, name)
-        if name not in self._LANGUAGES:
-            supported = ", ".join(sorted(self._LANGUAGES))
-            raise ValueError(f"Unsupported language {raw!r}; supported: {supported}.")
-        return name
-
-    async def execute(self, **kwargs: Any) -> ToolResult:
-        from pathlib import Path
-
-        from deeptutor.services.sandbox import (
-            ExecRequest,
-            Mount,
-            ResourceLimits,
-            get_sandbox_service,
-        )
-        from deeptutor.services.sandbox.artifacts import (
-            collect_public_artifacts,
-            render_artifacts_for_tool,
-        )
-
-        code = str(kwargs.get("code") or "").strip()
-        if not code:
-            raise ValueError("code_execution requires non-empty 'code'.")
-        language = self._resolve_language(kwargs.get("language"))
-        source_name, _ = self._LANGUAGES[language]
-
-        try:
-            timeout = int(kwargs.get("timeout") or 30)
-        except (TypeError, ValueError):
-            timeout = 30
-        timeout = max(1, min(timeout, 300))
-
-        # ``_sandbox_*`` kwargs are injected server-side by the pipeline; the
-        # LLM never supplies them. Mirror ExecTool's contract.
-        user_id = str(kwargs.get("_sandbox_user_id") or "anonymous")
-        workdir = str(kwargs.get("_sandbox_workdir") or "").strip()
-        mounts = tuple(kwargs.get("_sandbox_mounts") or ())
-        if not workdir:
-            # No pipeline workspace (e.g. direct/tool tests): fall back to the
-            # detached code workspace the path service already manages.
-            from deeptutor.services.path_service import get_path_service
-
-            workdir = str(get_path_service().get_run_code_workspace_dir())
-            mounts = (Mount(host_path=workdir, sandbox_path=workdir, read_only=False),)
-
-        # Each call gets its own subdir so concurrent runs don't clobber one
-        # another's source / binary. The subdir lives inside the mounted
-        # workspace, so the sandbox sees it at the same path.
-        run_dir = Path(workdir) / f"{language}_{_unique_run_token()}"
-        run_dir.mkdir(parents=True, exist_ok=True)
-        (run_dir / source_name).write_text(code, encoding="utf-8")
-
-        has_stdin = str(kwargs.get("stdin") or "") != ""
-        if has_stdin:
-            (run_dir / "stdin.txt").write_text(str(kwargs["stdin"]), encoding="utf-8")
-        command = self._command_for_platform(language, has_stdin=has_stdin)
-
-        limits = ResourceLimits(timeout_s=timeout)
-        request = ExecRequest(
-            command=command,
-            workdir=str(run_dir),
-            mounts=mounts,
-            limits=limits,
-        )
-        result = await get_sandbox_service().run(request, user_id=user_id)
-
-        # The source file, compiled binary, and stdin scratch are inputs we
-        # wrote ourselves — exclude them so only program-generated files
-        # surface as artifacts.
-        meta_files = {source_name, "prog", "prog.exe", "stdin.txt"}
-        artifacts = [
-            artifact
-            for artifact in collect_public_artifacts(str(run_dir))
-            if artifact.filename not in meta_files
-        ]
-        artifact_rows = [artifact.to_dict() for artifact in artifacts]
-        content_parts = [result.render(limits.max_output_chars)]
-        artifact_text = render_artifacts_for_tool(artifacts)
-        if artifact_text:
-            content_parts.append(artifact_text)
-
-        return ToolResult(
-            content="\n\n".join(content_parts),
-            success=result.ok and result.exit_code == 0,
-            sources=[
-                {
-                    "type": "artifact",
-                    "filename": row["filename"],
-                    "url": row["url"],
-                    "path": row["path"],
-                    "mime_type": row["mime_type"],
-                    "size_bytes": row["size_bytes"],
-                }
-                for row in artifact_rows
-            ],
-            metadata={
-                "language": language,
-                "code": code,
-                "command": command,
-                "exit_code": result.exit_code,
-                "timed_out": result.timed_out,
-                "sandbox_error": result.error,
-                "run_dir": str(run_dir),
-                "artifacts": artifact_rows,
-            },
         )
 
 
@@ -662,6 +796,129 @@ class PaperSearchToolWrapper(_PromptHintsMixin, BaseTool):
                 for paper in papers
             ],
             metadata={"provider": "arxiv", "papers": papers},
+        )
+
+
+class ZoteroSearchToolWrapper(_PromptHintsMixin, BaseTool):
+    """Search the user-supplied Zotero library through the public Web API."""
+
+    _ERROR_MESSAGES = {
+        "invalid_api_key": "The Zotero API key is invalid or cannot access this private library.",
+        "library_not_found": "No Zotero library was found for that user ID.",
+        "rate_limited": "Zotero rate-limited the search. Please try again later.",
+        "network_unavailable": "Zotero is temporarily unavailable. Check the network and try again.",
+        "invalid_response": "Zotero returned an unexpected response.",
+    }
+
+    def get_definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="zotero_search",
+            description=(
+                "Search a Zotero user library by title, creator, or year. Requires the "
+                "numeric Zotero user ID; an API key is needed only for private libraries."
+            ),
+            parameters=[
+                ToolParameter(name="query", type="string", description="Search query."),
+                ToolParameter(
+                    name="user_id",
+                    type="string",
+                    description="Numeric Zotero user ID from the Zotero account settings page.",
+                ),
+                ToolParameter(
+                    name="api_key",
+                    type="string",
+                    description="Zotero API key, required only for a private library.",
+                    required=False,
+                    default="",
+                    sensitive=True,
+                ),
+                ToolParameter(
+                    name="max_results",
+                    type="integer",
+                    description="Maximum references to return (1-25).",
+                    required=False,
+                    default=5,
+                ),
+            ],
+        )
+
+    async def execute(self, **kwargs: Any) -> ToolResult:
+        from deeptutor.tools.zotero_search import ZoteroSearchClient, ZoteroSearchError
+
+        query = str(kwargs.get("query") or "").strip()
+        user_id = str(kwargs.get("user_id") or "").strip()
+        if not query:
+            return ToolResult(content="Error: query is required.", success=False)
+        if not user_id:
+            return ToolResult(
+                content="Error: user_id is required. It is available in Zotero account settings.",
+                success=False,
+            )
+
+        try:
+            items = await ZoteroSearchClient().search(
+                query=query,
+                user_id=user_id,
+                api_key=str(kwargs.get("api_key") or ""),
+                max_results=kwargs.get("max_results", 5),
+            )
+        except ZoteroSearchError as exc:
+            message = self._ERROR_MESSAGES.get(
+                exc.code, "Zotero search failed. Check the user ID and try again."
+            )
+            return ToolResult(
+                content=message,
+                sources=[],
+                metadata={
+                    "provider": "zotero",
+                    "items": [],
+                    "error": exc.code,
+                    "status_code": exc.status_code,
+                },
+                success=False,
+            )
+        except ValueError:
+            return ToolResult(
+                content="Error: Zotero user_id and max_results are invalid.",
+                success=False,
+                metadata={"provider": "zotero", "items": []},
+            )
+
+        if not items:
+            return ToolResult(
+                content="No Zotero references matched this query.",
+                sources=[],
+                metadata={"provider": "zotero", "items": []},
+            )
+
+        lines: list[str] = []
+        for item in items:
+            year = item.get("year") or "undated"
+            lines.append(f"**{item['title']}** ({year})")
+            if item.get("authors"):
+                lines.append(f"Authors: {', '.join(item['authors'])}")
+            if item.get("doi"):
+                lines.append(f"DOI: {item['doi']}")
+            if item.get("url"):
+                lines.append(f"URL: {item['url']}")
+            if item.get("abstract"):
+                lines.append(f"Abstract: {item['abstract'][:400]}")
+            lines.append("")
+
+        return ToolResult(
+            content="\n".join(lines),
+            sources=[
+                {
+                    "type": "reference",
+                    "provider": "zotero",
+                    "title": item.get("title", ""),
+                    "url": item.get("zotero_url") or item.get("url", ""),
+                    "doi": item.get("doi", ""),
+                    "zotero_key": item.get("zotero_key", ""),
+                }
+                for item in items
+            ],
+            metadata={"provider": "zotero", "items": items},
         )
 
 
@@ -803,8 +1060,8 @@ class ReadSourceTool(_PromptHintsMixin, BaseTool):
     """Load the full text of an attached Space source by its manifest id.
 
     The chat pipeline auto-enables this tool whenever a turn has any non-image
-    attached source (notebook record, book reference, history session,
-    question-bank entry, or document attachment). The per-turn full-text
+    attached source (notebook record, book reference, reading unit, history
+    session, question-bank entry, or document attachment). The per-turn full-text
     payload is carried in ``context.metadata["source_index"]`` as
     ``{source_id: str}`` and injected into the tool call by
     ``_augment_tool_kwargs``. The tool itself stays stateless.
@@ -827,26 +1084,29 @@ class ReadSourceTool(_PromptHintsMixin, BaseTool):
                     description=(
                         "The source identifier from the Attached Sources "
                         "manifest. Begins with one of: nb- (notebook record), "
-                        "bk- (book reference), hs- (history session), qb- "
-                        "(question-bank entry), at- (document attachment)."
+                        "bk- (book reference), rd- (reading unit), hs- (history "
+                        "session), qb- (question-bank entry), at- (document attachment)."
                     ),
                 ),
             ],
         )
 
     async def execute(self, **kwargs: Any) -> ToolResult:
-        source_id = str(kwargs.get("source_id") or "").strip()
-        if not source_id:
-            return ToolResult(
-                content="Error: source_id is required.",
-                success=False,
-            )
         source_index = kwargs.get("source_index")
         if not isinstance(source_index, dict) or not source_index:
             return ToolResult(
                 content=("Error: no attached sources are available for this turn."),
                 success=False,
             )
+        source_id = str(kwargs.get("source_id") or "").strip()
+        if not source_id:
+            if len(source_index) == 1:
+                source_id = next(iter(source_index))
+            else:
+                return ToolResult(
+                    content="Error: source_id is required when multiple sources are available.",
+                    success=False,
+                )
         full_text = source_index.get(source_id)
         if not full_text:
             available = ", ".join(sorted(source_index.keys()))
@@ -860,6 +1120,9 @@ class ReadSourceTool(_PromptHintsMixin, BaseTool):
         return ToolResult(
             content=str(full_text),
             metadata={"source_id": source_id, "char_count": len(str(full_text))},
+            public_result={"content": "Attached source inspected privately."}
+            if kwargs.get("_mastery_source_context")
+            else None,
         )
 
 
@@ -1130,13 +1393,17 @@ class QuestionBankTool(_PromptHintsMixin, BaseTool):
         return ToolDefinition(
             name="question_bank",
             description=(
-                "Read and organise the learner's question bank — the graded "
-                "quiz questions saved under Learning Space → Question Bank. "
-                "This is where wrong answers and quiz history live; it is NOT "
-                "the notebook (`write_note`). Use it whenever the learner asks "
-                "to review, group, file, or tidy their questions or mistakes. "
+                "Read, organise, and record the learner's question bank — the "
+                "graded quiz questions saved under Learning Space → Question "
+                "Bank. This is where wrong answers and quiz history live; it is "
+                "NOT the notebook (`write_note`). Use it whenever the learner "
+                "asks to review, group, file, or tidy their questions or "
+                "mistakes, or when they own up to a mistake worth keeping. "
                 "action='overview' for counts + existing categories; "
                 "action='list' to see entries (each prefixed with its id); "
+                "action='record' to save one wrong question from this "
+                "conversation into the bank the learner reviews (add "
+                "`category` to file it in the same call); "
                 "action='organize' to file entry_ids into a category by name "
                 "(the category is created if it does not exist); "
                 "action='unfile' to remove them; "
@@ -1148,9 +1415,51 @@ class QuestionBankTool(_PromptHintsMixin, BaseTool):
                     type="string",
                     description=(
                         "'overview' (counts + categories, needs nothing else), "
-                        "'list', 'organize', 'unfile', or 'bookmark'."
+                        "'list', 'record', 'organize', 'unfile', or 'bookmark'."
                     ),
                     enum=list(QB_ACTIONS),
+                ),
+                ToolParameter(
+                    name="question",
+                    type="string",
+                    description=(
+                        "For action='record'. The problem itself, as close to "
+                        "the learner's wording or photo as possible. Recording "
+                        "the same question again updates the existing entry."
+                    ),
+                    required=False,
+                ),
+                ToolParameter(
+                    name="user_answer",
+                    type="string",
+                    description=(
+                        "For action='record'. What the learner answered, if they attempted it."
+                    ),
+                    required=False,
+                ),
+                ToolParameter(
+                    name="correct_answer",
+                    type="string",
+                    description="For action='record'. The correct answer, if known.",
+                    required=False,
+                ),
+                ToolParameter(
+                    name="explanation",
+                    type="string",
+                    description=(
+                        "For action='record'. Why the correct answer is right — "
+                        "the coaching the learner just received, condensed."
+                    ),
+                    required=False,
+                ),
+                ToolParameter(
+                    name="is_correct",
+                    type="boolean",
+                    description=(
+                        "For action='record'. Whether the learner answered "
+                        "correctly. Default false — a recorded mistake."
+                    ),
+                    required=False,
                 ),
                 ToolParameter(
                     name="filter",
@@ -1168,8 +1477,10 @@ class QuestionBankTool(_PromptHintsMixin, BaseTool):
                     type="string",
                     description=(
                         "Category name. Required for 'organize' / 'unfile'; "
-                        "optional on 'list' to look inside one category. "
-                        "'organize' creates the category when it is new."
+                        "optional on 'list' to look inside one category and on "
+                        "'record' to file the new entry in the same call. "
+                        "'organize' and 'record' create the category when it "
+                        "is new."
                     ),
                     required=False,
                 ),
@@ -1215,6 +1526,11 @@ class QuestionBankTool(_PromptHintsMixin, BaseTool):
             category=str(kwargs.get("category") or ""),
             search=str(kwargs.get("search") or ""),
             entry_ids=kwargs.get("entry_ids"),
+            question=str(kwargs.get("question") or ""),
+            user_answer=str(kwargs.get("user_answer") or ""),
+            correct_answer=str(kwargs.get("correct_answer") or ""),
+            explanation=str(kwargs.get("explanation") or ""),
+            is_correct=bool(kwargs.get("is_correct", False)),
             bookmarked=bool(kwargs.get("bookmarked", True)),
             limit=int(kwargs.get("limit") or 20),
         )
@@ -1597,42 +1913,39 @@ class ReadSkillTool(_PromptHintsMixin, BaseTool):
         )
 
     async def execute(self, **kwargs: Any) -> ToolResult:
-        from deeptutor.services.skill import get_skill_service
         from deeptutor.services.skill.service import (
             InvalidSkillNameError,
             InvalidSkillPathError,
             SkillFileNotFoundError,
             SkillNotFoundError,
-            SkillService,
         )
 
-        name = str(kwargs.get("name") or "").strip()
+        name = str(kwargs.get("name") or "").strip().lower()
         rel_path = str(kwargs.get("file") or "SKILL.md").strip() or "SKILL.md"
         if not name:
             raise ValueError("read_skill requires a skill name.")
 
-        services: list[SkillService] = [get_skill_service()]
-        try:
-            from deeptutor.multi_user.context import get_current_user
-            from deeptutor.multi_user.paths import get_admin_path_service
-            from deeptutor.multi_user.skill_access import assigned_skill_ids
+        from deeptutor.services.skill.runtime import runtime_skills
 
-            user = get_current_user()
-            if not user.is_admin and name in assigned_skill_ids(user.id):
-                services.append(
-                    SkillService(root=get_admin_path_service().get_workspace_dir() / "skills")
-                )
-        except Exception:
-            logger.debug("read_skill: assigned-skill scope unavailable", exc_info=True)
-
+        visible = runtime_skills()
+        services = [visible[name]] if name in visible else []
         for service in services:
             try:
                 content = service.read_skill_file(name, rel_path)
             except SkillFileNotFoundError:
+                # The skill resolved, so the name was right and only the path
+                # was wrong — naming its actual files is what ends the retry
+                # loop. A skill with a large references/ tree would otherwise
+                # spend the turn's context listing itself, so the list is
+                # bounded and says when it was cut.
+                available = service.list_skill_files(name)
+                shown = ", ".join(available[:_SKILL_FILE_LIST_LIMIT]) or "none"
+                if len(available) > _SKILL_FILE_LIST_LIMIT:
+                    shown += f", … ({len(available) - _SKILL_FILE_LIST_LIMIT} more)"
                 return ToolResult(
                     content=(
-                        f"(file not found in skill {name!r}: {rel_path!r} — "
-                        "check the skill's SKILL.md or references/ for the correct path)"
+                        f"(file not found: {rel_path!r} does not exist in skill "
+                        f"{name!r}, which holds: {shown})"
                     ),
                     success=False,
                 )
@@ -1644,9 +1957,13 @@ class ReadSkillTool(_PromptHintsMixin, BaseTool):
                 content=content,
                 metadata={"skill": name, "file": rel_path, "char_count": len(content)},
             )
+        available_names = set(visible)
+        available_skills = ", ".join(sorted(available_names))
+        available_hint = f". Available skills: {available_skills}" if available_skills else ""
         return ToolResult(
             content=(
-                f"(skill not found: {name!r} — use a name exactly as listed in the Skills section)"
+                f"(skill not found: {name!r} — use a name exactly as listed in the "
+                f"Skills section{available_hint})"
             ),
             success=False,
         )
@@ -1807,73 +2124,17 @@ class CronTool(_PromptHintsMixin, BaseTool):
         return ToolResult(content=outcome.text, success=outcome.ok, metadata=outcome.meta)
 
 
-BUILTIN_TOOL_TYPES: tuple[type[BaseTool], ...] = (
-    BrainstormTool,
-    RAGTool,
-    KbFilesTool,
-    WebSearchTool,
-    CodeExecutionTool,
-    ReasonTool,
-    PaperSearchToolWrapper,
-    ReadSourceTool,
-    ReadMemoryTool,
-    WriteMemoryTool,
-    ReadSkillTool,
-    LoadToolsTool,
-    ExecTool,
-    WebFetchTool,
-    ListNotebookTool,
-    WriteNoteTool,
-    QuestionBankTool,
-    GithubTool,
-    AskUserTool,
-    CronTool,
-    # Image → GeoGebra figure reconstruction. User-toggleable in chat; the
-    # solve loop capability force-mounts it for diagram problems.
-    GeoGebraAnalysisTool,
-    # Text-to-image / text-to-video generation. User-toggleable + per-user
-    # grant-gated; the chat pipeline only mounts them when a model is configured.
-    ImagegenTool,
-    VideogenTool,
-    # Mastery Path + Solve + Obsidian tools — globally registered so schemas/API
-    # stay stable; the chat loop capabilities decide when to auto-mount them for
-    # a turn. Obsidian is a knowledge capability: when its vault is selected it
-    # runs the turn exclusively on these tools.
-    *MASTERY_TOOL_TYPES,
-    *SOLVE_TOOL_TYPES,
-    *OBSIDIAN_TOOL_TYPES,
-    *MARGINNOTE_TOOL_TYPES,
-    # Subagent consult tool — globally registered; the subagent knowledge
-    # capability runs the turn exclusively on it when a connected agent is the
-    # selected KB.
-    *SUBAGENT_TOOL_TYPES,
-    # Tencent IMA tools — globally registered; the IMA capability mounts them
-    # (additively, alongside rag) when a connected IMA library is selected.
-    *IMA_TOOL_TYPES,
-    # Immersive-reading tools — globally registered; the reading capability
-    # mounts them (additively) and binds the open material server-side, so they
-    # are inert on a turn with no document open.
-    *READING_TOOL_TYPES,
-    # Self-configuration tools — globally registered; the setup capability
-    # mounts them (additively) on a turn that is actually about configuration.
-    *SETUP_TOOL_TYPES,
-    # Partner-only memory + history tools. Globally registered so schemas/API
-    # stay stable, but never mounted in product chat: the partner runtime
-    # force-mounts them (and suppresses chat's read_memory/write_memory) on
-    # every partner turn. Deliberately absent from CONFIGURABLE_BUILTIN_TOOL_NAMES
-    # — they are mandatory, not owner-configurable.
-    PartnerReadTool,
-    PartnerMemorizeTool,
-    PartnerSearchTool,
-)
+# Compatibility surface for callers that enumerate implementation classes
+# (notably the Settings API).  The sequence itself is import-cheap; classes are
+# resolved one at a time while it is iterated.  Runtime registration uses the
+# descriptors directly and therefore does not iterate this sequence at boot.
+BUILTIN_TOOL_TYPES = LazyBuiltinToolTypes(BUILTIN_TOOL_SPECS)
 
 # No tools are parked right now. When a tool's implementation is being
 # redesigned, list its type here: it stays OUT of the runtime registry (the
 # chat agent cannot invoke it) while the settings page still surfaces it with
 # a "Coming soon" badge. Re-add to ``BUILTIN_TOOL_TYPES`` when ready to ship.
 COMING_SOON_TOOL_TYPES: tuple[type[BaseTool], ...] = ()
-
-BUILTIN_TOOL_NAMES: tuple[str, ...] = tuple(tool_type().name for tool_type in BUILTIN_TOOL_TYPES)
 
 COMING_SOON_TOOL_NAMES: tuple[str, ...] = tuple(
     tool_type().name for tool_type in COMING_SOON_TOOL_TYPES
@@ -1888,6 +2149,7 @@ USER_TOGGLEABLE_TOOL_NAMES: tuple[str, ...] = (
     "brainstorm",
     "web_search",
     "paper_search",
+    "zotero_search",
     "reason",
     "geogebra_analysis",
     "imagegen",
@@ -1901,16 +2163,25 @@ USER_TOGGLEABLE_TOOL_NAMES: tuple[str, ...] = (
 # allowed) so an IM-facing partner can be denied e.g. memory access.
 # ``tool_composition.AUTO_MOUNTED_TOOLS`` is derived from this tuple, so the
 # two stay in lockstep; this ordering is the canonical display order for the
-# partner config UI. Capability-owned tools (mastery/solve/obsidian/subagent)
-# are intentionally absent — they are gated by capability activation, never by
-# this surface.
+# partner config UI. Capability-owned tools (the mastery *tutoring* tools,
+# solve/obsidian/subagent) are intentionally absent — they are gated by
+# capability activation, never by this surface. The four ``mastery_*``
+# navigation tools listed here are the exception that proves the rule: they
+# only read the atlas and propose a hand-off card, so they are ordinary
+# context-gated built-ins (gate: the learner has a topic) rather than part of
+# any capability.
 CONFIGURABLE_BUILTIN_TOOL_NAMES: tuple[str, ...] = (
+    "preprint",
+    "research_audit",
+    "research_lit",
     "rag",
     "kb_files",
-    "code_execution",
+    "knowledge_frontier",
     "read_source",
     "read_memory",
     "write_memory",
+    "learning_status",
+    "learning_update",
     "read_skill",
     "list_notebook",
     "write_note",
@@ -1921,15 +2192,34 @@ CONFIGURABLE_BUILTIN_TOOL_NAMES: tuple[str, ...] = (
     "load_tools",
     "cron",
     "ask_user",
+    "mastery_topics",
+    "mastery_sessions",
+    "mastery_open_session",
+    "mastery_new_session",
 )
 
-TOOL_ALIASES: dict[str, tuple[str, dict[str, Any]]] = {
-    "rag_hybrid": ("rag", {"mode": "hybrid"}),
-    "rag_naive": ("rag", {"mode": "naive"}),
-    "rag_search": ("rag", {}),
-    "code_execute": ("code_execution", {}),
-    "run_code": ("code_execution", {}),
+_LAZY_CLASS_EXPORTS = {
+    "ExecTool": "deeptutor.tools.exec_tool:ExecTool",
+    "ImagegenTool": "deeptutor.tools.media_gen_tool:ImagegenTool",
+    "VideogenTool": "deeptutor.tools.media_gen_tool:VideogenTool",
+    "PartnerReadTool": "deeptutor.tools.partner_memory:PartnerReadTool",
+    "PartnerMemorizeTool": "deeptutor.tools.partner_memory:PartnerMemorizeTool",
+    "PartnerSearchTool": "deeptutor.tools.partner_memory:PartnerSearchTool",
+    "SubmitVisualizationTool": "deeptutor.visualizers.tool:SubmitVisualizationTool",
 }
+
+
+def __getattr__(name: str):
+    class_path = _LAZY_CLASS_EXPORTS.get(name)
+    if class_path is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    import importlib
+
+    module_path, class_name = class_path.rsplit(":", 1)
+    value = getattr(importlib.import_module(module_path), class_name)
+    globals()[name] = value
+    return value
+
 
 __all__ = [
     "BUILTIN_TOOL_NAMES",
@@ -1942,16 +2232,17 @@ __all__ = [
     "USER_TOGGLEABLE_TOOL_NAMES",
     "AskUserTool",
     "BrainstormTool",
-    "CodeExecutionTool",
     "ExecTool",
     "GeoGebraAnalysisTool",
     "GithubTool",
     "KbFilesTool",
     "ImagegenTool",
+    "KnowledgeFrontierTool",
     "VideogenTool",
     "ListNotebookTool",
     "PaperSearchToolWrapper",
     "QuestionBankTool",
+    "ZoteroSearchToolWrapper",
     "PartnerMemorizeTool",
     "PartnerReadTool",
     "PartnerSearchTool",

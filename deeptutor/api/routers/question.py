@@ -9,7 +9,6 @@ import traceback
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
-from deeptutor.agents.question import AgentCoordinator
 from deeptutor.api.utils.task_id_manager import TaskIDManager
 from deeptutor.logging import (
     ProcessLogEvent,
@@ -18,10 +17,8 @@ from deeptutor.logging import (
     current_log_context,
 )
 from deeptutor.services.config import PROJECT_ROOT, load_config_with_main
-from deeptutor.services.llm.config import get_llm_config
 from deeptutor.services.path_service import get_path_service
 from deeptutor.services.settings.interface_settings import get_response_language
-from deeptutor.tools.question import mimic_exam_questions
 from deeptutor.utils.document_validator import DocumentValidator
 from deeptutor.utils.error_utils import format_exception_message
 
@@ -31,6 +28,15 @@ log_dir = config.get("paths", {}).get("user_log_dir") or config.get("logging", {
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+ws_router = APIRouter()
+
+
+async def mimic_exam_questions(*args, **kwargs):
+    """Compatibility seam that keeps the legacy workflow import deferred."""
+
+    from deeptutor.tools.question import mimic_exam_questions as run
+
+    return await run(*args, **kwargs)
 
 
 def _mimic_output_dir():
@@ -40,7 +46,7 @@ def _mimic_output_dir():
     return get_path_service().get_question_dir() / "mimic_papers"
 
 
-@router.websocket("/mimic")
+@ws_router.websocket("/mimic")
 async def websocket_mimic_generate(websocket: WebSocket):
     """
     WebSocket endpoint for mimic exam paper question generation.
@@ -68,7 +74,6 @@ async def websocket_mimic_generate(websocket: WebSocket):
     """
     from deeptutor.api.routers.auth import (
         ws_auth_failed,
-        ws_authorize_message,
         ws_require_auth,
         ws_require_capability_access,
     )
@@ -78,63 +83,21 @@ async def websocket_mimic_generate(websocket: WebSocket):
     if user_token is ws_auth_failed:
         return
     if not await ws_require_capability_access(websocket):
-        reset_current_user(user_token)
+        if user_token is not None:
+            reset_current_user(user_token)
         return
 
     await websocket.accept()
 
     pusher_task = None
-    lease = None
     original_stdout = sys.stdout
 
     try:
         # 1. Wait for config
         data = await websocket.receive_json()
-        if not await ws_authorize_message(websocket):
-            return
         mode = data.get("mode", "parsed")  # "upload" or "parsed"
         kb_name = data.get("kb_name", "ai_textbook")
         max_questions = data.get("max_questions")
-
-        pdf_bytes: bytes | None = None
-        safe_name = ""
-        paper_path = None
-        if mode == "upload":
-            pdf_data = data.get("pdf_data")
-            pdf_name = data.get("pdf_name", "exam.pdf")
-            if not pdf_data:
-                await websocket.send_json(
-                    {"type": "error", "content": "PDF data is required for upload mode"}
-                )
-                return
-            try:
-                pdf_bytes = base64.b64decode(pdf_data)
-            except Exception as exc:
-                await websocket.send_json(
-                    {"type": "error", "content": f"Invalid base64 PDF data: {exc}"}
-                )
-                return
-            try:
-                safe_name = DocumentValidator.validate_upload_safety(
-                    pdf_name, len(pdf_bytes), {".pdf"}
-                )
-            except ValueError as exc:
-                await websocket.send_json({"type": "error", "content": str(exc)})
-                return
-        elif mode == "parsed":
-            paper_path = data.get("paper_path")
-            if not paper_path:
-                await websocket.send_json(
-                    {"type": "error", "content": "paper_path is required for parsed mode"}
-                )
-                return
-        else:
-            await websocket.send_json({"type": "error", "content": f"Unknown mode: {mode}"})
-            return
-
-        from deeptutor.commercial.concurrency import acquire_commercial_turn_lease
-
-        lease = await acquire_commercial_turn_lease()
 
         logger.info(f"Starting mimic generation (mode: {mode}, kb: {kb_name})")
 
@@ -215,6 +178,33 @@ async def websocket_mimic_generate(websocket: WebSocket):
 
             # Handle PDF upload mode
             if mode == "upload":
+                pdf_data = data.get("pdf_data")
+                pdf_name = data.get("pdf_name", "exam.pdf")
+
+                if not pdf_data:
+                    await websocket.send_json(
+                        {"type": "error", "content": "PDF data is required for upload mode"}
+                    )
+                    return
+
+                # Decode PDF data first to check size
+                try:
+                    pdf_bytes = base64.b64decode(pdf_data)
+                except Exception as e:
+                    await websocket.send_json(
+                        {"type": "error", "content": f"Invalid base64 PDF data: {e}"}
+                    )
+                    return
+
+                # Pre-validate filename and file size before writing
+                try:
+                    safe_name = DocumentValidator.validate_upload_safety(
+                        pdf_name, len(pdf_bytes), {".pdf"}
+                    )
+                except ValueError as e:
+                    await websocket.send_json({"type": "error", "content": str(e)})
+                    return
+
                 # Create batch directory for this mimic session
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 pdf_stem = Path(safe_name).stem
@@ -230,7 +220,6 @@ async def websocket_mimic_generate(websocket: WebSocket):
 
                 # Write the validated PDF bytes
                 with open(pdf_path, "wb") as f:
-                    assert pdf_bytes is not None
                     f.write(pdf_bytes)
 
                 # Additional validation (file readability, etc.)
@@ -256,6 +245,12 @@ async def websocket_mimic_generate(websocket: WebSocket):
                 output_dir = str(batch_dir)
 
             elif mode == "parsed":
+                paper_path = data.get("paper_path")
+                if not paper_path:
+                    await websocket.send_json(
+                        {"type": "error", "content": "paper_path is required for parsed mode"}
+                    )
+                    return
                 paper_dir = paper_path
 
                 # Create batch directory for parsed mode too
@@ -263,6 +258,10 @@ async def websocket_mimic_generate(websocket: WebSocket):
                 batch_dir = _mimic_output_dir() / f"mimic_{timestamp}_{Path(paper_path).name}"
                 batch_dir.mkdir(parents=True, exist_ok=True)
                 output_dir = str(batch_dir)
+
+            else:
+                await websocket.send_json({"type": "error", "content": f"Unknown mode: {mode}"})
+                return
 
             # Create WebSocket callback for real-time progress updates
             async def ws_callback(event_type: str, data: dict):
@@ -329,12 +328,11 @@ async def websocket_mimic_generate(websocket: WebSocket):
         error_msg = format_exception_message(e)
         try:
             await websocket.send_json({"type": "error", "content": error_msg})
+        except (RuntimeError, WebSocketDisconnect):
+            logger.debug("WebSocket closed, cannot send error event")
         except Exception:
-            pass
+            logger.warning("Failed to send error event to client", exc_info=True)
     finally:
-        if lease is not None:
-            await lease.release()
-
         # Ensure stdout is always restored
         sys.stdout = original_stdout
 
@@ -368,34 +366,33 @@ async def websocket_mimic_generate(websocket: WebSocket):
                 pass
 
 
-@router.websocket("/generate")
+@ws_router.websocket("/generate")
 async def websocket_question_generate(websocket: WebSocket):
+    from deeptutor.agents.question import AgentCoordinator
     from deeptutor.api.routers.auth import (
         ws_auth_failed,
-        ws_authorize_message,
         ws_require_auth,
         ws_require_capability_access,
     )
     from deeptutor.multi_user.context import reset_current_user
+    from deeptutor.services.llm.config import get_llm_config
 
     user_token = await ws_require_auth(websocket)
     if user_token is ws_auth_failed:
         return
     if not await ws_require_capability_access(websocket):
-        reset_current_user(user_token)
+        if user_token is not None:
+            reset_current_user(user_token)
         return
 
     await websocket.accept()
 
     # Get task ID manager
     task_manager = TaskIDManager.get_instance()
-    lease = None
 
     try:
         # 1. Wait for config
         data = await websocket.receive_json()
-        if not await ws_authorize_message(websocket):
-            return
         requirement = data.get("requirement")
         kb_name = data.get("kb_name", "ai_textbook")
         count = data.get("count", 1)
@@ -406,10 +403,6 @@ async def websocket_question_generate(websocket: WebSocket):
             except (RuntimeError, WebSocketDisconnect):
                 pass
             return
-
-        from deeptutor.commercial.concurrency import acquire_commercial_turn_lease
-
-        lease = await acquire_commercial_turn_lease()
 
         # Generate task ID
         task_key = f"question_{kb_name}_{hash(str(requirement))}"
@@ -595,13 +588,7 @@ async def websocket_question_generate(websocket: WebSocket):
     except Exception as e:
         error_msg = format_exception_message(e)
         logger.error(f"WebSocket error: {error_msg}")
-        try:
-            await websocket.send_json({"type": "error", "content": error_msg})
-        except Exception:
-            pass
     finally:
-        if lease is not None:
-            await lease.release()
         if user_token is not None:
             try:
                 reset_current_user(user_token)

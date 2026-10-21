@@ -85,7 +85,7 @@ async def test_turn_runtime_passes_shared_lease_to_execution(monkeypatch) -> Non
         acquire,
     )
 
-    async def persist(_payload, *, commercial_lease):
+    async def persist(_payload, *, commercial_lease, **_kwargs):
         assert commercial_lease is lease
         return {"id": "session-1"}, {"id": "turn-1"}
 
@@ -121,7 +121,7 @@ async def test_failed_start_releases_reserved_trial_slot(monkeypatch) -> None:
         acquire,
     )
 
-    async def fail(_payload, *, commercial_lease):
+    async def fail(_payload, *, commercial_lease, **_kwargs):
         assert commercial_lease is lease
         raise ValueError("persistence failed")
 

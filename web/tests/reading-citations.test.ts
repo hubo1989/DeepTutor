@@ -2,11 +2,13 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   LOCATOR_HREF_PREFIX,
+  citationTargetFromHref,
   codeRanges,
   findLocatorCitations,
   linkifyLocatorCitations,
   locatorFromHref,
   locatorLabel,
+  verifiedReadingLocators,
 } from "../lib/reading-citations";
 
 test("parses a single locator citation", () => {
@@ -49,6 +51,14 @@ test("ignores brackets that are not locator citations", () => {
 
 test("rejects locator zero", () => {
   assert.deepEqual(findLocatorCitations("[p.0]"), []);
+});
+
+test("parses locator citation wrapped in backticks", () => {
+  const text = "Grounded `[p.12]` claim.";
+  const found = findLocatorCitations(text);
+  assert.equal(found.length, 1);
+  assert.deepEqual(found[0].locators, [12]);
+  assert.equal(found[0].raw, "`[p.12]`");
 });
 
 test("does not touch citations inside inline code", () => {
@@ -115,10 +125,70 @@ test("linkify rewrites to an anchor the reader can intercept", () => {
   );
 });
 
-test("linkify keeps a multi-locator label but targets the first", () => {
+test("linkify rewrites backticked citations to clean anchors without backticks", () => {
+  assert.equal(
+    linkifyLocatorCitations("Grounded `[p.12]` claim."),
+    `Grounded [p.12](${LOCATOR_HREF_PREFIX}12) claim.`,
+  );
+  assert.equal(
+    linkifyLocatorCitations("Both `[p.12,17]` agree."),
+    `Both [p.12](${LOCATOR_HREF_PREFIX}12), [17](${LOCATOR_HREF_PREFIX}17) agree.`,
+  );
+});
+
+test("absorbs spelled-out phrase before backticked citation and drops backticks", () => {
+  assert.equal(
+    linkifyLocatorCitations("该节位于第 3 页 `[p.3]`。"),
+    `该节位于[第 3 页](${LOCATOR_HREF_PREFIX}3)。`,
+  );
+  assert.equal(
+    linkifyLocatorCitations("It appears on page 7 `[p.7]`."),
+    `It appears on [page 7](${LOCATOR_HREF_PREFIX}7).`,
+  );
+});
+
+test("linkify binds a citation to its turn material", () => {
+  assert.equal(
+    linkifyLocatorCitations("Grounded [p.12] claim.", {
+      materialId: "0123456789abcdef",
+      allowedLocators: [12],
+    }),
+    "Grounded [p.12](#dt-material-0123456789abcdef-locator-12) claim.",
+  );
+});
+
+test("unsupported citations remain plain text instead of blind links", () => {
+  assert.equal(
+    linkifyLocatorCitations("Grounded [p.12], guessed [p.13].", {
+      materialId: "0123456789abcdef",
+      allowedLocators: [12],
+    }),
+    "Grounded [p.12](#dt-material-0123456789abcdef-locator-12), guessed [p.13].",
+  );
+  assert.equal(
+    linkifyLocatorCitations("Mixed [p.12,13].", {
+      materialId: "0123456789abcdef",
+      allowedLocators: [12],
+    }),
+    "Mixed [p.12,13].",
+  );
+});
+
+test("linkify splits comma-separated multi-locator citations into independent links", () => {
   assert.equal(
     linkifyLocatorCitations("Both [p.12,17] agree."),
-    `Both [p.12,17](${LOCATOR_HREF_PREFIX}12) agree.`,
+    `Both [p.12](${LOCATOR_HREF_PREFIX}12), [17](${LOCATOR_HREF_PREFIX}17) agree.`,
+  );
+  assert.equal(
+    linkifyLocatorCitations("Multiple [p.12, 15, 18] points."),
+    `Multiple [p.12](${LOCATOR_HREF_PREFIX}12), [15](${LOCATOR_HREF_PREFIX}15), [18](${LOCATOR_HREF_PREFIX}18) points.`,
+  );
+});
+
+test("linkify keeps range citations targeting the range start locator", () => {
+  assert.equal(
+    linkifyLocatorCitations("Read [p.12-14] carefully."),
+    `Read [p.12-14](${LOCATOR_HREF_PREFIX}12) carefully.`,
   );
 });
 
@@ -159,6 +229,109 @@ test("locatorFromHref only accepts the reader's own anchors", () => {
   assert.equal(locatorFromHref(`${LOCATOR_HREF_PREFIX}abc`), null);
   assert.equal(locatorFromHref(null), null);
   assert.equal(locatorFromHref(undefined), null);
+});
+
+test("citationTargetFromHref restores material-aware and legacy targets", () => {
+  assert.deepEqual(
+    citationTargetFromHref(
+      "#dt-material-0123456789ABCDEF-revision-4-locator-12",
+    ),
+    {
+      materialId: "0123456789abcdef",
+      materialRevision: 4,
+      locator: 12,
+    },
+  );
+  assert.deepEqual(
+    citationTargetFromHref("#dt-material-0123456789ABCDEF-locator-12"),
+    { materialId: "0123456789abcdef", locator: 12 },
+  );
+  assert.deepEqual(citationTargetFromHref(`${LOCATOR_HREF_PREFIX}3`), {
+    locator: 3,
+  });
+  assert.equal(
+    citationTargetFromHref("#dt-material-not-an-id-locator-3"),
+    null,
+  );
+  assert.equal(
+    citationTargetFromHref(
+      "#dt-material-0123456789abcdef-revision-0-locator-3",
+    ),
+    null,
+  );
+});
+
+test("linkify binds material-aware citations to an immutable revision", () => {
+  assert.equal(
+    linkifyLocatorCitations("Grounded [p.12].", {
+      materialId: "0123456789abcdef",
+      materialRevision: 4,
+      allowedLocators: [12],
+    }),
+    "Grounded [p.12](#dt-material-0123456789abcdef-revision-4-locator-12).",
+  );
+});
+
+test("verifiedReadingLocators uses only matching reading-tool evidence", () => {
+  const materialId = "0123456789abcdef";
+  const events = [
+    {
+      type: "tool_result",
+      metadata: {
+        tool: "search_material",
+        tool_metadata: {
+          material_id: materialId,
+          material_revision: 4,
+          hits: [{ locator: 12 }, { locator: 17 }],
+        },
+      },
+    },
+    {
+      type: "tool_result",
+      metadata: {
+        tool: "read_material",
+        tool_metadata: {
+          material_id: materialId,
+          material_revision: 4,
+          locators: [12, 13],
+        },
+      },
+    },
+    {
+      type: "tool_result",
+      metadata: {
+        tool: "reader_goto",
+        tool_metadata: {
+          material_id: materialId,
+          material_revision: 4,
+          locator: 14,
+        },
+      },
+    },
+    {
+      type: "tool_result",
+      metadata: {
+        tool: "read_material",
+        tool_metadata: {
+          material_id: "fedcba9876543210",
+          locators: [99],
+        },
+      },
+    },
+    {
+      type: "tool_result",
+      metadata: {
+        tool: "web_search",
+        tool_metadata: { material_id: materialId, locators: [88] },
+      },
+    },
+  ];
+  assert.deepEqual(
+    [...verifiedReadingLocators(events, materialId, 4)].sort((a, b) => a - b),
+    [12, 13, 14, 17],
+  );
+  assert.deepEqual([...verifiedReadingLocators(events, materialId, 3)], []);
+  assert.deepEqual([...verifiedReadingLocators([], materialId)], []);
 });
 
 test("locatorLabel uses the material's own unit word", () => {
@@ -237,10 +410,10 @@ test("does not absorb from inside code", () => {
 });
 
 test("leaves a multi-locator citation as a marker", () => {
-  // There is no single phrase for "[p.3,7]" to absorb.
+  // There is no single phrase for "[p.3,7]" to absorb, and multi-locators split into independent links.
   assert.equal(
     linkifyLocatorCitations("Both places discuss it on page 3 [p.3,7]."),
-    `Both places discuss it on page 3 [p.3,7](${LOCATOR_HREF_PREFIX}3).`,
+    `Both places discuss it on page 3 [p.3](${LOCATOR_HREF_PREFIX}3), [7](${LOCATOR_HREF_PREFIX}7).`,
   );
 });
 

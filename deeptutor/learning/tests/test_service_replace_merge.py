@@ -17,6 +17,8 @@ from deeptutor.learning.models import (
     KnowledgeType,
     LearningModule,
     LearningProgress,
+    MasteryInteraction,
+    PendingQuestion,
     RepetitionState,
     ReviewTask,
 )
@@ -40,10 +42,94 @@ def _make_module(mod_id: str, kp_ids: list[str]) -> LearningModule:
     )
 
 
+def _make_named_module(mod_id: str, points: list[tuple[str, str]]) -> LearningModule:
+    return LearningModule(
+        id=mod_id,
+        name=f"Module {mod_id}",
+        order=0,
+        knowledge_points=[
+            KnowledgePoint(id=kp_id, name=name, type=KnowledgeType.MEMORY, module_id=mod_id)
+            for kp_id, name in points
+        ],
+    )
+
+
 # ── replace_modules / init_modules (replace semantics) ────────────────────
 
 
 class TestReplaceModules:
+    @staticmethod
+    def _pending(question_id: str = "q1", kp_id: str = "kp2") -> PendingQuestion:
+        return PendingQuestion(
+            question_id=question_id,
+            knowledge_point_id=kp_id,
+            module_id="m1",
+            prompt="Explain it",
+            expected_answer="Clearly",
+        )
+
+    def test_route_reorder_keeps_current_objective_and_pending_interaction(self, tmp_path: Path):
+        store = LearningStore(root=tmp_path)
+        service = LearningService(store)
+        service.replace_modules_for_path(
+            "test", [_make_module("m1", ["kp1", "kp2"])], event_type="seed"
+        )
+
+        def prepare(tx):
+            tx.progress.current_module_id = "m1"
+            tx.progress.current_kp_index = 1
+            tx.progress.pending_question = self._pending()
+            tx.put_interaction(
+                MasteryInteraction(
+                    interaction_id="q1",
+                    path_id="test",
+                    question=self._pending(),
+                    session_id="session-1",
+                )
+            )
+            tx.touch()
+
+        store.mutate("test", prepare)
+
+        progress = service.replace_modules_for_path(
+            "test", [_make_module("m1", ["kp2", "kp1"])], event_type="topic.map_edited"
+        )
+
+        assert progress.current_module_id == "m1"
+        assert progress.current_kp_index == 0
+        assert progress.pending_question is not None
+        assert progress.pending_question.knowledge_point_id == "kp2"
+        assert store.get_active_interaction("test") is not None
+
+    def test_route_deletion_abandons_only_removed_pending_objective(self, tmp_path: Path):
+        store = LearningStore(root=tmp_path)
+        service = LearningService(store)
+        service.replace_modules_for_path("test", [_make_module("m1", ["kp1", "kp2"])])
+
+        def prepare(tx):
+            tx.progress.current_module_id = "m1"
+            tx.progress.current_kp_index = 1
+            tx.progress.pending_question = self._pending()
+            tx.put_interaction(
+                MasteryInteraction(
+                    interaction_id="q1",
+                    path_id="test",
+                    question=self._pending(),
+                    session_id="session-1",
+                )
+            )
+            tx.touch()
+
+        store.mutate("test", prepare)
+
+        progress = service.replace_modules_for_path(
+            "test", [_make_module("m1", ["kp1"])], event_type="topic.map_edited"
+        )
+
+        assert progress.current_kp_index == 0
+        assert progress.pending_question is None
+        assert store.get_active_interaction("test") is None
+
     def test_append_to_empty_path_selects_first_module(self, tmp_path: Path):
         store = LearningStore(root=tmp_path)
         progress = LearningService(store).replace_modules_for_path(
@@ -159,6 +245,21 @@ class TestReplaceModules:
         service.replace_modules(progress, [_make_module("m2", ["kp2"])])
         assert "kp1" not in progress.repetition_states
 
+    def test_replace_cleans_stale_learning_evidence(self, tmp_path: Path):
+        from deeptutor.learning.models import LearningEvidence
+
+        store = LearningStore(root=tmp_path)
+        service = LearningService(store)
+        progress = LearningProgress(book_id="test")
+
+        service.replace_modules(progress, [_make_module("m1", ["kp1"])])
+        progress.learning_evidence.append(
+            LearningEvidence(knowledge_point_id="kp1", result="correct")
+        )
+
+        service.replace_modules(progress, [_make_module("m2", ["kp2"])])
+        assert progress.learning_evidence == []
+
     def test_replace_cleans_stale_error_records(self, tmp_path: Path):
         store = LearningStore(root=tmp_path)
         service = LearningService(store)
@@ -258,6 +359,67 @@ class TestReplaceModules:
         service.replace_modules(progress, [_make_module("m2", ["kp1"])])
         assert progress.mastery_levels["kp1"] == 0.8
         assert "kp2" not in progress.mastery_levels
+
+    def test_semantic_replace_does_not_reuse_positional_id_for_new_content(self, tmp_path: Path):
+        store = LearningStore(root=tmp_path)
+        service = LearningService(store)
+        service.replace_modules_for_path(
+            "test",
+            [_make_named_module("test_m0", [("test_m0_kp0", "Truth tables")])],
+            identity_mode="semantic",
+        )
+
+        def seed(tx):
+            tx.progress.mastery_levels["test_m0_kp0"] = 1.0
+            tx.touch()
+
+        store.mutate("test", seed)
+        progress = service.replace_modules_for_path(
+            "test",
+            [_make_named_module("test_m0", [("test_m0_kp0", "Karnaugh maps")])],
+            identity_mode="semantic",
+        )
+        new_id = progress.modules[0].knowledge_points[0].id
+        assert new_id != "test_m0_kp0"
+        assert "test_m0_kp0" not in progress.mastery_levels
+        assert new_id not in progress.mastery_levels
+
+    def test_semantic_replace_reorder_preserves_evidence_by_fingerprint(self, tmp_path: Path):
+        store = LearningStore(root=tmp_path)
+        service = LearningService(store)
+        service.replace_modules_for_path(
+            "test",
+            [
+                _make_named_module(
+                    "test_m0",
+                    [("test_m0_kp0", "Truth tables"), ("test_m0_kp1", "De Morgan")],
+                )
+            ],
+            identity_mode="semantic",
+        )
+
+        def seed(tx):
+            tx.progress.mastery_levels["test_m0_kp0"] = 0.8
+            tx.progress.mastery_levels["test_m0_kp1"] = 0.4
+            tx.touch()
+
+        store.mutate("test", seed)
+        progress = service.replace_modules_for_path(
+            "test",
+            [
+                _make_named_module(
+                    "test_m0",
+                    [("test_m0_kp0", "De Morgan"), ("test_m0_kp1", "Truth tables")],
+                )
+            ],
+            identity_mode="semantic",
+        )
+        names = [kp.name for kp in progress.modules[0].knowledge_points]
+        ids = [kp.id for kp in progress.modules[0].knowledge_points]
+        assert names == ["De Morgan", "Truth tables"]
+        assert ids == ["test_m0_kp1", "test_m0_kp0"]
+        assert progress.mastery_levels["test_m0_kp0"] == 0.8
+        assert progress.mastery_levels["test_m0_kp1"] == 0.4
 
 
 # ── mastery policy (recency-weighted with low-confidence cap) ─────────────

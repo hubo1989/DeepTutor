@@ -2,13 +2,10 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 from _pytest.monkeypatch import MonkeyPatch
 import pytest
 
-from deeptutor.core.agentic import client as agentic_client
-from deeptutor.services.llm.client import LLMClient
+from deeptutor.services.llm.client import LLMClient, build_model_func_for_config
 from deeptutor.services.llm.config import LLMConfig
 
 
@@ -26,29 +23,6 @@ async def test_client_complete_uses_factory(monkeypatch: MonkeyPatch) -> None:
     result = await client.complete("hello")
 
     assert result == "ok"
-
-
-@pytest.mark.asyncio
-async def test_client_complete_forwards_byok_source_to_factory(
-    monkeypatch: MonkeyPatch,
-) -> None:
-    """The explicit config source must survive a missing request ContextVar."""
-    config = LLMConfig(
-        model="model",
-        api_key="key",
-        base_url="https://example.com",
-        source="byok",
-    )
-    captured: dict[str, object] = {}
-
-    async def _fake_complete(**kwargs: object) -> str:
-        captured.update(kwargs)
-        return "ok"
-
-    monkeypatch.setattr("deeptutor.services.llm.factory.complete", _fake_complete)
-
-    assert await LLMClient(config).complete("hello") == "ok"
-    assert captured["source"] == "byok"
 
 
 def test_client_complete_sync(monkeypatch: MonkeyPatch) -> None:
@@ -84,40 +58,6 @@ def test_client_reports_multimodal_image_support() -> None:
     )
 
 
-def test_agentic_client_wraps_byok_calls_with_safety_accounting_not_platform_quota() -> None:
-    client = SimpleNamespace(chat=SimpleNamespace(completions=object()))
-    wrapped = agentic_client._wrap_token_quota(client, source="byok")
-    assert isinstance(wrapped, agentic_client._TokenQuotaClient)
-    assert wrapped._client is client
-
-
-def test_agentic_client_wraps_platform_calls_when_user_quota_is_configured(monkeypatch) -> None:
-    monkeypatch.setattr(
-        "deeptutor.multi_user.token_quota.current_user_quota_policy",
-        lambda: object(),
-    )
-    client = SimpleNamespace(chat=SimpleNamespace(completions=object()))
-
-    wrapped = agentic_client._wrap_token_quota(client, source="platform")
-
-    assert isinstance(wrapped, agentic_client._TokenQuotaClient)
-    assert wrapped._client is client
-
-
-def test_llm_client_does_not_write_byok_key_to_process_environment(monkeypatch):
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    client = LLMClient(
-        LLMConfig(
-            model="gpt-user",
-            api_key="sk-user-secret",
-            base_url="https://api.openai.com/v1",
-            source="byok",
-        )
-    )
-    assert client.config.api_key == "sk-user-secret"
-    assert "OPENAI_API_KEY" not in __import__("os").environ
-
-
 @pytest.mark.asyncio
 async def test_client_complete_sync_running_loop() -> None:
     """complete_sync should raise when called from a running event loop."""
@@ -140,7 +80,7 @@ async def test_client_get_model_func_uses_factory(monkeypatch: MonkeyPatch) -> N
         captured.update(kwargs)
         return "ok"
 
-    monkeypatch.setattr("deeptutor.services.llm.factory.complete", _fake_complete)
+    monkeypatch.setattr("deeptutor.services.llm.factory.complete_with_config", _fake_complete)
 
     func = client.get_model_func()
     result = await func(
@@ -150,6 +90,7 @@ async def test_client_get_model_func_uses_factory(monkeypatch: MonkeyPatch) -> N
     )
 
     assert result == "ok"
+    assert captured["config"] is config
     assert captured["prompt"] == "hello"
     assert captured["system_prompt"] == "sys"
     assert captured["messages"] == [
@@ -173,7 +114,7 @@ async def test_client_get_model_func_empty_history_uses_prompt(
         captured.update(kwargs)
         return "ok"
 
-    monkeypatch.setattr("deeptutor.services.llm.factory.complete", _fake_complete)
+    monkeypatch.setattr("deeptutor.services.llm.factory.complete_with_config", _fake_complete)
 
     func = client.get_model_func()
     result = await func("hello", system_prompt="sys", history_messages=[])
@@ -198,7 +139,7 @@ async def test_client_get_model_func_explicit_messages_override_prompt(
         captured.update(kwargs)
         return "ok"
 
-    monkeypatch.setattr("deeptutor.services.llm.factory.complete", _fake_complete)
+    monkeypatch.setattr("deeptutor.services.llm.factory.complete_with_config", _fake_complete)
 
     messages = [{"role": "user", "content": "from messages"}]
     func = client.get_model_func()
@@ -220,7 +161,7 @@ async def test_client_get_vision_model_func_uses_factory(monkeypatch: MonkeyPatc
         captured.update(kwargs)
         return "ok"
 
-    monkeypatch.setattr("deeptutor.services.llm.factory.complete", _fake_complete)
+    monkeypatch.setattr("deeptutor.services.llm.factory.complete_with_config", _fake_complete)
 
     func = client.get_vision_model_func()
     result = await func(
@@ -233,3 +174,27 @@ async def test_client_get_vision_model_func_uses_factory(monkeypatch: MonkeyPatc
     assert captured["prompt"] == "hello"
     assert captured["messages"] == [{"role": "user", "content": "hi"}]
     assert captured["image_data"] == "abc123"
+
+
+@pytest.mark.asyncio
+async def test_explicit_config_model_func_does_not_mutate_process_environment(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    config = LLMConfig(
+        model="snapshot-model",
+        api_key="snapshot-key",
+        base_url="https://snapshot.example.com/v1",
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "global-key")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://global.example.com/v1")
+
+    async def _fake_complete(**kwargs: object) -> str:
+        assert kwargs["config"] is config
+        return "ok"
+
+    monkeypatch.setattr("deeptutor.services.llm.factory.complete_with_config", _fake_complete)
+
+    func = build_model_func_for_config(config, allow_multimodal=False)
+    assert await func("hello") == "ok"
+    assert __import__("os").environ["OPENAI_API_KEY"] == "global-key"
+    assert __import__("os").environ["OPENAI_BASE_URL"] == "https://global.example.com/v1"

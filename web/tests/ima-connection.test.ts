@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
-import type { RagProviderSummary } from "../lib/knowledge-api";
+import type { RagProviderSummary } from "../features/knowledge/model/types";
 import {
   canConnectIma,
   createProviders,
@@ -50,7 +50,7 @@ test("leaving the IMA source clears credentials from the mounted flow", () => {
   );
 });
 
-test("automatic names never overwrite a manual DeepTutor name", () => {
+test("automatic names never overwrite a manual LearnLeader name", () => {
   assert.equal(nextAutoName("", null, "IMA Notes"), "IMA Notes");
   assert.equal(nextAutoName("IMA Old", "IMA Old", "IMA New"), "IMA New");
   assert.equal(

@@ -23,8 +23,8 @@ import pytest
 _REPO = Path(__file__).resolve().parents[2]
 
 # (path, marker anchoring the uvicorn invocation, flag spellings for this style)
-_PYTHON_FLAGS = ("ws_max_size", "timeout_keep_alive")
-_CLI_FLAGS = ("--ws-max-size", "--timeout-keep-alive")
+_PYTHON_FLAGS = ("proxy_headers", "ws_max_size", "timeout_keep_alive")
+_CLI_FLAGS = ("--no-proxy-headers", "--ws-max-size", "--timeout-keep-alive")
 _LAUNCH_POINTS = [
     ("deeptutor/runtime/launcher.py", '"uvicorn",', _CLI_FLAGS),
     ("deeptutor/api/run_server.py", "uvicorn.run(", _PYTHON_FLAGS),
@@ -53,6 +53,16 @@ def test_dockerfile_launch_points_wire_serving_flags() -> None:
     for line in lines:
         for flag in _CLI_FLAGS:
             assert flag in line, f"Dockerfile launches uvicorn without {flag}: {line.strip()[:80]}"
+
+
+def test_production_container_wires_configured_worker_count() -> None:
+    lines = [
+        line
+        for line in (_REPO / "Dockerfile").read_text(encoding="utf-8").splitlines()
+        if line.startswith("exec python -m uvicorn deeptutor.api.main:app")
+    ]
+    assert len(lines) == 1
+    assert "--workers ${BACKEND_WORKERS}" in lines[0]
 
 
 def test_keep_alive_outlasts_the_proxy_socket_reaper() -> None:

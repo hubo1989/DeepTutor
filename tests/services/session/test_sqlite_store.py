@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 import sqlite3
+import time
 
 import pytest
 
@@ -28,6 +30,53 @@ def test_sqlite_store_defaults_to_data_user_chat_history_db(tmp_path: Path) -> N
         service._user_data_dir = original_user_dir
 
 
+@pytest.mark.asyncio
+async def test_submission_reservation_and_admission_are_atomic_across_workers(tmp_path):
+    """#1793: duplicate transport retries cannot allocate separate chats or turns."""
+    stores = [SQLiteSessionStore(tmp_path / "shared.db") for _ in range(2)]
+    sessions = await asyncio.gather(
+        *(store.reserve_submission("same-submission", "digest") for store in stores)
+    )
+    assert sessions[0] == sessions[1]
+    turns = await asyncio.gather(
+        *(store.begin_turn(sessions[0], submission_id="same-submission") for store in stores)
+    )
+    assert turns[0]["id"] == turns[1]["id"]
+    assert sum(bool(turn.get("_submission_replay")) for turn in turns) == 1
+    assert len(await stores[0].list_sessions()) == 1
+
+
+@pytest.mark.asyncio
+async def test_submission_identity_does_not_cross_accounts_or_workspaces(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from deeptutor.services.workspace import context
+
+    scope = {"id": "one"}
+    monkeypatch.setattr(
+        context, "get_workspace_scope", lambda: SimpleNamespace(workspace_id=scope["id"])
+    )
+    first = SQLiteSessionStore(tmp_path / "account-one.db")
+    second = SQLiteSessionStore(tmp_path / "account-two.db")
+    one = await first.reserve_submission("same-key", "same-digest")
+    two = await second.reserve_submission("same-key", "same-digest")
+    assert one != two
+    scope["id"] = "two"
+    with pytest.raises(RuntimeError, match="different request or workspace"):
+        await first.reserve_submission("same-key", "same-digest")
+    assert len(await first.list_sessions()) == 1
+
+
+@pytest.mark.asyncio
+async def test_resend_does_not_recreate_a_recycled_conversation(tmp_path):
+    store = SQLiteSessionStore(tmp_path / "deleted.db")
+    session_id = await store.reserve_submission("original", "digest")
+    await store.soft_delete_session(session_id)
+    with pytest.raises(RuntimeError, match="Restore the original conversation"):
+        await store.reserve_submission("original", "digest")
+    assert len(await store.list_deleted_sessions()) == 1
+
+
 def test_sqlite_store_migrates_legacy_chat_history_db(tmp_path: Path) -> None:
     service = PathService.get_instance()
     original_root = service._project_root
@@ -49,6 +98,179 @@ def test_sqlite_store_migrates_legacy_chat_history_db(tmp_path: Path) -> None:
     finally:
         service._project_root = original_root
         service._user_data_dir = original_user_dir
+
+
+def test_store_migrates_legacy_notebook_review_columns(tmp_path: Path) -> None:
+    db_path = tmp_path / "legacy-notebook.db"
+    now = time.time()
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                title TEXT DEFAULT '',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                compressed_summary TEXT DEFAULT '',
+                summary_up_to_msg_id INTEGER DEFAULT 0
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE notebook_entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                turn_id TEXT NOT NULL DEFAULT '',
+                question_id TEXT NOT NULL,
+                question TEXT NOT NULL,
+                question_type TEXT DEFAULT '',
+                options_json TEXT DEFAULT '{}',
+                correct_answer TEXT DEFAULT '',
+                explanation TEXT DEFAULT '',
+                difficulty TEXT DEFAULT '',
+                user_answer TEXT DEFAULT '',
+                user_answer_images_json TEXT DEFAULT '[]',
+                is_correct INTEGER DEFAULT 0,
+                bookmarked INTEGER DEFAULT 0,
+                followup_session_id TEXT DEFAULT '',
+                ai_judgment TEXT DEFAULT '',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                UNIQUE(session_id, turn_id, question_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO notebook_entries (
+                session_id,
+                turn_id,
+                question_id,
+                question,
+                is_correct,
+                created_at,
+                updated_at
+            ) VALUES ('session-1', '', 'q1', 'Legacy?', 0, ?, ?)
+            """,
+            (now, now),
+        )
+        conn.commit()
+
+    store = SQLiteSessionStore(db_path=db_path)
+    listing = asyncio.run(store.list_notebook_entries())
+
+    assert listing["total"] == 1
+    entry = listing["items"][0]
+    assert entry["source"] == "deep_question"
+    assert entry["origin_type"] == "conversation"
+    assert entry["origin_ref"] == "session-1"
+    assert entry["score_trend"] == "new"
+    assert entry["resolved"] is False
+    assert all(not entry[key] for key in ("material_id", "section_id"))
+    with sqlite3.connect(db_path) as conn:
+        indexes = {row[1] for row in conn.execute("PRAGMA index_list(notebook_entries)")}
+    assert "idx_notebook_entries_review" in indexes
+
+
+def test_store_migrates_legacy_workspace_ownership_without_reordering(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "legacy-workspaces.db"
+    rows = [
+        (
+            "mastery",
+            50.0,
+            {"capability": "mastery_path", "mastery_path_id": "topic-1"},
+        ),
+        (
+            "reading",
+            40.0,
+            {
+                "capability": "immersive_reading",
+                "session_kind": "immersive_reading",
+                "reading_workspace_id": "reading-1",
+            },
+        ),
+        (
+            "stale-chat",
+            30.0,
+            {"capability": "chat", "mastery_path_id": "topic-stale"},
+        ),
+        (
+            "left-workspace",
+            20.0,
+            {
+                "capability": "mastery_path",
+                "mastery_path_id": "topic-old",
+                "workspace_mode": "",
+            },
+        ),
+    ]
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL DEFAULT 'New conversation',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                compressed_summary TEXT DEFAULT '',
+                summary_up_to_msg_id INTEGER DEFAULT 0,
+                preferences_json TEXT DEFAULT '{}'
+            )
+            """
+        )
+        conn.executemany(
+            """
+            INSERT INTO sessions (id, title, created_at, updated_at, preferences_json)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            [
+                (session_id, session_id, updated_at, updated_at, json.dumps(preferences))
+                for session_id, updated_at, preferences in rows
+            ],
+        )
+
+    store = SQLiteSessionStore(db_path=db_path)
+    listed = asyncio.run(store.list_sessions())
+    by_id = {row["id"]: row for row in listed}
+
+    assert [row["id"] for row in listed] == [row[0] for row in rows]
+    assert by_id["mastery"]["preferences"]["workspace_mode"] == "mastery_path"
+    assert by_id["reading"]["preferences"]["workspace_mode"] == "immersive_reading"
+    assert "workspace_mode" not in by_id["stale-chat"]["preferences"]
+    assert by_id["left-workspace"]["preferences"]["workspace_mode"] == ""
+    with sqlite3.connect(db_path) as conn:
+        timestamps = dict(conn.execute("SELECT id, updated_at FROM sessions").fetchall())
+    assert timestamps == {session_id: updated_at for session_id, updated_at, _ in rows}
+
+
+@pytest.mark.asyncio
+async def test_explicit_workspace_migration_is_idempotent(tmp_path: Path) -> None:
+    store = SQLiteSessionStore(db_path=tmp_path / "startup-migration.db")
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO sessions (id, title, created_at, updated_at, preferences_json)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                "late-legacy",
+                "late-legacy",
+                10.0,
+                20.0,
+                json.dumps({"capability": "mastery_path", "mastery_path_id": "topic-late"}),
+            ),
+        )
+
+    assert await store.migrate_workspace_preferences() == 1
+    assert await store.migrate_workspace_preferences() == 0
+    session = await store.get_session("late-legacy")
+
+    assert session is not None
+    assert session["preferences"]["workspace_mode"] == "mastery_path"
+    assert session["updated_at"] == 20.0
 
 
 @pytest.fixture
@@ -76,6 +298,57 @@ def _make_items(*specs):
     return items
 
 
+def test_get_session_summaries_batches_counts_and_latest_visible_message(
+    store: SQLiteSessionStore,
+) -> None:
+    first = asyncio.run(store.create_session(title="First", session_id="session-1"))
+    second = asyncio.run(store.create_session(title="Second", session_id="session-2"))
+    asyncio.run(store.add_message(first["id"], "system", "private setup"))
+    asyncio.run(store.add_message(first["id"], "user", "First question"))
+    asyncio.run(store.add_message(first["id"], "assistant", "Latest answer"))
+    asyncio.run(store.add_message(second["id"], "system", "system only"))
+
+    summaries = asyncio.run(store.get_session_summaries([first["id"], second["id"], first["id"]]))
+    by_id = {summary["session_id"]: summary for summary in summaries}
+
+    assert by_id[first["id"]]["message_count"] == 2
+    assert by_id[first["id"]]["last_message"] == "Latest answer"
+    assert by_id[second["id"]]["message_count"] == 0
+    assert by_id[second["id"]]["last_message"] == ""
+
+
+def test_generic_history_lists_immersive_reading_sessions_with_their_collection(
+    store: SQLiteSessionStore,
+) -> None:
+    """Reading conversations are listed, carrying where they belong.
+
+    They used to be filtered out of history entirely, which left a learner no
+    route back to one except by reopening its collection. They are listed now,
+    and the sidebar files them under their collection — which only works if
+    both routing signals survive the summary, so assert on those rather than
+    merely on the row being present.
+    """
+    chat = asyncio.run(store.create_session(title="Regular chat"))
+    reading = asyncio.run(store.create_session(title="Reading conversation"))
+    asyncio.run(
+        store.update_session_preferences(
+            reading["id"],
+            {
+                "session_kind": "immersive_reading",
+                "reading_workspace_id": "rw_private",
+            },
+        )
+    )
+
+    listed = asyncio.run(store.list_sessions())
+
+    assert {row["id"] for row in listed} == {chat["id"], reading["id"]}
+    row = next(row for row in listed if row["id"] == reading["id"])
+    assert row["preferences"]["session_kind"] == "immersive_reading"
+    assert row["preferences"]["reading_workspace_id"] == "rw_private"
+    assert row["preferences"]["workspace_mode"] == "immersive_reading"
+
+
 # ── Notebook entries ──────────────────────────────────────────────
 
 
@@ -87,6 +360,44 @@ def test_upsert_notebook_entries_persists_all(store: SQLiteSessionStore) -> None
     result = asyncio.run(store.list_notebook_entries())
     assert result["total"] == 3
     assert all(e["session_title"] == "Test" for e in result["items"])
+
+
+def test_list_notebook_entries_intersects_session_filters(
+    store: SQLiteSessionStore,
+) -> None:
+    session_a = asyncio.run(store.create_session(session_id="session-a"))
+    session_b = asyncio.run(store.create_session(session_id="session-b"))
+    asyncio.run(
+        store.upsert_notebook_entries(
+            session_a["id"],
+            _make_items(("a1", "A question?", False)),
+        )
+    )
+    asyncio.run(
+        store.upsert_notebook_entries(
+            session_b["id"],
+            _make_items(("b1", "B question?", True)),
+        )
+    )
+
+    overlap = asyncio.run(
+        store.list_notebook_entries(
+            session_id=session_a["id"],
+            session_ids=[session_a["id"], session_b["id"]],
+        )
+    )
+    disjoint = asyncio.run(
+        store.list_notebook_entries(
+            session_id=session_a["id"],
+            session_ids=[session_b["id"]],
+        )
+    )
+    empty = asyncio.run(store.list_notebook_entries(session_ids=[]))
+
+    assert overlap["total"] == 1
+    assert [item["question_id"] for item in overlap["items"]] == ["a1"]
+    assert disjoint == {"items": [], "total": 0}
+    assert empty == {"items": [], "total": 0}
 
 
 def test_upsert_notebook_entries_updates_on_conflict(store: SQLiteSessionStore) -> None:
@@ -195,6 +506,51 @@ def test_upsert_unknown_session_raises(store: SQLiteSessionStore) -> None:
         asyncio.run(store.upsert_notebook_entries("nope", _make_items(("q1", "Q?", False))))
 
 
+def test_non_conversation_origin_upserts_without_a_session(
+    store: SQLiteSessionStore,
+) -> None:
+    item = {
+        "origin_type": "document_analysis",
+        "origin_ref": "book:algebra:page-12",
+        "question_id": "q1",
+        "question": "What is the slope?",
+        "source": "book",
+        "material_id": "algebra",
+        "is_correct": False,
+    }
+
+    assert asyncio.run(store.upsert_notebook_entries(None, [item])) == 1
+    item["user_answer"] = "3"
+    assert asyncio.run(store.upsert_notebook_entries(None, [item])) == 1
+
+    listing = asyncio.run(store.list_notebook_entries())
+    assert listing["total"] == 1
+    entry = listing["items"][0]
+    assert entry["session_id"] == ""
+    assert entry["origin_type"] == "document_analysis"
+    assert entry["origin_ref"] == "book:algebra:page-12"
+    assert entry["user_answer"] == "3"
+    assert asyncio.run(store.list_notebook_entries(session_ids=[]))["total"] == 0
+
+
+def test_non_conversation_origin_requires_a_stable_reference(
+    store: SQLiteSessionStore,
+) -> None:
+    with pytest.raises(ValueError, match="require origin_ref"):
+        asyncio.run(
+            store.upsert_notebook_entries(
+                None,
+                [
+                    {
+                        "origin_type": "external_import",
+                        "question_id": "q1",
+                        "question": "Imported?",
+                    }
+                ],
+            )
+        )
+
+
 def test_list_entries_filters_bookmarked(store: SQLiteSessionStore) -> None:
     session = asyncio.run(store.create_session())
     asyncio.run(
@@ -227,6 +583,163 @@ def test_list_entries_filters_is_correct(store: SQLiteSessionStore) -> None:
     wrong = asyncio.run(store.list_notebook_entries(is_correct=False))
     assert wrong["total"] == 1
     assert wrong["items"][0]["question_id"] == "q1"
+
+
+def test_ungraded_rows_are_not_listed_as_wrong(store: SQLiteSessionStore) -> None:
+    session = asyncio.run(store.create_session())
+    asyncio.run(
+        store.upsert_notebook_entries(
+            session["id"],
+            [
+                {
+                    "question_id": "wrong",
+                    "question": "Wrong?",
+                    "is_correct": False,
+                    "result": "incorrect",
+                },
+                {
+                    "question_id": "pending",
+                    "question": "Pending?",
+                    "is_correct": False,
+                    "result": "ungraded",
+                },
+            ],
+        )
+    )
+    wrong = asyncio.run(store.list_notebook_entries(is_correct=False))
+    assert [item["question_id"] for item in wrong["items"]] == ["wrong"]
+    stats = asyncio.run(store.question_bank_stats())
+    assert stats["wrong"] == 1
+    assert stats["unresolved"] == 1
+
+
+def test_notebook_review_metadata_filters_and_transitions(
+    store: SQLiteSessionStore,
+) -> None:
+    session = asyncio.run(store.create_session(title="Sources"))
+    asyncio.run(
+        store.upsert_notebook_entries(
+            session["id"],
+            [
+                {
+                    "question_id": "q1",
+                    "question": "Mastery?",
+                    "is_correct": False,
+                    "source": "mastery_path",
+                    "material_id": "path-1",
+                    "material_title": "Algebra",
+                    "section_id": "kp-1",
+                    "section_title": "Equations",
+                },
+                {
+                    "question_id": "q2",
+                    "question": "Reading?",
+                    "is_correct": True,
+                    "source": "immersive_reading",
+                    "material_id": "book-1",
+                    "material_title": "EPUB",
+                    "section_id": "page-1",
+                    "section_title": "Page 1",
+                },
+            ],
+        )
+    )
+
+    mastery = asyncio.run(
+        store.list_notebook_entries(source="mastery_path", material_id="path-1", section_id="kp-1")
+    )
+    assert mastery["total"] == 1
+    entry = mastery["items"][0]
+    assert entry["score_trend"] == "new"
+    assert entry["resolved"] is False
+    assert asyncio.run(store.question_bank_stats())["unresolved"] == 1
+    assert asyncio.run(store.list_question_bank_materials()) == [
+        {
+            "source": "mastery_path",
+            "material_id": "path-1",
+            "material_title": "Algebra",
+            "entry_count": 1,
+            "unresolved_count": 1,
+        },
+        {
+            "source": "immersive_reading",
+            "material_id": "book-1",
+            "material_title": "EPUB",
+            "entry_count": 1,
+            "unresolved_count": 0,
+        },
+    ]
+
+    eid = entry["id"]
+    assert asyncio.run(store.update_notebook_entry(eid, {"resolved": True}))
+    resolved = asyncio.run(store.list_notebook_entries(resolved=True))
+    assert {item["id"] for item in resolved["items"]} == {eid, entry["id"] + 1}
+
+    retry = {
+        "question_id": "q1",
+        "question": "Mastery?",
+        "is_correct": True,
+        "source": "mastery_path",
+        "material_id": "path-1",
+        "section_id": "kp-1",
+    }
+    asyncio.run(store.upsert_notebook_entries(session["id"], [retry]))
+    improved = asyncio.run(store.list_notebook_entries(score_trend="improved"))["items"][0]
+    assert improved["resolved"] is True
+
+    retry["is_correct"] = False
+    asyncio.run(store.upsert_notebook_entries(session["id"], [retry]))
+    declined = asyncio.run(store.list_notebook_entries(score_trend="declined"))["items"][0]
+    assert declined["resolved"] is False
+
+    asyncio.run(store.upsert_notebook_entries(session["id"], [retry]))
+    unchanged = asyncio.run(store.list_notebook_entries(score_trend="unchanged"))["items"][0]
+    assert unchanged["resolved"] is False
+
+
+def test_question_bank_materials_respect_session_scope(store: SQLiteSessionStore) -> None:
+    first = asyncio.run(store.create_session(title="Course A"))
+    second = asyncio.run(store.create_session(title="Course B"))
+    asyncio.run(
+        store.upsert_notebook_entries(
+            first["id"],
+            [
+                {
+                    "question_id": "q-a",
+                    "question": "A?",
+                    "is_correct": False,
+                    "source": "book",
+                    "material_id": "book-a",
+                    "material_title": "Book A",
+                }
+            ],
+        )
+    )
+    asyncio.run(
+        store.upsert_notebook_entries(
+            second["id"],
+            [
+                {
+                    "question_id": "q-b",
+                    "question": "B?",
+                    "is_correct": True,
+                    "source": "book",
+                    "material_id": "book-b",
+                    "material_title": "Book B",
+                }
+            ],
+        )
+    )
+
+    assert asyncio.run(store.list_question_bank_materials([first["id"]])) == [
+        {
+            "source": "book",
+            "material_id": "book-a",
+            "material_title": "Book A",
+            "entry_count": 1,
+            "unresolved_count": 1,
+        }
+    ]
 
 
 def test_update_notebook_entry_bookmark_roundtrip(store: SQLiteSessionStore) -> None:
@@ -275,12 +788,82 @@ def test_delete_notebook_entry(store: SQLiteSessionStore) -> None:
     assert asyncio.run(store.delete_notebook_entry(99999)) is False
 
 
-def test_entries_cascade_on_session_delete(store: SQLiteSessionStore) -> None:
+def test_entries_follow_a_session_into_and_out_of_the_recycle_bin(
+    store: SQLiteSessionStore,
+) -> None:
     session = asyncio.run(store.create_session())
     asyncio.run(store.upsert_notebook_entries(session["id"], _make_items(("q1", "Q?", False))))
     assert asyncio.run(store.list_notebook_entries())["total"] == 1
-    asyncio.run(store.delete_session(session["id"]))
+
+    # A recycled session takes its entries out of view without destroying
+    # them, which is what makes the restore below whole.
+    asyncio.run(store.soft_delete_session(session["id"]))
     assert asyncio.run(store.list_notebook_entries())["total"] == 0
+    assert asyncio.run(store.restore_session(session["id"]))
+    assert asyncio.run(store.list_notebook_entries())["total"] == 1
+
+    asyncio.run(store.soft_delete_session(session["id"]))
+    assert asyncio.run(store.hard_delete_session(session["id"]))
+    detached = asyncio.run(store.list_notebook_entries())
+    assert detached["total"] == 1
+    assert detached["items"][0]["session_id"] == ""
+    assert detached["items"][0]["origin_ref"] == session["id"]
+
+
+def test_bank_counts_skip_entries_of_recycled_sessions(store: SQLiteSessionStore) -> None:
+    """The rail's counts, material chips and category badges match the list."""
+    kept = asyncio.run(store.create_session())
+    recycled = asyncio.run(store.create_session())
+    category = asyncio.run(store.create_category("Algebra"))
+    for session, material in ((kept, "book-a"), (recycled, "book-b")):
+        item = _make_items(("q1", "Q?", False))[0]
+        item.update(material_id=material, material_title=material)
+        asyncio.run(store.upsert_notebook_entries(session["id"], [item]))
+        entry = asyncio.run(store.find_notebook_entry(session["id"], "q1"))
+        asyncio.run(store.update_notebook_entry(entry["id"], {"bookmarked": True}))
+        asyncio.run(store.add_entry_to_category(entry["id"], category["id"]))
+
+    asyncio.run(store.soft_delete_session(recycled["id"]))
+
+    assert asyncio.run(store.list_notebook_entries())["total"] == 1
+    assert asyncio.run(store.question_bank_stats()) == {
+        "total": 1,
+        "wrong": 1,
+        "unresolved": 1,
+        "bookmarked": 1,
+        "uncategorized": 0,
+    }
+    materials = asyncio.run(store.list_question_bank_materials())
+    assert [m["material_id"] for m in materials] == ["book-a"]
+    assert asyncio.run(store.list_categories())[0]["entry_count"] == 1
+    # Scoped counts (a course's sessions) follow the same rule.
+    scope = [kept["id"], recycled["id"]]
+    assert asyncio.run(store.question_bank_stats(scope))["total"] == 1
+    assert asyncio.run(store.list_categories(scope))[0]["entry_count"] == 1
+
+    assert asyncio.run(store.restore_session(recycled["id"]))
+    assert asyncio.run(store.question_bank_stats())["total"] == 2
+    assert len(asyncio.run(store.list_question_bank_materials())) == 2
+    assert asyncio.run(store.list_categories())[0]["entry_count"] == 2
+
+
+def test_entries_keep_provenance_when_a_session_is_deleted_outright(
+    store: SQLiteSessionStore,
+) -> None:
+    """Deleting a chat removes navigation without deleting learning evidence."""
+    session = asyncio.run(store.create_session())
+    asyncio.run(store.upsert_notebook_entries(session["id"], _make_items(("q1", "Q?", False))))
+    assert asyncio.run(store.list_notebook_entries())["total"] == 1
+
+    assert asyncio.run(store.delete_session(session["id"]))
+
+    listing = asyncio.run(store.list_notebook_entries())
+    assert listing["total"] == 1
+    assert listing["items"][0]["session_id"] == ""
+    assert listing["items"][0]["origin_type"] == "conversation"
+    assert listing["items"][0]["origin_ref"] == session["id"]
+    assert asyncio.run(store.list_deleted_sessions()) == []
+    assert asyncio.run(store.restore_session(session["id"])) is False
 
 
 # ── Categories ────────────────────────────────────────────────────
@@ -398,6 +981,196 @@ def test_delete_last_turn_leaves_prefix_intact(store: SQLiteSessionStore) -> Non
     assert remaining[1]["id"] == a1
 
 
+def _seed_turns_with_parked_second(
+    store: SQLiteSessionStore, *, stamp: bool = True
+) -> dict[str, object]:
+    """Seed the real lifecycle order: turn row first, then its user row.
+
+    Turn 1 is completed; turn 2 is parked on ``waiting_input`` with no
+    assistant row. ``stamp=False`` simulates legacy rows persisted before
+    ``metadata.turn_id`` existed; production writes it (executor.py).
+    """
+    sid = asyncio.run(store.create_session())["id"]
+    t1 = asyncio.run(store.begin_turn(sid, capability="chat"))
+    u1 = asyncio.run(
+        store.add_message(sid, "user", "q1", metadata={"turn_id": t1["id"]} if stamp else None)
+    )
+    a1 = asyncio.run(store.add_message(sid, "assistant", "a1", parent_message_id=u1))
+    asyncio.run(store.link_turn_message(t1["id"], a1))
+    asyncio.run(store.transition_turn(t1["id"], "completed", expected_status="running"))
+    t2 = asyncio.run(store.begin_turn(sid, capability="chat"))
+    u2 = asyncio.run(
+        store.add_message(sid, "user", "q2", metadata={"turn_id": t2["id"]} if stamp else None)
+    )
+    asyncio.run(store.transition_turn(t2["id"], "waiting_input", expected_status="running"))
+    return {"sid": sid, "t1": t1["id"], "u1": u1, "a1": a1, "t2": t2["id"], "u2": u2}
+
+
+def test_delete_completed_turn_message_leaves_waiting_turn_intact(
+    store: SQLiteSessionStore,
+) -> None:
+    ids = _seed_turns_with_parked_second(store)
+
+    result = asyncio.run(store.delete_turn_by_message(str(ids["sid"]), int(ids["u1"])))
+
+    assert result["deleted"] is True
+    assert result["turn_id"] == ids["t1"]
+    assert asyncio.run(store.get_turn(str(ids["t1"]))) is None
+    parked = asyncio.run(store.get_turn(str(ids["t2"])))
+    assert parked is not None
+    assert parked["status"] == "waiting_input"
+    remaining = asyncio.run(store.get_messages(str(ids["sid"])))
+    assert [m["content"] for m in remaining] == ["q2"]
+
+
+def test_delete_message_of_active_turn_is_refused(store: SQLiteSessionStore) -> None:
+    ids = _seed_turns_with_parked_second(store)
+
+    result = asyncio.run(store.delete_turn_by_message(str(ids["sid"]), int(ids["u2"])))
+
+    assert result["deleted"] is False
+    assert result["was_active"] is True
+    assert result["turn_id"] == ids["t2"]
+    parked = asyncio.run(store.get_turn(str(ids["t2"])))
+    assert parked is not None
+    assert parked["status"] == "waiting_input"
+    remaining = asyncio.run(store.get_messages(str(ids["sid"])))
+    assert [m["content"] for m in remaining] == ["q1", "a1", "q2"]
+
+
+def test_delete_regenerated_assistant_message_resolves_its_own_turn(
+    store: SQLiteSessionStore,
+) -> None:
+    # Regeneration writes a new turn row and assistant row after the original
+    # user row; a completed intermediate turn also exists, so ordering alone
+    # would attribute the assistant row to the wrong turn. Its own turn link
+    # must win.
+    sid = asyncio.run(store.create_session())["id"]
+    t1 = asyncio.run(store.begin_turn(sid, capability="chat"))
+    u1 = asyncio.run(store.add_message(sid, "user", "q1", metadata={"turn_id": t1["id"]}))
+    a1 = asyncio.run(store.add_message(sid, "assistant", "a1", parent_message_id=u1))
+    asyncio.run(store.link_turn_message(t1["id"], a1))
+    asyncio.run(store.transition_turn(t1["id"], "completed", expected_status="running"))
+    t2 = asyncio.run(store.begin_turn(sid, capability="chat"))
+    u2 = asyncio.run(store.add_message(sid, "user", "q2", metadata={"turn_id": t2["id"]}))
+    a2 = asyncio.run(store.add_message(sid, "assistant", "a2", parent_message_id=u2))
+    asyncio.run(store.link_turn_message(t2["id"], a2))
+    asyncio.run(store.transition_turn(t2["id"], "completed", expected_status="running"))
+    t3 = asyncio.run(store.begin_turn(sid, capability="chat"))
+    a3 = asyncio.run(store.add_message(sid, "assistant", "a1-regen", parent_message_id=u1))
+    asyncio.run(store.link_turn_message(t3["id"], a3))
+    asyncio.run(store.transition_turn(t3["id"], "completed", expected_status="running"))
+
+    result = asyncio.run(store.delete_turn_by_message(sid, a3))
+
+    assert result["deleted"] is True
+    assert result["turn_id"] == t3["id"]
+    assert asyncio.run(store.get_turn(t1["id"])) is not None
+    assert asyncio.run(store.get_turn(t2["id"])) is not None
+    assert asyncio.run(store.get_turn(t3["id"])) is None
+    remaining = asyncio.run(store.get_messages(sid))
+    assert [m["content"] for m in remaining] == ["q1", "a1", "q2", "a2"]
+    assert remaining[1]["parent_message_id"] == u1
+    assert remaining[3]["parent_message_id"] == u2
+
+
+def test_delete_unanswered_user_does_not_pair_with_another_branch(
+    store: SQLiteSessionStore,
+) -> None:
+    sid = asyncio.run(store.create_session())["id"]
+    t1 = asyncio.run(store.begin_turn(sid, capability="chat"))
+    u1 = asyncio.run(store.add_message(sid, "user", "unanswered", metadata={"turn_id": t1["id"]}))
+    asyncio.run(store.transition_turn(t1["id"], "failed", expected_status="running"))
+    u2 = asyncio.run(store.add_message(sid, "user", "other question", parent_message_id=None))
+    a2 = asyncio.run(store.add_message(sid, "assistant", "other answer", parent_message_id=u2))
+
+    result = asyncio.run(store.delete_turn_by_message(sid, u1))
+
+    assert result["deleted"] is True
+    assert [m["id"] for m in asyncio.run(store.get_messages(sid))] == [u2, a2]
+
+
+def test_delete_regenerated_answer_leaves_parked_turn_and_shared_question(
+    store: SQLiteSessionStore,
+) -> None:
+    sid = asyncio.run(store.create_session())["id"]
+    t1 = asyncio.run(store.begin_turn(sid, capability="chat"))
+    u1 = asyncio.run(store.add_message(sid, "user", "q1", metadata={"turn_id": t1["id"]}))
+    a1 = asyncio.run(store.add_message(sid, "assistant", "a1", parent_message_id=u1))
+    asyncio.run(store.link_turn_message(t1["id"], a1))
+    asyncio.run(store.transition_turn(t1["id"], "completed", expected_status="running"))
+    regenerated_turn = asyncio.run(store.begin_turn(sid, capability="chat"))
+    regenerated = asyncio.run(
+        store.add_message(sid, "assistant", "regenerated", parent_message_id=u1)
+    )
+    asyncio.run(store.link_turn_message(regenerated_turn["id"], regenerated))
+    asyncio.run(
+        store.transition_turn(regenerated_turn["id"], "completed", expected_status="running")
+    )
+    waiting = asyncio.run(store.begin_turn(sid, capability="ask_questions"))
+    asyncio.run(store.add_message(sid, "user", "q2", metadata={"turn_id": waiting["id"]}))
+    asyncio.run(store.transition_turn(waiting["id"], "waiting_input", expected_status="running"))
+
+    result = asyncio.run(store.delete_turn_by_message(sid, regenerated))
+
+    assert result["deleted"] is True
+    assert [m["content"] for m in asyncio.run(store.get_messages(sid))] == ["q1", "a1", "q2"]
+    assert asyncio.run(store.get_turn(t1["id"])) is not None
+    parked = asyncio.run(store.get_turn(waiting["id"]))
+    assert parked is not None
+    assert parked["status"] == "waiting_input"
+
+
+def test_delete_legacy_message_uses_ordering_fallback(store: SQLiteSessionStore) -> None:
+    ids = _seed_turns_with_parked_second(store, stamp=False)
+
+    result = asyncio.run(store.delete_turn_by_message(str(ids["sid"]), int(ids["u1"])))
+
+    assert result["deleted"] is True
+    assert result["turn_id"] == ids["t1"]
+    assert asyncio.run(store.get_turn(str(ids["t1"]))) is None
+    parked = asyncio.run(store.get_turn(str(ids["t2"])))
+    assert parked is not None
+    assert parked["status"] == "waiting_input"
+    remaining = asyncio.run(store.get_messages(str(ids["sid"])))
+    assert [message["id"] for message in remaining] == [ids["u2"]]
+
+
+@pytest.mark.parametrize("delete_role", ["user", "assistant"])
+def test_delete_migrated_legacy_pair_leaves_later_turn_intact(
+    store: SQLiteSessionStore,
+    delete_role: str,
+) -> None:
+    sid, ids = _seed_chat(store, turns=2)
+    # Recreate the historical schema without branch pointers, then reopen it
+    # through the actual migration before exercising message deletion.
+    with store._connect() as conn:
+        conn.execute("DROP INDEX idx_messages_parent")
+        conn.execute("ALTER TABLE messages DROP COLUMN parent_message_id")
+    migrated = SQLiteSessionStore(db_path=store.db_path)
+    messages = asyncio.run(migrated.get_messages(sid))
+    assert messages[1]["parent_message_id"] == ids[0]
+
+    target = ids[0] if delete_role == "user" else ids[1]
+    assert asyncio.run(migrated.delete_turn_by_message(sid, target))["deleted"] is True
+    remaining = asyncio.run(migrated.get_messages(sid))
+    assert [message["id"] for message in remaining] == ids[2:]
+    assert remaining[0]["parent_message_id"] is None
+    assert remaining[1]["parent_message_id"] == ids[2]
+
+
+def test_delete_explicit_root_assistant_does_not_guess_a_user(
+    store: SQLiteSessionStore,
+) -> None:
+    sid, ids = _seed_chat(store, turns=1)
+    root_answer = asyncio.run(
+        store.add_message(sid, "assistant", "root answer", parent_message_id=None)
+    )
+
+    assert asyncio.run(store.delete_turn_by_message(sid, root_answer))["deleted"] is True
+    assert [message["id"] for message in asyncio.run(store.get_messages(sid))] == ids
+
+
 # ── Context messages ──────────────────────────────────────────────
 
 
@@ -453,6 +1226,10 @@ def test_context_messages_carry_private_metadata(store: SQLiteSessionStore) -> N
     messages = asyncio.run(store.get_messages_for_context(session["id"]))
 
     assert messages[0]["metadata"]["provider_response_state"] == state
+
+    public_detail = asyncio.run(store.get_session_with_messages(session["id"]))
+    assert public_detail is not None
+    assert "provider_response_state" not in public_detail["messages"][0]["metadata"]
 
 
 def test_branch_context_messages_carry_ask_user_events(store: SQLiteSessionStore) -> None:

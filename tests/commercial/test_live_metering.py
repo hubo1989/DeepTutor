@@ -218,7 +218,7 @@ async def test_source_independent_meter_can_count_byok_usage(tmp_path, monkeypat
 @pytest.mark.asyncio
 async def test_agentic_stream_finalizes_once_with_provider_usage(tmp_path, monkeypatch) -> None:
     from deeptutor.commercial import metering
-    from deeptutor.core.agentic.client import _TokenQuotaCompletions
+    from deeptutor.runtime.agentic.client import _TokenQuotaCompletions
     from deeptutor.multi_user import token_quota
 
     runtime, control_plane, customer, resolved = await _commercial_runtime()
@@ -277,7 +277,7 @@ async def test_agentic_stream_finalizes_once_with_provider_usage(tmp_path, monke
 @pytest.mark.asyncio
 async def test_agentic_cancelled_stream_with_output_is_still_metered(tmp_path, monkeypatch) -> None:
     from deeptutor.commercial import metering
-    from deeptutor.core.agentic.client import _TokenQuotaCompletions
+    from deeptutor.runtime.agentic.client import _TokenQuotaCompletions
     from deeptutor.multi_user import token_quota
 
     runtime, control_plane, customer, resolved = await _commercial_runtime()
@@ -466,7 +466,7 @@ async def test_agentic_passes_stable_request_id_and_finalizes_pg_after_legacy_fa
     monkeypatch,
 ) -> None:
     from deeptutor.commercial import metering
-    from deeptutor.core.agentic.client import _TokenQuotaCompletions
+    from deeptutor.runtime.agentic.client import _TokenQuotaCompletions
     from deeptutor.multi_user import token_quota
 
     captured: dict[str, object] = {}
@@ -521,7 +521,7 @@ async def test_agentic_passes_stable_request_id_and_finalizes_pg_after_legacy_fa
 @pytest.mark.asyncio
 async def test_agentic_releases_pg_after_legacy_release_failure(monkeypatch) -> None:
     from deeptutor.commercial import metering
-    from deeptutor.core.agentic.client import _TokenQuotaCompletions
+    from deeptutor.runtime.agentic.client import _TokenQuotaCompletions
     from deeptutor.multi_user import token_quota
 
     class CommercialLease:

@@ -20,11 +20,6 @@ import tempfile
 import traceback
 from typing import Any, Dict, List, Optional
 
-from deeptutor.commercial.storage_limits import (
-    create_staging_directory,
-    enforce_staging_scratch_limit,
-    promote_staged_directory_with_storage_limits,
-)
 from deeptutor.logging import PROCESS_LOG_PRIVATE_ATTR
 from deeptutor.runtime.home import get_runtime_data_root
 from deeptutor.services.rag.index_versioning import (
@@ -97,14 +92,19 @@ class GraphRagPipeline:
         self.logger.info(
             "Initializing KB '%s' with %d file(s) using GraphRAG", kb_name, len(file_paths)
         )
+        from deeptutor.commercial.storage_limits import (
+            create_staging_directory,
+            enforce_staging_scratch_limit,
+            promote_staged_directory_with_storage_limits,
+        )
+
         staging = create_staging_directory(root_dir)
         try:
             gr_config.write_settings(staging)
             enforce_staging_scratch_limit(staging, replacing_root=root_dir)
+            source_for_input: dict[str, str] = {}
             count = await ingestion.prepare_input(
-                file_paths,
-                staging,
-                replacing_root=root_dir,
+                file_paths, staging, source_for_input=source_for_input
             )
             if count == 0:
                 self.logger.error("GraphRAG: no extractable documents for '%s'", kb_name)
@@ -114,10 +114,13 @@ class GraphRagPipeline:
             await self._build(staging, is_update=False)
             storage.write_meta(staging, version_name=root_dir.name)
             await asyncio.to_thread(
-                promote_staged_directory_with_storage_limits,
-                staging,
-                root_dir,
+                promote_staged_directory_with_storage_limits, staging, root_dir
             )
+            if indexed_file_callback := kwargs.get("indexed_file_callback"):
+                names = await asyncio.to_thread(storage.indexed_input_names, root_dir)
+                indexed_file_callback(
+                    sorted(source_for_input[name] for name in names if name in source_for_input)
+                )
             self.logger.info("KB '%s' initialized with GraphRAG (%d docs)", kb_name, count)
             return True
         except Exception as exc:
@@ -134,6 +137,9 @@ class GraphRagPipeline:
         self._ensure_available()
         kb_dir = resolve_kb_dir(self.kb_base_dir, kb_name)
         existing = resolve_storage_dir_for_read(kb_dir, None)
+        from deeptutor.services.rag.embedding_binding import bound_graph_storage_root
+
+        existing = bound_graph_storage_root(kb_dir, storage.PROVIDER, existing)
         is_update = existing is not None and storage.has_output(existing)
         root_dir = (
             existing if existing is not None else resolve_storage_dir_for_rebuild(kb_dir, None)
@@ -145,7 +151,6 @@ class GraphRagPipeline:
             kb_name,
             is_update,
         )
-        staging = create_staging_directory(root_dir, copy_existing=is_update)
         try:
             # Refresh settings so a changed model/endpoint is picked up.
             settings = gr_config.build_settings()
@@ -154,28 +159,17 @@ class GraphRagPipeline:
                 # exact settings snapshot first so a bad provider configuration
                 # cannot overwrite a working settings.yaml or add input files.
                 await self._preflight_settings(settings)
-            gr_config.write_settings_payload(staging, settings)
-            enforce_staging_scratch_limit(staging, replacing_root=root_dir)
-            count = await ingestion.prepare_input(
-                file_paths,
-                staging,
-                replacing_root=root_dir,
-            )
+            gr_config.write_settings_payload(root_dir, settings)
+            count = await ingestion.prepare_input(file_paths, root_dir)
             if count == 0:
                 self.logger.warning("GraphRAG: no extractable documents to add for '%s'", kb_name)
-                shutil.rmtree(staging, ignore_errors=True)
                 return False
             await self._build(
-                staging,
+                root_dir,
                 is_update=is_update,
                 preflight_embedding_model=not is_update,
             )
-            storage.write_meta(staging, version_name=root_dir.name)
-            await asyncio.to_thread(
-                promote_staged_directory_with_storage_limits,
-                staging,
-                root_dir,
-            )
+            storage.write_meta(root_dir)
             self.logger.info("Added %d doc(s) to GraphRAG KB '%s'", count, kb_name)
             return True
         except Exception as exc:
@@ -184,7 +178,6 @@ class GraphRagPipeline:
                 traceback.format_exc(),
                 extra={PROCESS_LOG_PRIVATE_ATTR: True},
             )
-            shutil.rmtree(staging, ignore_errors=True)
             if not is_update:
                 self._cleanup_failed_version_dir(root_dir)
             raise
@@ -209,6 +202,9 @@ class GraphRagPipeline:
     async def search(self, query: str, kb_name: str, **kwargs) -> Dict[str, Any]:
         kb_dir = resolve_kb_dir(self.kb_base_dir, kb_name)
         root_dir = resolve_storage_dir_for_read(kb_dir, None)
+        from deeptutor.services.rag.embedding_binding import bound_graph_storage_root
+
+        root_dir = bound_graph_storage_root(kb_dir, storage.PROVIDER, root_dir)
 
         if root_dir is None or not storage.has_output(root_dir):
             return {

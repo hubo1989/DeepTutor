@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 from pathlib import Path
 from types import SimpleNamespace
 import zipfile
@@ -104,24 +105,64 @@ def test_verified_source_visual_contract_and_lifecycle(tmp_path: Path, suffix: s
     assert not persisted.exists()
 
 
-def test_manifest_limit_does_not_replace_existing_assets(tmp_path: Path, monkeypatch):
+def test_large_existing_manifest_remains_readable_and_accepts_more_figures(tmp_path: Path):
+    """#1802: a corpus beyond the old 16 MiB limit must retain every reference."""
     import deeptutor.services.rag.visual_assets as assets_module
 
     kb_dir, source, image, parsed = _fixture(tmp_path)
     original = collect_visual_assets(parsed, source, kb_dir)[0]
     store = VisualAssetStore(kb_dir)
     store.publish([original])
-    manifest_before = store.manifest_path.read_bytes()
-    monkeypatch.setattr(assets_module, "MAX_MANIFEST_BYTES", len(manifest_before) + 10)
+    # Model a legacy manifest from a figure-heavy KB without 15,000 image copies.
+    records = {
+        f"{index:064x}": {**original.record, "asset_id": f"{index:064x}", "context": "x" * 1000}
+        for index in range(11000)
+    }
+    records[original.record["asset_id"]] = original.record
+    store.manifest_path.write_text(json.dumps({"version": 1, "assets": records}), encoding="utf-8")
+    assert store.manifest_path.stat().st_size > 16 * 1024 * 1024
+    assert store.read(original.record["asset_id"]) is not None
     second = assets_module.VisualAssetCandidate(
         path=image,
         record={**original.record, "asset_id": "a" * 64},
     )
-    with pytest.raises(OSError, match="manifest exceeds"):
-        store.publish([second])
-    assert store.manifest_path.read_bytes() == manifest_before
+    store.publish([second])
+    assert len(store.records()) == len(records) + 1
     assert store.read(original.record["asset_id"]) is not None
-    assert store.read(second.record["asset_id"]) is None
+    assert store.read(second.record["asset_id"]) is not None
+
+
+@pytest.mark.parametrize("operation", ["publish", "remove_source", "move_source"])
+def test_unreadable_manifest_is_reported_and_never_overwritten(tmp_path: Path, caplog, operation):
+    kb_dir, source, _image, parsed = _fixture(tmp_path)
+    candidate = collect_visual_assets(parsed, source, kb_dir)[0]
+    store = VisualAssetStore(kb_dir)
+    store.publish([candidate])
+    store.manifest_path.write_bytes(b"{broken manifest")
+    before = store.manifest_path.read_bytes()
+    assert store.read(candidate.record["asset_id"]) is None
+    assert "Cannot read source figures for KB 'kb'" in caplog.text
+    with pytest.raises(OSError, match="Cannot read visual asset manifest"):
+        if operation == "publish":
+            store.publish([candidate])
+        elif operation == "remove_source":
+            store.remove_source(source.name)
+        else:
+            store.move_source(source.name, "moved.pdf")
+    assert store.manifest_path.read_bytes() == before
+
+
+def test_changed_image_does_not_replace_existing_manifest(tmp_path: Path):
+    kb_dir, source, image, parsed = _fixture(tmp_path)
+    candidate = collect_visual_assets(parsed, source, kb_dir)[0]
+    store = VisualAssetStore(kb_dir)
+    store.publish([candidate])
+    before = store.manifest_path.read_bytes()
+    image.write_bytes(b"not an image anymore")
+    with pytest.raises(OSError, match="Source image changed"):
+        store.publish([candidate])
+    assert store.manifest_path.read_bytes() == before
+    assert store.read(candidate.record["asset_id"]) is not None
 
 
 def test_size_count_and_rebuild_cleanup(tmp_path: Path, monkeypatch):
@@ -168,6 +209,13 @@ def test_hundred_figure_textbook_keeps_late_figures_searchable_and_delivers_pixe
     from deeptutor.tools.builtin import RAGTool
 
     kb_dir, source, image, parsed = _fixture(tmp_path)
+    # Page-grounded indexing now opens the physical PDF as well as parser output.
+    import pymupdf
+
+    with pymupdf.open() as pdf:
+        for _ in range(100):
+            pdf.new_page()
+        pdf.save(source)
     image.unlink()
     parsed = replace(
         parsed,
@@ -214,12 +262,13 @@ def test_hundred_figure_textbook_keeps_late_figures_searchable_and_delivers_pixe
     assert len(visuals) == 100
     VisualAssetStore(kb_dir).publish(candidates)
     index = VectorStoreIndex.from_documents(documents, embed_model=FigureEmbedding())
-    retriever = index.as_retriever(similarity_top_k=1)
+    # The page text and its figure caption share the deterministic embedding.
+    retriever = index.as_retriever(similarity_top_k=2)
     for number in (1, 50, 100):
         nodes = retriever.retrieve(f"Figure {number}")
         retrieved = LlamaIndexPipeline._nodes_to_result(None, f"Figure {number}", nodes)
-        record = retrieved["sources"][0]
-        assert int(record["page"]) == number
+        record = next(item for item in retrieved["sources"] if item.get("visual_asset_id"))
+        assert record["page"] == number
         assert record["visual_asset_id"] == candidates[number - 1].record["asset_id"]
 
     late = candidates[-1]
@@ -243,7 +292,9 @@ def test_hundred_figure_textbook_keeps_late_figures_searchable_and_delivers_pixe
     parts = result.model_message["content"]
     assert sum(part["type"] == "image_url" for part in parts) == 1
     assert base64.b64decode(parts[1]["image_url"]["url"].split(",", 1)[1]) == expected_pixels
-    assert late.record["asset_id"] in result.sources[0]["visual_asset_url"]
+    assert any(
+        late.record["asset_id"] in item.get("visual_asset_url", "") for item in result.sources
+    )
 
 
 @pytest.mark.parametrize("suffix", [".pdf", ".epub"])
@@ -369,6 +420,7 @@ def test_visual_preview_enforces_kb_scope_and_verified_bytes(tmp_path: Path, mon
 
 def test_rag_tool_sends_exact_retrieved_pixels_to_vision_model(tmp_path: Path, monkeypatch):
     from deeptutor.multi_user import knowledge_access
+    from deeptutor.services.workspace import context as workspace_context
     from deeptutor.tools import rag_tool
     from deeptutor.tools.builtin import RAGTool
 
@@ -380,6 +432,7 @@ def test_rag_tool_sends_exact_retrieved_pixels_to_vision_model(tmp_path: Path, m
         "resolve_for_rag",
         lambda kb_name: SimpleNamespace(name="kb", base_dir=tmp_path) if kb_name == "kb" else None,
     )
+    monkeypatch.setattr(workspace_context, "current_workspace_id", lambda: "study")
 
     async def search(**_kwargs):
         return {
@@ -407,7 +460,9 @@ def test_rag_tool_sends_exact_retrieved_pixels_to_vision_model(tmp_path: Path, m
     data_uri = parts[1]["image_url"]["url"]
     assert data_uri.startswith("data:image/png;base64,")
     assert base64.b64decode(data_uri.split(",", 1)[1]) == image.read_bytes()
-    assert result.sources[0]["visual_asset_url"].endswith(record.record["asset_id"])
+    assert result.sources[0]["visual_asset_url"].endswith(
+        f"{record.record['asset_id']}?dt_workspace=study"
+    )
     assert "base64" not in str(result.metadata)
 
     text_only = asyncio.run(
@@ -463,8 +518,10 @@ def test_rag_model_payload_is_bounded_to_two_images(tmp_path: Path, monkeypatch)
     assert sum(part["type"] == "image_url" for part in result.model_message["content"]) == 2
 
 
-def test_visual_message_reaches_next_model_request_without_stream_leak(tmp_path: Path):
-    from deeptutor.core.agentic.tool_dispatch import _collect_outcome
+def test_visual_message_reaches_next_model_request_without_stream_leak(tmp_path: Path, monkeypatch):
+    from deeptutor.runtime.agentic import loop as agent_loop
+    from deeptutor.runtime.agentic.labeled_step import LabeledStepResult
+    from deeptutor.runtime.agentic.tool_dispatch import DispatchOutcome, _collect_outcome
 
     kb_dir, source, image, parsed = _fixture(tmp_path)
     candidate = collect_visual_assets(parsed, source, kb_dir)[0]
@@ -526,11 +583,85 @@ def test_visual_message_reaches_next_model_request_without_stream_leak(tmp_path:
             stage="exploring",
         )
     )
-    assert len(capped.model_messages) == 3
+    assert len(capped.model_messages) == 2
+
+    captured = []
+
+    async def fake_step(**kwargs):
+        captured.append(list(kwargs["messages"]))
+        if len(captured) == 1:
+            return LabeledStepResult(
+                label="CALL_TOOLS",
+                text="",
+                tool_calls=[{"id": "tool-1", "name": "rag", "arguments": "{}"}],
+            )
+        return LabeledStepResult(label="FINISH", text="Done")
+
+    monkeypatch.setattr(agent_loop, "run_labeled_step", fake_step)
+
+    class Host:
+        async def guard_context_window(self, _messages):
+            pass
+
+        def build_iteration_trace_meta(self, _iteration):
+            return {}, {}
+
+        async def dispatch_tools(self, **_kwargs):
+            return outcome
+
+    protocol = agent_loop.LabelProtocol(
+        allowed=("CALL_TOOLS", "FINISH"),
+        terminal=frozenset({"FINISH"}),
+        intermediate=frozenset(),
+        final=frozenset(),
+        tool_label="CALL_TOOLS",
+    )
+    loop_result = asyncio.run(
+        agent_loop.run_agentic_loop(
+            initial_messages=[{"role": "user", "content": "What does the figure show?"}],
+            protocol=protocol,
+            client=object(),
+            model="gpt-4o",
+            completion_kwargs={},
+            binding="openai",
+            tool_schemas=[],
+            stream=stream,
+            source="chat",
+            stage="exploring",
+            max_iterations=2,
+            host=Host(),
+        )
+    )
+    assert loop_result.completed
+    assert "base64" not in str(loop_result.messages)
+    assert all(message.get("role") != "user" for message in loop_result.messages[1:])
+    next_request = captured[1]
+    assert next_request[-2]["role"] == "tool"
+    assert next_request[-1] == private_message
+    assert (
+        base64.b64decode(next_request[-1]["content"][1]["image_url"]["url"].split(",", 1)[1])
+        == image.read_bytes()
+    )
+    from deeptutor.services.llm.provider_core.anthropic_provider import AnthropicProvider
+    from deeptutor.services.llm.provider_core.openai_responses.converters import convert_messages
+
+    _system, responses_input = convert_messages(next_request)
+    response_image = responses_input[-1]["content"][1]
+    assert response_image["type"] == "input_image"
+    assert base64.b64decode(response_image["image_url"].split(",", 1)[1]) == image.read_bytes()
+    anthropic_image = AnthropicProvider._convert_image_block(next_request[-1]["content"][1])
+    assert anthropic_image["type"] == "image"
+    assert base64.b64decode(anthropic_image["source"]["data"]) == image.read_bytes()
+    _system, anthropic_messages = AnthropicProvider.__new__(AnthropicProvider)._convert_messages(
+        next_request
+    )
+    assert anthropic_messages[-1]["role"] == "user"
+    assert anthropic_messages[-1]["content"][0]["type"] == "tool_result"
+    assert anthropic_messages[-1]["content"][-1]["type"] == "image"
 
 
 def test_visual_messages_follow_complete_tool_reply_batch():
-    from deeptutor.agents.chat.agent_loop import _with_transient_model_messages
+    from deeptutor.runtime.agentic.messages import with_transient_model_messages
 
     messages = [
         {"role": "assistant", "tool_calls": [{"id": "rag"}, {"id": "other"}]},
@@ -544,7 +675,92 @@ def test_visual_messages_follow_complete_tool_reply_batch():
             "_after_tool_call_id": "rag",
         }
     ]
-    request = _with_transient_model_messages(messages, transient)
+    request = with_transient_model_messages(messages, transient)
     assert [item["role"] for item in request] == ["assistant", "tool", "tool", "user"]
     assert request[-1]["content"] == transient[0]["content"]
     assert messages[-1]["role"] == "tool"  # canonical history was not changed
+
+
+def test_visual_images_are_bounded_across_tool_rounds(monkeypatch):
+    from deeptutor.agents.loop.pipeline import IMAGE_TOKEN_GUARD_RESERVE, AgenticLoopPipeline
+    from deeptutor.runtime.agentic import loop as agent_loop
+    from deeptutor.runtime.agentic.labeled_step import LabeledStepResult
+    from deeptutor.runtime.agentic.tool_dispatch import DispatchOutcome
+
+    requests = []
+    guard_estimates = []
+
+    async def fake_step(**kwargs):
+        requests.append(kwargs["messages"])
+        if len(requests) <= 2:
+            tool_id = f"tool-{len(requests)}"
+            return LabeledStepResult(
+                label="CALL_TOOLS",
+                text="",
+                tool_calls=[{"id": tool_id, "name": "rag", "arguments": "{}"}],
+            )
+        return LabeledStepResult(label="FINISH", text="Done")
+
+    monkeypatch.setattr(agent_loop, "run_labeled_step", fake_step)
+
+    class Host:
+        async def guard_context_window(self, messages):
+            guard_estimates.append(AgenticLoopPipeline._estimate_messages_tokens(messages))
+
+        def build_iteration_trace_meta(self, _iteration):
+            return {}, {}
+
+        async def dispatch_tools(self, *, iteration, **_kwargs):
+            tool_id = f"tool-{iteration + 1}"
+            return DispatchOutcome(
+                tool_messages=[
+                    {"role": "tool", "tool_call_id": tool_id, "content": "Figure found"}
+                ],
+                model_messages=[
+                    {
+                        "role": "user",
+                        "_after_tool_call_id": tool_id,
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:image/png;base64,{iteration}{image}"},
+                            }
+                            for image in range(2)
+                        ],
+                    }
+                ],
+            )
+
+    protocol = agent_loop.LabelProtocol(
+        allowed=("CALL_TOOLS", "FINISH"),
+        terminal=frozenset({"FINISH"}),
+        intermediate=frozenset(),
+        final=frozenset(),
+        tool_label="CALL_TOOLS",
+    )
+    result = asyncio.run(
+        agent_loop.run_agentic_loop(
+            initial_messages=[{"role": "user", "content": "Explain the figures"}],
+            protocol=protocol,
+            client=object(),
+            model="vision-model",
+            completion_kwargs={},
+            binding="openai",
+            tool_schemas=[],
+            stream=object(),
+            source="chat",
+            stage="exploring",
+            max_iterations=3,
+            host=Host(),
+        )
+    )
+    assert result.completed
+    images = [
+        part["image_url"]["url"]
+        for message in requests[2]
+        for part in (message.get("content") or [])
+        if isinstance(part, dict) and part.get("type") == "image_url"
+    ]
+    assert images == ["data:image/png;base64,10", "data:image/png;base64,11"]
+    assert guard_estimates[2] >= 2 * IMAGE_TOKEN_GUARD_RESERVE
+    assert "base64" not in str(result.messages)

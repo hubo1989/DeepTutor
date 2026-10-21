@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
+from copy import deepcopy
 from dataclasses import dataclass
 
 from deeptutor.services.config import resolve_embedding_runtime_config
@@ -32,95 +35,60 @@ class EmbeddingConfig:
     profile_generation: int | None = None
 
 
-def _get_byok_embedding_config() -> EmbeddingConfig | None:
-    """Resolve the current user's BYOK embedding profile when applicable."""
-    from deeptutor.multi_user.byok_policy import (
-        allowed_binding,
-        byok_runtime_enabled,
-        grant_service_enabled,
-        validate_endpoint,
-    )
-    from deeptutor.multi_user.byok_vault import ByokVaultError, UserByokCredentialVault
-    from deeptutor.multi_user.context import get_current_user
-    from deeptutor.multi_user.execution_source import (
-        get_execution_source,
-        resolve_execution_source,
-    )
-    from deeptutor.multi_user.grants import load_grant
-    from deeptutor.services.config.provider_runtime import EMBEDDING_PROVIDERS
-    from deeptutor.services.provider_registry import canonical_provider_name
+_scoped_config: ContextVar[EmbeddingConfig | None] = ContextVar("embedding_config", default=None)
 
-    current = get_current_user()
-    grant = load_grant(current.id)
-    source = get_execution_source()
-    vault = UserByokCredentialVault()
-    profiles = vault.list_profiles(current.id, service="embedding")
-    if not profiles:
-        if not current.is_admin and not grant_service_enabled(grant, "platform", "embedding"):
-            raise ValueError(
-                "No embedding source is enabled for your account. Configure BYOK or contact an administrator."
-            )
-        return None
-    preferences = vault.get_preferences(current.id)
+
+def scoped_embedding_config() -> EmbeddingConfig | None:
+    return _scoped_config.get()
+
+
+@contextmanager
+def embedding_config_scope(config: EmbeddingConfig):
+    """Bind one operation, including its worker threads, to a resolved model."""
+    token = _scoped_config.set(config)
     try:
-        resolved_source = source
-        if resolved_source is None or resolved_source.service != "embedding":
-            resolved_source = resolve_execution_source(
-                "embedding",
-                grant=grant,
-                preferences=preferences,
-                byok_profiles=profiles,
-            )
-        if not resolved_source.is_byok:
-            if not current.is_admin and not grant_service_enabled(grant, "platform", "embedding"):
-                raise ValueError("Platform embedding access is not enabled for your account.")
-            return None
-        profile, secret = vault.load_secret(current.id, str(resolved_source.profile_id))
-    except ByokVaultError as exc:
-        raise ValueError(
-            "The selected BYOK embedding profile is unavailable; update your BYOK settings."
-        ) from exc
-
-    raw_provider = str(profile.get("provider") or "").strip().lower()
-    provider = canonical_provider_name(raw_provider) or raw_provider
-    if not byok_runtime_enabled("embedding") or not allowed_binding("embedding", provider):
-        raise ValueError("Embedding BYOK is not enabled for this provider")
-    model = str(profile.get("model") or "").strip()
-    if not model:
-        raise ValueError("Embedding BYOK profile must specify a model")
-    spec = EMBEDDING_PROVIDERS.get(provider)
-    if spec is None:
-        raise ValueError("Unsupported embedding BYOK provider")
-    endpoint = str(profile.get("base_url") or "").strip() or spec.default_api_base
-    validated_endpoint = validate_endpoint(endpoint, service="embedding", binding=provider)
-    if not validated_endpoint:
-        raise ValueError("Embedding BYOK profile has no usable endpoint")
-    endpoint = validated_endpoint
-    dimension = int(profile.get("dimension") or 0)
-    return EmbeddingConfig(
-        model=model,
-        api_key=secret,
-        base_url=endpoint,
-        effective_url=endpoint,
-        binding=provider,
-        provider_name=provider,
-        provider_mode=spec.mode,
-        dim=max(0, dimension),
-        source="byok",
-        profile_id=str(profile.get("id") or ""),
-        profile_generation=int(profile.get("generation") or 0),
-    )
+        yield
+    finally:
+        _scoped_config.reset(token)
 
 
-def get_embedding_config() -> EmbeddingConfig:
+def get_embedding_config(
+    selection: dict | None = None, *, catalog: dict | None = None
+) -> EmbeddingConfig:
     """Load embedding config from provider runtime resolver."""
-    byok = _get_byok_embedding_config()
-    if byok is not None:
-        return byok
-    resolved = resolve_embedding_runtime_config()
+    if selection is None and catalog is None and _scoped_config.get() is not None:
+        return _scoped_config.get()
+    if selection is not None:
+        from deeptutor.services.config import get_model_catalog_service
+
+        catalog = deepcopy(catalog if catalog is not None else get_model_catalog_service().load())
+        service = catalog.get("services", {}).get("embedding", {})
+        profile = next(
+            (p for p in service.get("profiles", []) if p.get("id") == selection.get("profile_id")),
+            None,
+        )
+        model = next(
+            (
+                m
+                for m in (profile or {}).get("models", [])
+                if m.get("id") == selection.get("model_id")
+            ),
+            None,
+        )
+        if profile is None or model is None:
+            raise ValueError(
+                "The embedding model bound to this knowledge base was deleted. Select another embedding model to re-index it."
+            )
+        service["active_profile_id"] = profile["id"]
+        service["active_model_id"] = model["id"]
+    resolved = (
+        resolve_embedding_runtime_config(catalog=catalog)
+        if catalog is not None
+        else resolve_embedding_runtime_config()
+    )
 
     if not resolved.model:
-        raise ValueError("Embedding model not set. Please configure it in Settings > Catalog.")
+        raise ValueError("Embedding model not set. Configure it in Settings > Embedding models.")
 
     if not resolved.effective_url:
         raise ValueError(
@@ -129,7 +97,8 @@ def get_embedding_config() -> EmbeddingConfig:
 
     if resolved.provider_mode != "local" and not resolved.api_key:
         raise ValueError(
-            "Embedding API key not set. Please configure the active profile in Settings > Catalog."
+            "Embedding API key not set. Configure the active profile in "
+            "Settings > Embedding models."
         )
 
     return EmbeddingConfig(

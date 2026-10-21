@@ -408,10 +408,10 @@ class _FakeRuntimeSettings:
 @pytest.mark.parametrize(
     ("path", "payload"),
     [
-        ("/rag-pipelines/pageindex/config", {"api_base_url": "https://example.test"}),
-        ("/rag-pipelines/llamaindex/config", {"top_k": 3}),
-        ("/rag-pipelines/graphrag/config", {"community_level": 2}),
-        ("/rag-pipelines/lightrag/config", {"top_k": 3}),
+        ("/knowledge-bases/rag-pipelines/pageindex/config", {"api_base_url": "https://example.test"}),
+        ("/knowledge-bases/rag-pipelines/llamaindex/config", {"top_k": 3}),
+        ("/knowledge-bases/rag-pipelines/graphrag/config", {"community_level": 2}),
+        ("/knowledge-bases/rag-pipelines/lightrag/config", {"top_k": 3}),
     ],
 )
 def test_global_rag_pipeline_settings_require_admin(
@@ -422,15 +422,15 @@ def test_global_rag_pipeline_settings_require_admin(
 
     fake = _FakeRuntimeSettings()
     monkeypatch.setattr(config_module, "get_runtime_settings_service", lambda: fake)
-    app = _app_with(knowledge.router, "/api/v1/knowledge", auth_tokens)
+    app = _app_with(knowledge.router, "/api", auth_tokens)
 
     with TestClient(app) as client:
         read_denied = client.get(
-            f"/api/v1/knowledge{path}",
+            f"/api{path}",
             headers=_auth("alice-token"),
         )
         denied = client.put(
-            f"/api/v1/knowledge{path}",
+            f"/api{path}",
             headers=_auth("alice-token"),
             json=payload,
         )
@@ -442,8 +442,8 @@ def test_global_rag_pipeline_settings_require_admin(
 @pytest.mark.parametrize(
     "path",
     [
-        "/api/v1/knowledge/rag-pipelines/model-options",
-        "/api/v1/knowledge/rag-pipelines/llamaindex/preflight",
+        "/api/knowledge-bases/rag-pipelines/model-options",
+        "/api/knowledge-bases/rag-pipelines/llamaindex/preflight",
     ],
 )
 def test_global_rag_catalog_and_preflight_require_admin(
@@ -451,7 +451,7 @@ def test_global_rag_catalog_and_preflight_require_admin(
 ) -> None:
     from deeptutor.api.routers import knowledge
 
-    app = _app_with(knowledge.router, "/api/v1/knowledge", auth_tokens)
+    app = _app_with(knowledge.router, "/api", auth_tokens)
     with TestClient(app) as client:
         response = client.get(path, headers=_auth("alice-token"))
     assert response.status_code == 403
@@ -460,13 +460,13 @@ def test_global_rag_catalog_and_preflight_require_admin(
 @pytest.mark.parametrize(
     ("path", "payload"),
     [
-        ("/connect-obsidian", {"name": "vault", "vault_path": "/tmp/vault"}),
+        ("/knowledge-bases/connect-obsidian", {"name": "vault", "vault_path": "/tmp/vault"}),
         (
-            "/probe-folder",
+            "/knowledge-bases/probe-folder",
             {"folder_path": "/tmp/index", "rag_provider": "llamaindex"},
         ),
         (
-            "/connect-folder",
+            "/knowledge-bases/connect-folder",
             {
                 "name": "linked",
                 "folder_path": "/tmp/index",
@@ -474,11 +474,11 @@ def test_global_rag_catalog_and_preflight_require_admin(
             },
         ),
         (
-            "/probe-lightrag-server",
+            "/knowledge-bases/probe-lightrag-server",
             {"server_url": "http://127.0.0.1:9621", "api_key": "secret"},
         ),
         (
-            "/connect-lightrag-server",
+            "/knowledge-bases/connect-lightrag-server",
             {
                 "name": "remote",
                 "server_url": "http://127.0.0.1:9621",
@@ -486,11 +486,11 @@ def test_global_rag_catalog_and_preflight_require_admin(
             },
         ),
         (
-            "/probe-ima",
+            "/knowledge-bases/probe-ima",
             {"client_id": "client", "api_key": "secret", "knowledge_base_id": "kb"},
         ),
         (
-            "/connect-ima",
+            "/knowledge-bases/connect-ima",
             {
                 "name": "ima",
                 "client_id": "client",
@@ -498,7 +498,7 @@ def test_global_rag_catalog_and_preflight_require_admin(
                 "knowledge_base_id": "kb",
             },
         ),
-        ("/owned/link-folder", {"folder_path": "/tmp/documents"}),
+        ("/knowledge-bases/owned/link-folder", {"folder_path": "/tmp/documents"}),
     ],
 )
 def test_host_and_remote_kb_connections_require_admin(
@@ -506,10 +506,10 @@ def test_host_and_remote_kb_connections_require_admin(
 ) -> None:
     from deeptutor.api.routers import knowledge
 
-    app = _app_with(knowledge.router, "/api/v1/knowledge", auth_tokens)
+    app = _app_with(knowledge.router, "/api", auth_tokens)
     with TestClient(app) as client:
         response = client.post(
-            f"/api/v1/knowledge{path}",
+            f"/api{path}",
             headers=_auth("alice-token"),
             json=payload,
         )
@@ -520,9 +520,9 @@ def test_host_and_remote_kb_connections_require_admin(
 @pytest.mark.parametrize(
     ("method", "path"),
     [
-        ("get", "/owned/linked-folders"),
-        ("delete", "/owned/linked-folders/folder-1"),
-        ("post", "/owned/sync-folder/folder-1"),
+        ("get", "/knowledge-bases/owned/linked-folders"),
+        ("delete", "/knowledge-bases/owned/linked-folders/folder-1"),
+        ("post", "/knowledge-bases/owned/sync-folder/folder-1"),
     ],
 )
 def test_linked_folder_management_requires_admin(
@@ -530,11 +530,11 @@ def test_linked_folder_management_requires_admin(
 ) -> None:
     from deeptutor.api.routers import knowledge
 
-    app = _app_with(knowledge.router, "/api/v1/knowledge", auth_tokens)
+    app = _app_with(knowledge.router, "/api", auth_tokens)
     with TestClient(app) as client:
         response = client.request(
             method,
-            f"/api/v1/knowledge{path}",
+            f"/api{path}",
             headers=_auth("alice-token"),
         )
 
@@ -545,10 +545,10 @@ def test_ordinary_kb_upload_route_is_not_admin_gated(mu_isolated_root, auth_toke
     """A regular user's own uploaded KB remains a supported Phase-1 path."""
     from deeptutor.api.routers import knowledge
 
-    app = _app_with(knowledge.router, "/api/v1/knowledge", auth_tokens)
+    app = _app_with(knowledge.router, "/api", auth_tokens)
     with TestClient(app) as client:
         response = client.post(
-            "/api/v1/knowledge/create",
+            "/api/knowledge-bases/my-kb/upload",
             headers=_auth("alice-token"),
         )
 
@@ -612,7 +612,7 @@ def test_subagent_local_cli_connection_and_message_require_admin(
         "cwd": "/tmp/project",
         "partner_id": "",
     }
-    monkeypatch.setattr(subagents, "current_kb_manager", lambda: manager)
+    monkeypatch.setattr(subagents, "account_kb_manager", lambda: manager)
     monkeypatch.setattr(subagents, "list_backend_kinds", lambda: ["codex", "partner"])
     monkeypatch.setattr(subagents, "assert_path_allowed", lambda path: Path(path))
 
@@ -672,7 +672,7 @@ def test_partner_http_chat_requires_model_access(
     monkeypatch.setattr(partners, "get_partner_manager", lambda: _StubManager())
     monkeypatch.setattr(partners, "can_use_partner", lambda _pid, _user=None: True)
 
-    async def must_not_start(_partner_id: str):
+    async def must_not_start(_partner_id: str, **_kwargs):
         raise AssertionError("partner execution must not start")
 
     monkeypatch.setattr(partners, "_ensure_running_partner", must_not_start)
@@ -714,7 +714,7 @@ def test_partner_http_chat_requires_partner_assignment(
     monkeypatch.setattr(partners, "get_partner_manager", lambda: _StubManager())
     monkeypatch.setattr(partners, "can_use_partner", lambda _pid, _user=None: True)
 
-    async def must_not_start(_partner_id: str):
+    async def must_not_start(_partner_id: str, **_kwargs):
         raise AssertionError("unassigned partner execution must not start")
 
     monkeypatch.setattr(partners, "_ensure_running_partner", must_not_start)

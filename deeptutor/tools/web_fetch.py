@@ -11,8 +11,8 @@ Security stance (kept tight on purpose because the model decides
 arguments, not a human):
 
 * Only ``http://`` / ``https://`` schemes accepted.
-* IP literals and hostnames resolving to **private / loopback / link-local**
-  ranges are rejected up front. The strict-host check happens both
+* IP literals and hostnames resolving to **any private / loopback / link-local**
+  address are rejected up front. The strict-host check happens both
   pre-flight (against the parsed URL) and post-redirect (against the
   final resolved URL) so a redirect to ``127.0.0.1`` can't slip past.
 * Response size is hard-capped at ``MAX_RESPONSE_BYTES``; we stop reading
@@ -23,13 +23,14 @@ arguments, not a human):
 
 from __future__ import annotations
 
+import codecs
 from dataclasses import dataclass
 import ipaddress
 import logging
 import re
 import socket
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse, urlsplit
 
 import httpx
 
@@ -40,6 +41,7 @@ MAX_RESPONSE_BYTES = 4 * 1024 * 1024  # 4 MB — safety cap on raw download
 DEFAULT_TIMEOUT_S = 15.0
 DEFAULT_USER_AGENT = "DeepTutor/1.0 (+https://hkuds.dev/deeptutor)"
 ALLOWED_SCHEMES = {"http", "https"}
+MAX_REDIRECTS = 5
 
 # Cheap inline HTML → text. Good enough for blog / docs / arxiv abstract
 # pages. For JS-heavy SPAs the tool will return the bare HTML scaffold —
@@ -98,29 +100,45 @@ async def fetch_url_as_markdown(
     if not host:
         return FetchOutcome(ok=False, error="URL is missing a host.")
     validator = host_validator or _is_disallowed_host
-    if validator(host):
-        return FetchOutcome(
-            ok=False,
-            error=f"Refusing to fetch private/loopback host: {host}.",
-        )
 
     factory = client_factory or _default_client_factory
+    current_url = url_clean
     try:
         async with factory(timeout=timeout_s, user_agent=user_agent) as client:
-            try:
+            # Redirects are followed by hand so that every hop is validated
+            # *before* it is contacted. `follow_redirects=True` only lets us
+            # inspect the final URL, by which point the client has already
+            # connected to each intermediate host.
+            for hop in range(MAX_REDIRECTS + 1):
+                current = urlsplit(current_url)
+                current_host = (current.hostname or "").strip()
+                if current.scheme.lower() not in ALLOWED_SCHEMES or not current_host:
+                    return FetchOutcome(ok=False, error="Redirect target is not a valid HTTP URL.")
+                if validator(current_host):
+                    return FetchOutcome(
+                        ok=False,
+                        error=(
+                            f"Redirect to private/loopback host blocked: {current_host}."
+                            if hop
+                            else f"Refusing to fetch private/loopback host: {current_host}."
+                        ),
+                    )
                 async with client.stream(
                     "GET",
-                    url_clean,
-                    headers={"User-Agent": user_agent, "Accept": "text/html,*/*;q=0.5"},
-                    follow_redirects=True,
+                    current_url,
+                    headers={
+                        "User-Agent": user_agent,
+                        "Accept": "text/html,*/*;q=0.5",
+                    },
+                    follow_redirects=False,
                 ) as response:
-                    final_url = str(response.url)
-                    final_host = (urlparse(final_url).hostname or "").strip()
-                    if final_host and validator(final_host):
-                        return FetchOutcome(
-                            ok=False,
-                            error=f"Redirect to private/loopback host blocked: {final_host}.",
-                        )
+                    location = response.headers.get("location", "")
+                    if response.status_code in {301, 302, 303, 307, 308} and location:
+                        if hop >= MAX_REDIRECTS:
+                            return FetchOutcome(ok=False, error="Too many HTTP redirects.")
+                        current_url = urljoin(current_url, location)
+                        continue
+                    final_url = str(response.url) or current_url
                     if response.status_code >= 400:
                         return FetchOutcome(
                             ok=False,
@@ -128,12 +146,15 @@ async def fetch_url_as_markdown(
                             error=f"HTTP {response.status_code} from {final_url}.",
                         )
                     raw = await _bounded_read(response, MAX_RESPONSE_BYTES)
-            except httpx.HTTPError as exc:
-                return FetchOutcome(ok=False, error=f"Network error: {exc}")
+                    break
+            else:  # pragma: no cover — the loop returns at its redirect limit
+                return FetchOutcome(ok=False, error="Too many HTTP redirects.")
+    except httpx.HTTPError as exc:
+        return FetchOutcome(ok=False, error=f"Network error: {exc}")
     except Exception as exc:  # pragma: no cover — defensive
         return FetchOutcome(ok=False, error=f"Unexpected fetch failure: {exc}")
 
-    title, body = _extract_readable(raw)
+    title, body = _extract_readable(raw, base_url=final_url)
     truncated = False
     if len(body) > max_chars:
         body = body[:max_chars].rstrip() + "\n…[truncated]"
@@ -158,36 +179,34 @@ def _is_disallowed_host(host: str) -> bool:
     """Block hosts that resolve to private / loopback / link-local IPs.
 
     Handles both raw IP literals (``127.0.0.1`` / ``[::1]``) and DNS
-    names (resolves them once via ``socket.getaddrinfo`` and checks ALL
-    returned addresses). DNS failures are treated as disallowed to fail
-    closed when in doubt.
+    names. Every resolved address must be public because the HTTP client later
+    connects by hostname and may select any answer. DNS failures and malformed
+    answer rows are treated as disallowed so validation fails closed.
     """
+
     candidate = host.strip("[]")
-    # Direct IP literal check
     try:
-        ip = ipaddress.ip_address(candidate)
-        return _is_disallowed_ip(ip)
+        return _is_disallowed_ip(ipaddress.ip_address(candidate))
     except ValueError:
         pass
-    # Common loopback / metadata hostnames before DNS even tries.
     lower = candidate.lower()
     if lower in {"localhost", "ip6-localhost", "ip6-loopback"}:
         return True
     if lower.endswith(".local"):
         return True
-    # Resolve once; treat resolution failure as "disallowed" so a typo
-    # plus an unlucky stub doesn't accidentally hit a private network.
     try:
         infos = socket.getaddrinfo(candidate, None)
     except OSError:
         return True
+    if not infos:
+        return True
     for info in infos:
-        addr = info[4][0]
         try:
-            if _is_disallowed_ip(ipaddress.ip_address(addr)):
-                return True
-        except ValueError:
-            continue
+            ip = ipaddress.ip_address(info[4][0])
+        except (IndexError, TypeError, ValueError):
+            return True
+        if _is_disallowed_ip(ip):
+            return True
     return False
 
 
@@ -206,22 +225,92 @@ async def _bounded_read(response: httpx.Response, limit: int) -> str:
     """Stream-read at most ``limit`` bytes from ``response`` then stop.
 
     Avoids holding hundreds of MB if a server (or an LLM-supplied URL)
-    points at a huge resource. Encoding falls back from response.encoding
-    → utf-8 with replacement.
+    points at a huge resource. The charset comes from
+    :py:func:`_detect_encoding`; undecodable bytes are replaced.
     """
     buf = bytearray()
     async for chunk in response.aiter_bytes():
         buf.extend(chunk)
         if len(buf) >= limit:
             break
-    encoding = response.encoding or "utf-8"
+    encoding = _detect_encoding(bytes(buf), response.headers.get("content-type", ""))
     try:
         return buf.decode(encoding, errors="replace")
     except (LookupError, TypeError):
         return buf.decode("utf-8", errors="replace")
 
 
-def _extract_readable(html_or_text: str) -> tuple[str, str]:
+# Byte-order marks take precedence over every declared charset (WHATWG
+# "decode"). ``utf-8-sig`` also drops the mark from the decoded text.
+_BOMS = (
+    (b"\xef\xbb\xbf", "utf-8-sig"),
+    (b"\xff\xfe", "utf-16"),
+    (b"\xfe\xff", "utf-16"),
+)
+_HEADER_CHARSET_RE = re.compile(r"""charset\s*=\s*["']?([\w.:-]+)""", re.IGNORECASE)
+# ``<meta charset="gbk">`` and ``<meta http-equiv="Content-Type"
+# content="text/html; charset=gbk">``; browsers look for either in the
+# first 1024 bytes when the HTTP header names no charset.
+_META_CHARSET_RE = re.compile(
+    rb"""<meta[^>]+?charset\s*=\s*["']?\s*([\w.:-]+)""",
+    re.IGNORECASE,
+)
+_META_PRESCAN_BYTES = 1024
+# Labels pages commonly declare for a superset encoding. Browsers decode them
+# as the superset (WHATWG Encoding), so a page labelled ``gb2312`` that uses
+# GBK-only characters still renders; Python's strict codecs would not.
+_CHARSET_SUPERSETS = {
+    "gb2312": "gb18030",
+    "gbk": "gb18030",
+    "x-gbk": "gb18030",
+    "iso-8859-1": "cp1252",
+    "latin1": "cp1252",
+    "latin-1": "cp1252",
+    "us-ascii": "cp1252",
+    "ascii": "cp1252",
+}
+
+
+def _usable_charset(label: str | bytes | None) -> str | None:
+    if not label:
+        return None
+    if isinstance(label, bytes):
+        label = label.decode("ascii", errors="ignore")
+    name = label.strip().lower()
+    name = _CHARSET_SUPERSETS.get(name, name)
+    try:
+        codecs.lookup(name)
+    except LookupError:
+        return None
+    return name
+
+
+def _detect_encoding(body: bytes, content_type: str) -> str:
+    """Pick the charset for ``body`` the way a browser would.
+
+    Order: byte-order mark, the ``charset`` parameter of the HTTP
+    ``Content-Type``, a ``<meta>`` charset declaration near the top of the
+    document, then UTF-8. Without the ``<meta>`` step every page that only
+    declares its charset in the markup (common for GBK / Shift_JIS / EUC-KR
+    sites) is decoded as UTF-8 and comes back as replacement characters.
+    """
+    for bom, encoding in _BOMS:
+        if body.startswith(bom):
+            return encoding
+    header_match = _HEADER_CHARSET_RE.search(content_type or "")
+    declared = _usable_charset(header_match.group(1) if header_match else None)
+    if declared:
+        return declared
+    meta_match = _META_CHARSET_RE.search(body[:_META_PRESCAN_BYTES])
+    sniffed = _usable_charset(meta_match.group(1) if meta_match else None)
+    # A UTF-16 label in ASCII-compatible markup is a mislabel; browsers
+    # treat it as UTF-8, and decoding it as UTF-16 would garble everything.
+    if sniffed and not sniffed.startswith("utf-16"):
+        return sniffed
+    return "utf-8"
+
+
+def _extract_readable(html_or_text: str, base_url: str = "") -> tuple[str, str]:
     """Return ``(title, body_text)`` extracted from an HTML string.
 
     For non-HTML payloads (plain text, JSON dumps) just normalises
@@ -230,6 +319,18 @@ def _extract_readable(html_or_text: str) -> tuple[str, str]:
     """
     title = ""
     if "<" in html_or_text and ">" in html_or_text:
+        # Immersive Reading needs article structure rather than a page-wide
+        # text dump. Reuse the product's mature documentation/article extractor
+        # when lxml is available; the regex path below remains a lean-install
+        # fallback for malformed pages or environments without that dependency.
+        try:
+            from deeptutor.services.web_source.html_extractor import (
+                extract_article_markdown,
+            )
+
+            return extract_article_markdown(html_or_text, base_url=base_url)
+        except Exception:
+            logger.debug("structured HTML extraction failed; using text fallback", exc_info=True)
         title_match = _TITLE_RE.search(html_or_text)
         if title_match:
             title = re.sub(r"\s+", " ", title_match.group(1)).strip()

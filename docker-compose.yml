@@ -16,9 +16,32 @@
 # Local LLM (LM Studio / Ollama / vLLM):
 #   Use "host.docker.internal" instead of "localhost" in provider base_url fields.
 #   Configure provider endpoints in data/user/settings/model_catalog.json or the UI.
+#
+# Content workspace:
+#   DEEPTUTOR_WORKSPACE_HOST=/absolute/host/folder python scripts/docker_compose.py up -d
+#   maps that folder to the stable in-container path /workspace. If omitted,
+#   ./data/user/workspace remains the default.
 # ============================================
 
 services:
+  # Redis is internal-only runtime coordination state. AOF keeps unflushed
+  # event/command streams available across a sidecar restart; business data
+  # remains in SQLite/PocketBase.
+  redis:
+    image: redis:7.4-alpine
+    container_name: deeptutor-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - ./data/redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - deeptutor-network
+
   # ============================================
   # PocketBase — optional auth + storage sidecar
   # Set integrations.pocketbase_url=http://pocketbase:8090 to activate.
@@ -72,6 +95,7 @@ services:
       # secrets. What it *does* carry for non-admin accounts is wider than
       # workspace subtrees — see the scope note on that service's own volumes.
       - ./data:/app/data
+      - "${DEEPTUTOR_WORKSPACE_HOST:-./data/user/workspace}:/workspace"
 
     environment:
       # Route untrusted shell exec to the runner sidecar (SYSTEM isolation).
@@ -93,13 +117,12 @@ services:
       - DEEPTUTOR_SMTP_TIMEOUT_SECONDS=${DEEPTUTOR_SMTP_TIMEOUT_SECONDS:-10}
       # BYOK credentials are encrypted at rest. Supply the master key through
       # a deployment-only env file or a mounted Docker secret.
-      # Empty leaves the persisted admin policy in control; an explicit false
-      # remains a deployment-level emergency kill switch.
       - DEEPTUTOR_BYOK_ENABLED=${DEEPTUTOR_BYOK_ENABLED:-}
       - DEEPTUTOR_BYOK_MASTER_KEY=${DEEPTUTOR_BYOK_MASTER_KEY:-}
       - DEEPTUTOR_BYOK_MASTER_KEY_FILE=${DEEPTUTOR_BYOK_MASTER_KEY_FILE:-}
       - DEEPTUTOR_BYOK_USAGE_DB_PATH=${DEEPTUTOR_BYOK_USAGE_DB_PATH:-/app/data/system/byok_usage.sqlite3}
-
+      - DEEPTUTOR_WORKSPACE_ROOT=/workspace
+      - DEEPTUTOR_WORKSPACE_ALLOWED_ROOTS=/workspace
       # Optional dependencies, re-applied on every start (#762). Installing
       # these with `docker exec` does not survive `compose down`, so declare
       # them here instead. Both are idempotent and never fatal; the pip cache
@@ -109,14 +132,22 @@ services:
       # - DEEPTUTOR_EXTRAS=math-animator,partners
       # - DEEPTUTOR_APT_PACKAGES=ffmpeg
 
+      # Unraid / NAS bind mounts: set these to the host owner of ./data
+      # instead of chowning the volume or running the app as root.
+      # The entrypoint remaps the unprivileged `deeptutor` user to these ids.
+      # - PUID=99
+      # - PGID=100
+
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:${DEEPTUTOR_DOCKER_BACKEND_PORT:-8001}/"]
+      test: ["CMD", "curl", "-f", "http://localhost:${DEEPTUTOR_DOCKER_BACKEND_PORT:-8001}/health/ready"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 60s
 
     depends_on:
+      redis:
+        condition: service_healthy
       pocketbase:
         condition: service_healthy
       sandbox-runner:
@@ -143,21 +174,22 @@ services:
     container_name: deeptutor-sandbox-runner
     restart: unless-stopped
 
-    # The stock runner only receives the admin task workspace. It is a shared
-    # process namespace, so mounting the whole data/users tree would let one
-    # account's command read every other account's workspace. Per-user exec
-    # requires a separately isolated runner deployment and explicit policy opt-in.
-    # data/system is never mounted here: it contains auth state, provider keys,
-    # and per-owner secrets. Installed CLI apps live in a separate read-only
-    # tree so the runner can execute them without being able to replace them.
+    # Share the content workspace at the SAME stable path as the main app.
+    # The whole tree is readable so workspace_list/read and shell tools can use
+    # user files. Only outputs/ is writable: a command cannot modify source
+    # material, user settings, or any other host path. The runner never sees
+    # data/system, data/users, or the rest of the application data tree.
     volumes:
-      - ./data/user/workspace:/app/data/user/workspace
-      # Installed CLI apps, READ-ONLY. This is the one directory the runner
+      - "${DEEPTUTOR_WORKSPACE_HOST:-./data/user/workspace}:/workspace:ro"
+      - "${DEEPTUTOR_WORKSPACE_HOST:-./data/user/workspace}/outputs:/workspace/outputs"      # Installed CLI apps, READ-ONLY. This is the one directory the runner
       # executes code from that it did not receive in a request, so it must not
       # be writable here: an escaped command that could overwrite an app's entry
       # point would run as that app in every later turn, for every account.
       # Installing writes it from the main container instead (services/cli_apps).
       - ./data/cli-apps:/app/data/cli-apps:ro
+
+    environment:
+      - DEEPTUTOR_RUNNER_ALLOWED_WORKDIRS=/workspace/outputs
 
     # No `ports:` — intentionally not published to the host.
 

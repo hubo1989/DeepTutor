@@ -1,7 +1,7 @@
 """Unified MinerU parsing entrypoint.
 
-Hides the local-CLI vs cloud-API split behind one function so callers (the
-mimic-mode adapter) never branch on backend. Both branches converge on the
+Hides the local-CLI vs cloud-API split behind one function so callers never
+branch on backend. Both branches converge on the
 same contract: write MinerU artifacts into a working directory and return its
 path. Backend selection comes from ``document_parsing.json`` via
 :func:`resolve_mineru_config`.
@@ -22,40 +22,48 @@ from .config import (
     MinerUError,
     resolve_mineru_config,
 )
+from .formats import MINERU_PDF_FORMATS, MINERU_SUPPORTED_FORMATS
 from .local import LocalParseReason, parse_document_with_mineru_result
 
 logger = logging.getLogger(__name__)
 
 # PATH-lookup order matches ``check_mineru_installed`` in local.py so the
 # probe reports the same command the parse subprocess will actually use.
-_LOCAL_CLI_COMMANDS = ("magic-pdf", "mineru")
+_LOCAL_CLI_COMMANDS = ("mineru", "magic-pdf")
 
-# One actionable message per local-parse failure reason. The install/cloud
-# hint is deliberately limited to CLI_MISSING: a runtime failure must not be
-# reported as a missing installation.
+#: One actionable message per local-parse failure reason. The install/cloud
+#: hint is deliberately limited to ``CLI_MISSING``: a runtime failure must not
+#: be reported as a missing installation (issue #1612, outcome 4).
 _LOCAL_FAILURE_MESSAGES: dict[LocalParseReason, str] = {
+    LocalParseReason.TIMEOUT: "Local MinerU parsing timed out: {detail}",
+    LocalParseReason.CANCELLED: "Local MinerU parsing was cancelled: {detail}",
     LocalParseReason.CLI_MISSING: (
-        "Local MinerU parsing failed. Ensure MinerU is installed or switch to "
-        "cloud mode in Settings -> MinerU."
+        "Local MinerU parsing failed. Ensure MinerU is installed "
+        "(`pip install -U 'mineru[all]>=3.4.5'`) or switch to cloud mode in "
+        "Settings → MinerU."
     ),
     LocalParseReason.INPUT_MISSING: (
         "MinerU could not read the source file ({detail}). It may have been "
         "moved or deleted before parsing started."
     ),
-    LocalParseReason.UNSUPPORTED_INPUT: ("MinerU does not support this input type ({detail})."),
+    LocalParseReason.UNSUPPORTED_INPUT: (
+        "MinerU does not support this input type ({detail}). Supported inputs "
+        "are PDF, common raster images, DOCX, PPTX, and XLSX."
+    ),
     LocalParseReason.LEGACY_CLI_INPUT: (
         "The legacy magic-pdf CLI only accepts PDF files. Install the current "
-        "MinerU CLI to parse images, DOCX, PPTX, or XLSX."
+        "MinerU CLI (`pip install -U 'mineru[all]>=3.4.5'`) to parse images, "
+        "DOCX, PPTX, or XLSX."
     ),
     LocalParseReason.NONZERO_EXIT: (
         "Local MinerU parsing failed at runtime (the CLI is installed). Last "
         "output:\n{detail}\nCheck the source file, local model files and "
-        "available memory, or switch to cloud mode in Settings -> MinerU."
+        "available memory, or switch to cloud mode in Settings → MinerU."
     ),
     LocalParseReason.NO_ARTIFACTS: (
         "MinerU finished but produced no output files ({detail}). Check that "
         "local models are downloaded and the output directory is writable, or "
-        "switch to cloud mode in Settings -> MinerU."
+        "switch to cloud mode in Settings → MinerU."
     ),
     LocalParseReason.EXCEPTION: "Local MinerU parsing was interrupted: {detail}",
 }
@@ -175,6 +183,41 @@ def _reserve_mineru_pages(
     return lease, commercial_lease, pages
 
 
+def parse_document_to_workdir(
+    source_path: str | Path,
+    output_base: str | Path,
+    *,
+    config: MinerUConfig | None = None,
+    on_output: Callable[[str], None] | None = None,
+) -> Path:
+    """Parse a MinerU-supported document or image into ``output_base``.
+
+    The current MinerU input set is intentionally validated here as well as in
+    :class:`ParseService`, because this module is also used directly by a few
+    adapters and tests.
+    """
+    cfg = config or resolve_mineru_config()
+    source_path = Path(source_path)
+    suffix = source_path.suffix.lower()
+    if suffix not in MINERU_SUPPORTED_FORMATS:
+        raise MinerUError(
+            f"MinerU does not support {suffix or 'files without an extension'}. "
+            "Supported inputs are PDF, common raster images, DOCX, PPTX, and XLSX."
+        )
+    output_base = Path(output_base)
+    output_base.mkdir(parents=True, exist_ok=True)
+
+    if cfg.is_cloud:
+        from .cloud import parse_cloud
+        from .normalization import working_copy
+
+        logger.info("Parsing %s via MinerU cloud API", source_path.name)
+        with working_copy(source_path, output_base, cfg, on_output) as upload_path:
+            return parse_cloud(upload_path, output_base, cfg, on_progress=on_output)
+
+    return _parse_local(source_path, output_base, config=cfg, on_output=on_output)
+
+
 def parse_pdf_to_workdir(
     pdf_path: str | Path,
     output_base: str | Path,
@@ -192,47 +235,39 @@ def parse_pdf_to_workdir(
     lines from whichever backend runs — raw CLI output locally, task-state
     summaries from the cloud poller. Raises :class:`MinerUError` on failure.
     """
-    cfg = config or resolve_mineru_config()
     pdf_path = Path(pdf_path)
-    output_base = Path(output_base)
-    output_base.mkdir(parents=True, exist_ok=True)
-
+    if pdf_path.suffix.lower() not in MINERU_PDF_FORMATS:
+        raise MinerUError(f"parse_pdf_to_workdir expects a PDF file: {pdf_path}")
+    cfg = config or resolve_mineru_config()
     lease, commercial_lease, page_count = _reserve_mineru_pages(
-        pdf_path,
-        cfg,
-        request_id=request_id,
+        pdf_path, cfg, request_id=request_id
     )
     try:
-        if cfg.is_cloud:
-            from .cloud import parse_cloud
-            from .normalization import working_copy
-
-            logger.info("Parsing %s via MinerU cloud API", pdf_path.name)
-            with working_copy(pdf_path, output_base, cfg, on_output) as upload_path:
-                result = parse_cloud(upload_path, output_base, cfg, on_progress=on_output)
-        else:
-            result = _parse_local(pdf_path, output_base, config=cfg, on_output=on_output)
+        result = parse_document_to_workdir(
+        pdf_path,
+        output_base,
+            config=config,
+            on_output=on_output,
+        )
     except BaseException:
-        try:
-            if lease is not None:
-                lease.release()
-        finally:
-            if commercial_lease is not None:
+        # Release both ledgers on failure; a legacy release error must surface.
+        if commercial_lease is not None:
+            try:
                 commercial_lease.release()
+            except Exception:
+                logger.exception("MinerU commercial lease release failed")
+        if lease is not None:
+            lease.release()
         raise
+    # Success: settle both ledgers. Every ledger owns an independent durable
+    # reservation, so commercial settlement still runs even when the legacy
+    # SQLite settle fails; the legacy error then surfaces to the caller.
     try:
         if lease is not None:
             lease.finalize(page_count)
     finally:
         if commercial_lease is not None:
-            try:
-                commercial_lease.finalize(
-                    page_count,
-                    usage_units={"pages": page_count},
-                    is_estimated=False,
-                )
-            except Exception as exc:
-                raise MinerUError(str(exc)) from exc
+            commercial_lease.finalize(page_count, usage_units={"pages": page_count}, is_estimated=False)
     return result
 
 
@@ -291,7 +326,7 @@ def local_cli_version(command: str, timeout: float = 60.0) -> str:
 
 
 def _parse_local(
-    pdf_path: Path,
+    source_path: Path,
     output_base: Path,
     *,
     config: MinerUConfig,
@@ -307,10 +342,26 @@ def _parse_local(
         if not probe["found"]:
             raise MinerUError(
                 f"Configured MinerU CLI path is not an executable file: {probe['path']}. "
-                "Fix it in Settings -> MinerU (or clear it to auto-detect from PATH).",
+                "Fix it in Settings → MinerU (or clear it to auto-detect from PATH).",
                 code=str(LocalParseReason.CLI_MISSING),
             )
         cli_command = probe["path"]
+    else:
+        probe = local_cli_probe()
+        if probe["found"]:
+            cli_command = probe["path"]
+
+    if (
+        cli_command
+        and Path(cli_command).name == "magic-pdf"
+        and source_path.suffix.lower() != ".pdf"
+    ):
+        raise MinerUError(
+            "The legacy magic-pdf CLI only accepts PDF files. Install the current "
+            "MinerU CLI (`pip install -U 'mineru[all]>=3.4.5'`) to parse images, "
+            "DOCX, PPTX, or XLSX.",
+            code=str(LocalParseReason.LEGACY_CLI_INPUT),
+        )
 
     # A lazy first-parse model download must honor the configured source and
     # custom address, not just the explicit Download button.
@@ -319,9 +370,9 @@ def _parse_local(
     # does, so the Windows render-thread guard belongs on this branch alone.
     subprocess_env = {**download_env, **render_env_overrides()}
 
-    logger.info("Parsing %s via local MinerU CLI (%s)", pdf_path.name, cli_command or "PATH")
+    logger.info("Parsing %s via local MinerU CLI (%s)", source_path.name, cli_command or "PATH")
     result = parse_document_with_mineru_result(
-        str(pdf_path),
+        str(source_path),
         str(output_base),
         on_output=on_output,
         cli_command=cli_command,
@@ -344,9 +395,9 @@ def _parse_local(
             code=str(reason),
             detail=result.detail,
         )
-    working_dir = output_base / pdf_path.stem
+    working_dir = output_base / source_path.stem
     if not working_dir.is_dir():
-        # Defensive: the CLI names its output dir after the PDF stem, but fall
+        # Defensive: the CLI names its output dir after the source stem, but fall
         # back to the newest sub-directory if that assumption ever breaks.
         subdirs = sorted(
             (d for d in output_base.iterdir() if d.is_dir()),
@@ -359,4 +410,10 @@ def _parse_local(
     return working_dir
 
 
-__all__ = ["MinerUError", "local_cli_probe", "local_cli_version", "parse_pdf_to_workdir"]
+__all__ = [
+    "MinerUError",
+    "local_cli_probe",
+    "local_cli_version",
+    "parse_document_to_workdir",
+    "parse_pdf_to_workdir",
+]

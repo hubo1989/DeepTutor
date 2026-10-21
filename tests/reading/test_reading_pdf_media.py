@@ -13,7 +13,6 @@ import random
 import pytest
 
 from deeptutor.reading.extract import extract_material
-from deeptutor.reading.store import ReadingStore
 from deeptutor.utils.document_images import find_markers
 
 
@@ -77,6 +76,27 @@ def test_pdf_images_become_locator_pinned_media(tmp_path) -> None:
         assert len(media_names) == locator_counts[locator]
 
 
+def test_reused_pdf_image_is_mapped_to_each_page(tmp_path) -> None:
+    pymupdf = pytest.importorskip("pymupdf")
+    pdf_path = tmp_path / "repeated-figure.pdf"
+    image = _png_bytes((150, 120), seed=7)
+    doc = pymupdf.open()
+    for page_index in range(1, 4):
+        page = doc.new_page(width=612, height=792)
+        page.insert_text((72, 60), _prose(f"Page {page_index}"))
+        page.insert_image(pymupdf.Rect(72, 100, 240, 180), stream=image)
+    doc.save(str(pdf_path))
+    doc.close()
+
+    extraction = extract_material(pdf_path)
+
+    assert len(extraction.units) == 3
+    assert [item.locator for item in extraction.media] == [1, 2, 3]
+    assert len({item.name for item in extraction.media}) == 1
+    for unit in extraction.units:
+        assert find_markers(unit) == [(1, extraction.media[0].name)]
+
+
 def test_text_only_pdf_has_no_media_and_no_marker(tmp_path) -> None:
     pdf_path = tmp_path / "plain.pdf"
     _build_pdf(pdf_path, images_per_page=[0, 0])
@@ -86,21 +106,3 @@ def test_text_only_pdf_has_no_media_and_no_marker(tmp_path) -> None:
     assert len(extraction.units) == 2
     assert extraction.media == ()
     assert all("[图片" not in unit for unit in extraction.units)
-
-
-def test_store_persists_pdf_media_index(tmp_path) -> None:
-    pytest.importorskip("pymupdf")
-    pdf_path = tmp_path / "figures.pdf"
-    _build_pdf(pdf_path, images_per_page=[2, 0])
-    store = ReadingStore(tmp_path / "reading")
-
-    manifest = store.ingest(pdf_path)
-
-    assert manifest.media_count == 2
-    rows = store.media_items(manifest.material_id)
-    assert [row["locator"] for row in rows] == [1, 1]
-    assert all(store.media_path(manifest.material_id, row["name"]) is not None for row in rows)
-    assert (
-        store.update_media_captions(manifest.material_id, {rows[0]["name"]: "visible chart"}) == 1
-    )
-    assert store.media_items(manifest.material_id)[0]["caption"] == "visible chart"

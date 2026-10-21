@@ -2,19 +2,13 @@
 
 from __future__ import annotations
 
-import asyncio
 from typing import Any
 
 import pytest
 
 from deeptutor.services.llm.config import LLMConfig
 from deeptutor.services.llm.exceptions import LLMAPIError
-from deeptutor.services.llm.factory import (
-    _commercial_factory_request_tokens,
-    _reserve_factory_quota,
-    complete,
-    stream,
-)
+from deeptutor.services.llm.factory import complete, complete_with_config, stream
 from deeptutor.services.llm.provider_core.base import LLMResponse
 
 
@@ -33,6 +27,10 @@ class _FakeProvider:
         self.stream_response = stream_response or LLMResponse(content=stream_chunk)
         self.stream_chunk = stream_chunk
         self.reasoning_chunk = reasoning_chunk
+        self.closed = 0
+
+    async def aclose(self) -> None:
+        self.closed += 1
 
     async def chat_with_retry(self, **kwargs: Any) -> LLMResponse:
         self.complete_kwargs = kwargs
@@ -49,29 +47,6 @@ class _FakeProvider:
         return self.stream_response
 
 
-class _CommercialLeaseProbe:
-    def __init__(self) -> None:
-        self.finalized: list[dict[str, Any]] = []
-        self.released = 0
-
-    async def finalize(self, quantity: int, **kwargs: Any) -> None:
-        self.finalized.append({"quantity": quantity, **kwargs})
-
-    async def release(self) -> None:
-        self.released += 1
-
-
-class _FailingQuotaLease:
-    def __init__(self) -> None:
-        self.released = 0
-
-    def finalize(self, _quantity: int) -> None:
-        raise RuntimeError("quota telemetry unavailable")
-
-    def release(self) -> None:
-        self.released += 1
-
-
 def _make_cfg(**overrides: Any) -> LLMConfig:
     defaults = dict(
         model="gpt-4o-mini",
@@ -85,33 +60,6 @@ def _make_cfg(**overrides: Any) -> LLMConfig:
     )
     defaults.update(overrides)
     return LLMConfig(**defaults)
-
-
-def test_factory_does_not_reserve_platform_quota_for_byok() -> None:
-    assert _reserve_factory_quota(_make_cfg(source="byok"), [], max_tokens=128) == (None, 0)
-
-
-def test_commercial_request_bound_includes_tool_and_response_schemas() -> None:
-    messages = [{"role": "user", "content": "hi"}]
-    baseline = _commercial_factory_request_tokens(messages, max_tokens=64)
-    with_schemas = _commercial_factory_request_tokens(
-        messages,
-        max_tokens=64,
-        request_options={
-            "tools": [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "lookup",
-                        "parameters": {"description": "x" * 2_000},
-                    },
-                }
-            ],
-            "response_format": {"schema": {"description": "y" * 2_000}},
-        },
-    )
-
-    assert with_schemas > baseline + 4_000
 
 
 @pytest.mark.asyncio
@@ -178,158 +126,6 @@ async def test_stream_merges_config_and_caller_extra_headers(monkeypatch) -> Non
 
 
 @pytest.mark.asyncio
-async def test_complete_error_response_still_finalizes_commercial_usage(monkeypatch) -> None:
-    cfg = _make_cfg()
-    provider = _FakeProvider(
-        complete_response=LLMResponse(
-            content="provider rejected final response",
-            finish_reason="error",
-            usage={"input_tokens": 5, "output_tokens": 1, "total_tokens": 6},
-        )
-    )
-    lease = _CommercialLeaseProbe()
-    monkeypatch.setattr("deeptutor.services.llm.factory.get_llm_config", lambda: cfg)
-    monkeypatch.setattr(
-        "deeptutor.services.llm.factory.get_runtime_provider",
-        lambda _config: provider,
-    )
-    monkeypatch.setattr(
-        "deeptutor.services.llm.factory._reserve_factory_commercial",
-        lambda *_args, **_kwargs: asyncio.sleep(0, result=(lease, 100)),
-    )
-
-    with pytest.raises(Exception, match="provider rejected final response"):
-        await complete("hello")
-
-    assert lease.released == 0
-    assert lease.finalized == [
-        {
-            "quantity": 6,
-            "usage_units": {
-                "input_tokens": 5,
-                "output_tokens": 1,
-                "total_tokens": 6,
-            },
-            "is_estimated": False,
-        }
-    ]
-
-
-@pytest.mark.asyncio
-async def test_complete_settles_commercial_when_legacy_quota_finalize_fails(monkeypatch) -> None:
-    cfg = _make_cfg()
-    provider = _FakeProvider(
-        complete_response=LLMResponse(
-            content="ok",
-            usage={"input_tokens": 4, "output_tokens": 2, "total_tokens": 6},
-        )
-    )
-    commercial_lease = _CommercialLeaseProbe()
-    monkeypatch.setattr("deeptutor.services.llm.factory.get_llm_config", lambda: cfg)
-    monkeypatch.setattr(
-        "deeptutor.services.llm.factory.get_runtime_provider", lambda _config: provider
-    )
-    monkeypatch.setattr(
-        "deeptutor.services.llm.factory._reserve_factory_commercial",
-        lambda *_args, **_kwargs: asyncio.sleep(0, result=(commercial_lease, 100)),
-    )
-    monkeypatch.setattr(
-        "deeptutor.services.llm.factory._reserve_factory_quota",
-        lambda *_args, **_kwargs: (_FailingQuotaLease(), 100),
-    )
-
-    with pytest.raises(RuntimeError, match="quota telemetry unavailable"):
-        await complete("hello")
-
-    assert commercial_lease.released == 0
-    assert commercial_lease.finalized[0]["quantity"] == 6
-
-
-@pytest.mark.asyncio
-async def test_stream_reports_finalize_failure_without_hanging_or_stranding_commercial(
-    monkeypatch,
-) -> None:
-    cfg = _make_cfg()
-    commercial_lease = _CommercialLeaseProbe()
-    monkeypatch.setattr("deeptutor.services.llm.factory.get_llm_config", lambda: cfg)
-    monkeypatch.setattr(
-        "deeptutor.services.llm.factory.get_runtime_provider",
-        lambda _config: _FakeProvider(
-            stream_chunk="A",
-            stream_response=LLMResponse(
-                content="A",
-                usage={"input_tokens": 4, "output_tokens": 1, "total_tokens": 5},
-            ),
-        ),
-    )
-    monkeypatch.setattr(
-        "deeptutor.services.llm.factory._reserve_factory_commercial",
-        lambda *_args, **_kwargs: asyncio.sleep(0, result=(commercial_lease, 100)),
-    )
-    monkeypatch.setattr(
-        "deeptutor.services.llm.factory._reserve_factory_quota",
-        lambda *_args, **_kwargs: (_FailingQuotaLease(), 100),
-    )
-    monkeypatch.setattr(
-        "deeptutor.services.llm.factory._start_byok_factory_usage",
-        lambda *_args, **_kwargs: (None, 0),
-    )
-
-    generator = stream("hello", stream_coalesce_seconds=0)
-    assert await asyncio.wait_for(generator.__anext__(), timeout=1) == "A"
-    with pytest.raises(Exception, match="quota telemetry unavailable"):
-        await asyncio.wait_for(generator.__anext__(), timeout=1)
-    await generator.aclose()
-
-    assert commercial_lease.released == 0
-    assert commercial_lease.finalized[0]["quantity"] == 5
-
-
-@pytest.mark.asyncio
-async def test_cancelled_factory_stream_with_output_is_still_metered(monkeypatch) -> None:
-    cfg = _make_cfg()
-    lease = _CommercialLeaseProbe()
-    hold = asyncio.Event()
-
-    class BlockingProvider(_FakeProvider):
-        async def chat_stream_with_retry(self, **kwargs: Any) -> LLMResponse:
-            await kwargs["on_content_delta"]("partial")
-            await hold.wait()
-            return LLMResponse(content="partial")
-
-    monkeypatch.setattr("deeptutor.services.llm.factory.get_llm_config", lambda: cfg)
-    monkeypatch.setattr(
-        "deeptutor.services.llm.factory.get_runtime_provider",
-        lambda _config: BlockingProvider(),
-    )
-    monkeypatch.setattr(
-        "deeptutor.services.llm.factory._reserve_factory_commercial",
-        lambda *_args, **_kwargs: asyncio.sleep(0, result=(lease, 100)),
-    )
-    monkeypatch.setattr(
-        "deeptutor.services.llm.factory._reserve_factory_quota",
-        lambda *_args, **_kwargs: (None, 0),
-    )
-    monkeypatch.setattr(
-        "deeptutor.services.llm.factory._start_byok_factory_usage",
-        lambda *_args, **_kwargs: (None, 0),
-    )
-
-    generator = stream("hello", stream_coalesce_seconds=0)
-    assert await generator.__anext__() == "partial"
-    await generator.aclose()
-
-    assert lease.released == 0
-    assert lease.finalized == [
-        {
-            "quantity": 100,
-            "usage_units": {"llm_tokens": 100},
-            "is_estimated": True,
-        }
-    ]
-
-
-@pytest.mark.asyncio
 async def test_explicit_call_inherits_matching_profile_headers_and_reasoning(
     monkeypatch,
 ) -> None:
@@ -365,34 +161,39 @@ async def test_explicit_call_inherits_matching_profile_headers_and_reasoning(
 
 
 @pytest.mark.asyncio
-async def test_explicit_byok_source_overrides_platform_active_config(monkeypatch) -> None:
-    """Factory calls retain BYOK accounting when context propagation is absent."""
-    cfg = _make_cfg(source="platform")
+async def test_complete_with_config_never_resolves_or_merges_global_config(monkeypatch) -> None:
+    snapshot = _make_cfg(extra_headers={}, reasoning_effort=None)
     provider = _FakeProvider()
     captured_config: dict[str, LLMConfig] = {}
 
-    monkeypatch.setattr("deeptutor.services.llm.factory.get_llm_config", lambda: cfg)
+    def _unexpected_resolver(**_kwargs: Any):
+        raise AssertionError("explicit config path must not resolve global config")
 
-    def _fake_get_runtime_provider(config: LLMConfig):
+    def _fake_build_isolated_provider(config: LLMConfig):
         captured_config["config"] = config
         return provider
 
+    monkeypatch.setattr("deeptutor.services.llm.factory._resolve_call_config", _unexpected_resolver)
+    monkeypatch.setattr("deeptutor.services.llm.factory.get_llm_config", _unexpected_resolver)
+    monkeypatch.setattr("deeptutor.services.llm.factory._resolve_provider_spec", lambda **_: None)
     monkeypatch.setattr(
-        "deeptutor.services.llm.factory.get_runtime_provider", _fake_get_runtime_provider
+        "deeptutor.services.llm.factory.build_isolated_provider",
+        _fake_build_isolated_provider,
     )
 
-    assert (
-        await complete(
-            "hello",
-            model=cfg.model,
-            api_key=cfg.api_key,
-            base_url=cfg.base_url,
-            binding=cfg.binding,
-            source="byok",
-        )
-        == "ok"
-    )
-    assert captured_config["config"].source == "byok"
+    assert await complete_with_config(snapshot, "hello") == "ok"
+    assert captured_config["config"] is snapshot
+    assert captured_config["config"].extra_headers == {}
+    assert provider.complete_kwargs["reasoning_effort"] is None
+    assert provider.closed == 1
+
+
+@pytest.mark.asyncio
+async def test_complete_with_config_rejects_identity_overrides() -> None:
+    snapshot = _make_cfg()
+
+    with pytest.raises(TypeError, match="reasoning_effort"):
+        await complete_with_config(snapshot, "hello", reasoning_effort="high")
 
 
 @pytest.mark.asyncio
@@ -418,6 +219,25 @@ async def test_stream_does_not_replay_reasoning_as_final_content(monkeypatch) ->
         chunks.append(chunk)
 
     assert chunks == ["<think>", "scratchpad", "</think>"]
+
+
+@pytest.mark.asyncio
+async def test_complete_does_not_return_duplicated_reasoning_as_content(monkeypatch) -> None:
+    cfg = _make_cfg()
+    provider = _FakeProvider(
+        complete_response=LLMResponse(
+            content="Let me draft ~320 words.",
+            reasoning_content="Let me draft ~320 words.",
+        )
+    )
+
+    monkeypatch.setattr("deeptutor.services.llm.factory.get_llm_config", lambda: cfg)
+    monkeypatch.setattr(
+        "deeptutor.services.llm.factory.get_runtime_provider",
+        lambda _config: provider,
+    )
+
+    assert await complete("hello") == ""
 
 
 @pytest.mark.asyncio

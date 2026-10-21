@@ -1,61 +1,53 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { AlertCircle, CheckCircle2, Loader2, Save } from "lucide-react";
+import {
+  AlertCircle,
+  CheckCircle2,
+  GraduationCap,
+  Loader2,
+  Save,
+} from "lucide-react";
+import { useTranslation } from "react-i18next";
 import McpToolGroups from "@/components/common/McpToolGroups";
 import { toggleToolName as toggleName } from "@/lib/mcp-tool-groups";
 import { fetchAdminResources, fetchUserGrant, saveUserGrant } from "../api";
-import type { GrantPayload, MultiUserResources } from "../types";
-import {
-  EMBEDDING_TOKEN_UNIT,
-  LLM_TOKEN_UNIT,
-  formatQuotaRaw,
-  parseQuotaInput,
-  quotaInputValue,
-} from "../quota-ui";
+import type {
+  GrantPayload,
+  LearningPolicy,
+  MultiUserResources,
+} from "../types";
 
 type SaveState = "idle" | "saving" | "saved" | "error";
 
 function emptyGrant(userId: string): GrantPayload {
   return {
-    version: 3,
+    version: 2,
     user_id: userId,
     models: { llm: [] },
-    platform: {
-      embedding: { enabled: false },
-      mineru: { enabled: false },
-    },
-    byok: {
-      // Match the safer server-side new-user default: BYOK access is an
-      // explicit admin grant, never something a newly created grant enables.
-      llm: { enabled: false },
-      embedding: { enabled: false },
-      mineru: { enabled: false },
-    },
     knowledge_bases: [],
     skills: [],
     partners: [],
     enabled_tools: null,
     mcp_tools: null,
     exec_enabled: null,
-    quota: {
-      llm: {
-        daily_tokens: 100000,
-        monthly_tokens: 1000000,
-      },
-      embedding: {
-        daily_tokens: 1000000,
-        monthly_tokens: 10000000,
-      },
-      mineru: {
-        daily_pages: 50,
-        monthly_pages: 500,
-        max_pages_per_file: 50,
-      },
-    },
-    token_quota: {
-      daily_tokens: 100000,
-      monthly_tokens: 1000000,
+    learning_policy: null,
+  };
+}
+
+const LEARNING_AGE_BANDS = ["6-8", "9-12", "13-15"] as const;
+
+function conservativeLearningPolicy(): LearningPolicy {
+  return {
+    age_band: "9-12",
+    locked_persona: "teacher",
+    allowed_capabilities: ["chat", "immersive_reading"],
+    default_capability: "immersive_reading",
+    allowed_surfaces: ["chat", "reading"],
+    reading: {
+      allow_upload: false,
+      material_ids: [],
+      extensions: [],
     },
   };
 }
@@ -77,48 +69,6 @@ function SectionTitle({ children }: { children: React.ReactNode }) {
     <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-[var(--muted-foreground)]">
       {children}
     </h3>
-  );
-}
-
-function QuotaInput({
-  label,
-  rawValue,
-  unit,
-  suffix,
-  rawSuffix = "tokens",
-  disabled,
-  onChange,
-}: {
-  label: string;
-  rawValue: number;
-  unit: number;
-  suffix: string;
-  rawSuffix?: string;
-  disabled: boolean;
-  onChange: (value: string) => void;
-}) {
-  return (
-    <label className="block">
-      <span className="mb-1 block text-[var(--muted-foreground)]">{label}</span>
-      <div className="flex items-center gap-1.5">
-        <input
-          type="number"
-          min={0}
-          step={unit === 1 ? 1 : 0.1}
-          inputMode={unit === 1 ? "numeric" : "decimal"}
-          value={quotaInputValue(rawValue, unit)}
-          disabled={disabled}
-          onChange={(event) => onChange(event.target.value)}
-          className="min-w-0 flex-1 rounded-lg border border-[var(--border)] bg-[var(--background)] px-2 py-1.5 text-xs text-[var(--foreground)]"
-        />
-        <span className="shrink-0 text-[11px] text-[var(--muted-foreground)]">
-          {suffix}
-        </span>
-      </div>
-      <span className="mt-1 block text-[10px] text-[var(--muted-foreground)]">
-        {rawValue === 0 ? "Unlimited" : formatQuotaRaw(rawValue, rawSuffix)}
-      </span>
-    </label>
   );
 }
 
@@ -167,7 +117,7 @@ function ModeSwitch({
   disabled,
   onDefault,
   onCustom,
-  defaultLabel = "Default · all",
+  defaultLabel,
 }: {
   isCustom: boolean;
   disabled: boolean;
@@ -175,6 +125,7 @@ function ModeSwitch({
   onCustom: () => void;
   defaultLabel?: string;
 }) {
+  const { t } = useTranslation();
   const base =
     "rounded-md px-2 py-0.5 text-[11px] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-45";
   return (
@@ -189,7 +140,7 @@ function ModeSwitch({
             : "text-[var(--muted-foreground)] hover:text-[var(--foreground)]"
         }`}
       >
-        {defaultLabel}
+        {defaultLabel ?? t("Default · all")}
       </button>
       <button
         type="button"
@@ -201,13 +152,20 @@ function ModeSwitch({
             : "text-[var(--muted-foreground)] hover:text-[var(--foreground)]"
         }`}
       >
-        Custom
+        {t("Custom")}
       </button>
     </div>
   );
 }
 
-export function GrantEditor({ userId }: { userId: string }) {
+export function GrantEditor({
+  userId,
+  lockLearningPolicy = false,
+}: {
+  userId: string;
+  lockLearningPolicy?: boolean;
+}) {
+  const { t } = useTranslation();
   const [resources, setResources] = useState<MultiUserResources | null>(null);
   const [grant, setGrant] = useState<GrantPayload>(() => emptyGrant(userId));
   const [loading, setLoading] = useState(true);
@@ -227,7 +185,7 @@ export function GrantEditor({ userId }: { userId: string }) {
       .catch((error) => {
         setSaveState("error");
         setMessage(
-          error instanceof Error ? error.message : "Failed to load grants",
+          error instanceof Error ? error.message : t("Failed to load grants"),
         );
       })
       .finally(() => {
@@ -236,7 +194,7 @@ export function GrantEditor({ userId }: { userId: string }) {
     return () => {
       cancelled = true;
     };
-  }, [userId]);
+  }, [userId, t]);
 
   const currentFingerprint = useMemo(() => grantFingerprint(grant), [grant]);
   const dirty =
@@ -353,35 +311,64 @@ export function GrantEditor({ userId }: { userId: string }) {
     setGrant((current) => ({ ...current, [key]: value }));
   }
 
-  function toggleSourcePermission(
-    source: "platform" | "byok",
-    service: "llm" | "embedding" | "mineru",
+  function enableLearningPolicy() {
+    setGrant((current) => ({
+      ...current,
+      learning_policy: conservativeLearningPolicy(),
+    }));
+  }
+
+  function disableLearningPolicy() {
+    setGrant((current) => ({ ...current, learning_policy: null }));
+  }
+
+  function setLearningAgeBand(ageBand: LearningPolicy["age_band"]) {
+    setGrant((current) =>
+      current.learning_policy
+        ? {
+            ...current,
+            learning_policy: { ...current.learning_policy, age_band: ageBand },
+          }
+        : current,
+    );
+  }
+
+  function updateReadingPolicy(
+    update: (reading: LearningPolicy["reading"]) => LearningPolicy["reading"],
   ) {
     setGrant((current) => {
-      if (source === "byok") {
-        return {
-          ...current,
-          byok: {
-            ...current.byok,
-            [service]: {
-              ...current.byok[service],
-              enabled: !current.byok[service].enabled,
-            },
-          },
-        };
-      }
-      if (service === "llm") return current;
+      if (!current.learning_policy) return current;
+      const reading = current.learning_policy.reading;
       return {
         ...current,
-        platform: {
-          ...current.platform,
-          [service]: {
-            ...current.platform[service],
-            enabled: !current.platform[service].enabled,
-          },
+        learning_policy: {
+          ...current.learning_policy,
+          allowed_surfaces: current.learning_policy.allowed_surfaces ?? [
+            "chat",
+            "reading",
+          ],
+          reading: update(reading),
         },
       };
     });
+  }
+
+  function toggleReadingMaterial(materialId: string) {
+    updateReadingPolicy((reading) => ({
+      ...reading,
+      material_ids: reading.material_ids.includes(materialId)
+        ? reading.material_ids.filter((id) => id !== materialId)
+        : [...reading.material_ids, materialId],
+    }));
+  }
+
+  function toggleReadingExtension(extensionId: string) {
+    updateReadingPolicy((reading) => ({
+      ...reading,
+      extensions: reading.extensions.includes(extensionId)
+        ? reading.extensions.filter((id) => id !== extensionId)
+        : [...reading.extensions, extensionId],
+    }));
   }
 
   // Named apart from the imported `toggleName` helper it wraps, and narrowed to
@@ -394,32 +381,6 @@ export function GrantEditor({ userId }: { userId: string }) {
     });
   }
 
-  function setQuota(
-    resource: "llm" | "embedding" | "mineru",
-    key:
-      | "daily_tokens"
-      | "monthly_tokens"
-      | "daily_pages"
-      | "monthly_pages"
-      | "max_pages_per_file",
-    value: string,
-    unit = 1,
-  ) {
-    const parsed = parseQuotaInput(value, unit);
-    const nextValue = parsed === null ? 0 : parsed;
-    setGrant((current) => ({
-      ...current,
-      quota: {
-        ...current.quota,
-        [resource]: { ...current.quota[resource], [key]: nextValue },
-      },
-      token_quota:
-        resource === "llm" && (key === "daily_tokens" || key === "monthly_tokens")
-          ? { ...current.token_quota, [key]: nextValue }
-          : current.token_quota,
-    }));
-  }
-
   async function save() {
     setSaveState("saving");
     setMessage("");
@@ -428,24 +389,24 @@ export function GrantEditor({ userId }: { userId: string }) {
       setGrant(saved);
       setSavedFingerprint(grantFingerprint(saved));
       setSaveState("saved");
-      setMessage("Saved just now");
+      setMessage(t("Saved just now"));
     } catch (error) {
       setSaveState("error");
-      setMessage(error instanceof Error ? error.message : "Failed to save");
+      setMessage(error instanceof Error ? error.message : t("Failed to save"));
     }
   }
 
   const status = loading
-    ? "Loading assignments..."
+    ? t("Loading assignments...")
     : saveState === "saving"
-      ? "Saving changes..."
+      ? t("Saving changes...")
       : saveState === "error"
-        ? message || "Failed to save"
+        ? message || t("Failed to save")
         : saveState === "saved" && !dirty
-          ? message || "Saved just now"
+          ? message || t("Saved just now")
           : dirty
-            ? "Unsaved changes"
-            : "Ready";
+            ? t("Unsaved changes")
+            : t("Ready");
 
   const statusTone =
     saveState === "error"
@@ -456,19 +417,19 @@ export function GrantEditor({ userId }: { userId: string }) {
 
   const toolsSummary =
     grant.enabled_tools === null
-      ? "all tools"
-      : `${grant.enabled_tools.length} tools`;
+      ? t("all tools")
+      : t("{{count}} tools", { count: grant.enabled_tools.length });
   // MCP tools deny-by-default for non-admin users: ``null`` grants none until
   // the admin switches to Custom and picks specific tool names.
   const mcpSummary =
-    grant.mcp_tools === null ? "no MCP" : `${grant.mcp_tools.length} MCP`;
+    grant.mcp_tools === null ? t("no MCP") : t("{{count}} MCP tools", { count: grant.mcp_tools.length });
 
   if (loading && !resources) {
     return (
       <div className="border-t border-[var(--border)] bg-[var(--background)]/40 p-4">
-        <div className="flex h-[min(420px,calc(100dvh-6rem))] min-h-[280px] items-center justify-center rounded-2xl border border-[var(--border)] bg-[var(--card)] text-sm text-[var(--muted-foreground)]">
+        <div className="flex h-[420px] items-center justify-center rounded-2xl border border-[var(--border)] bg-[var(--card)] text-sm text-[var(--muted-foreground)]">
           <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-          Loading assignments...
+          {t("Loading assignments...")}
         </div>
       </div>
     );
@@ -476,30 +437,29 @@ export function GrantEditor({ userId }: { userId: string }) {
 
   return (
     <div className="border-t border-[var(--border)] bg-[var(--background)]/40 p-4">
-      <div className="flex h-[min(620px,calc(100dvh-6rem))] min-h-[360px] flex-col overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--card)] shadow-sm">
-        <div className="shrink-0 border-b border-[var(--border)] px-4 py-4 lg:px-5">
+      <div className="flex h-[620px] max-h-[calc(100vh-170px)] min-h-[420px] flex-col overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--card)] shadow-sm">
+        <div className="shrink-0 border-b border-[var(--border)] px-5 py-4">
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div>
               <h2 className="text-sm font-semibold text-[var(--foreground)]">
-                Assign access
+                {t("Assign access")}
               </h2>
               <p className="mt-0.5 text-xs text-[var(--muted-foreground)]">
-                Admin resources stay linked server-side; users only receive
-                allowed access.
+                {t("Admin resources stay linked server-side; users only receive allowed access.")}
               </p>
             </div>
             <div className="flex flex-wrap gap-1.5 text-[11px] text-[var(--muted-foreground)]">
               <span className="rounded-full bg-[var(--muted)]/60 px-2 py-1">
-                {selectedModelCount} models
+                {t("{{count}} models", { count: selectedModelCount })}
               </span>
               <span className="rounded-full bg-[var(--muted)]/60 px-2 py-1">
-                {kbIds.size} KBs
+                {t("{{count}} KBs", { count: kbIds.size })}
               </span>
               <span className="rounded-full bg-[var(--muted)]/60 px-2 py-1">
-                {skillIds.size} skills
+                {t("{{count}} skills", { count: skillIds.size })}
               </span>
               <span className="rounded-full bg-[var(--muted)]/60 px-2 py-1">
-                {partnerIds.size} partners
+                {t("{{count}} partners", { count: partnerIds.size })}
               </span>
               <span className="rounded-full bg-[var(--muted)]/60 px-2 py-1">
                 {toolsSummary}
@@ -511,10 +471,150 @@ export function GrantEditor({ userId }: { userId: string }) {
           </div>
         </div>
 
-        <div className="min-h-0 flex-1 overflow-y-auto px-4 py-5 [scrollbar-gutter:stable] lg:px-5">
-          <div className="grid gap-5 lg:grid-cols-3">
+        <div className="min-h-0 flex-1 overflow-y-auto px-5 py-5 [scrollbar-gutter:stable]">
+          <div className="grid gap-5 md:grid-cols-3">
+            <section className="min-w-0 md:col-span-3">
+              <SectionTitle>{t("Learning policy")}</SectionTitle>
+              <div className="rounded-lg border border-[var(--border)]/60 p-3">
+                <CheckRow
+                  label={t("Enable learning policy")}
+                  description={t(
+                    "Teacher persona; Chat and Immersive Reading only",
+                  )}
+                  checked={Boolean(grant.learning_policy)}
+                  disabled={controlsDisabled || lockLearningPolicy}
+                  onToggle={() =>
+                    grant.learning_policy
+                      ? disableLearningPolicy()
+                      : enableLearningPolicy()
+                  }
+                />
+                {grant.learning_policy && (
+                  <div className="mt-3 grid gap-3 sm:grid-cols-3">
+                    <label className="text-xs text-[var(--foreground)]">
+                      <span className="mb-1 block text-[11px] text-[var(--muted-foreground)]">
+                        {t("Age band")}
+                      </span>
+                      <select
+                        value={grant.learning_policy.age_band}
+                        disabled={controlsDisabled}
+                        onChange={(event) =>
+                          setLearningAgeBand(
+                            event.target.value as LearningPolicy["age_band"],
+                          )
+                        }
+                        className="h-8 w-full rounded-md border border-[var(--border)] bg-[var(--background)] px-2"
+                      >
+                        {LEARNING_AGE_BANDS.map((band) => (
+                          <option key={band} value={band}>
+                            {band}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className="text-xs text-[var(--foreground)]">
+                      <span className="mb-1 block text-[11px] text-[var(--muted-foreground)]">
+                        {t("Persona")}
+                      </span>
+                      <select
+                        value={grant.learning_policy.locked_persona}
+                        disabled
+                        className="h-8 w-full rounded-md border border-[var(--border)] bg-[var(--background)] px-2"
+                      >
+                        <option value="teacher">{t("Teacher")}</option>
+                      </select>
+                    </label>
+                    <div className="text-xs">
+                      <span className="mb-1 block text-[11px] text-[var(--muted-foreground)]">
+                        {t("Modes")}
+                      </span>
+                      <div className="flex h-8 items-center gap-1.5">
+                        <GraduationCap
+                          size={14}
+                          className="text-[var(--muted-foreground)]"
+                        />
+                        <span>{t("Chat · Immersive Reading")}</span>
+                      </div>
+                    </div>
+                    <div className="grid gap-3 sm:col-span-3 lg:grid-cols-2">
+                      <div>
+                        <div className="mb-1 text-[11px] text-[var(--muted-foreground)]">
+                          {t("Assigned reading materials")}
+                        </div>
+                        <div className="grid gap-1 sm:grid-cols-2">
+                          {(resources?.reading_materials ?? []).map(
+                            (material) => (
+                              <CheckRow
+                                key={material.material_id}
+                                label={material.title || material.filename}
+                                description={material.filename}
+                                checked={Boolean(
+                                  grant.learning_policy?.reading.material_ids.includes(
+                                    material.material_id,
+                                  ),
+                                )}
+                                disabled={controlsDisabled}
+                                onToggle={() =>
+                                  toggleReadingMaterial(material.material_id)
+                                }
+                              />
+                            ),
+                          )}
+                          {(resources?.reading_materials ?? []).length === 0 ? (
+                            <p className="text-[11px] leading-relaxed text-[var(--muted-foreground)]">
+                              {t(
+                                "Upload books in Reading before assigning them.",
+                              )}
+                            </p>
+                          ) : null}
+                        </div>
+                        <label className="mt-2 flex items-center gap-2 text-xs">
+                          <input
+                            type="checkbox"
+                            checked={grant.learning_policy.reading.allow_upload}
+                            disabled={controlsDisabled}
+                            onChange={(event) =>
+                              updateReadingPolicy((reading) => ({
+                                ...reading,
+                                allow_upload: event.target.checked,
+                              }))
+                            }
+                          />
+                          {t("Allow learner uploads")}
+                        </label>
+                      </div>
+                      <div>
+                        <div className="mb-1 text-[11px] text-[var(--muted-foreground)]">
+                          {t("Reading extensions")}
+                        </div>
+                        <div className="grid gap-1 sm:grid-cols-2">
+                          {(resources?.reading_extensions ?? []).map(
+                            (extension) => (
+                              <CheckRow
+                                key={extension.id}
+                                label={extension.name}
+                                description={`${extension.id} · ${extension.version}`}
+                                checked={Boolean(
+                                  grant.learning_policy?.reading.extensions.includes(
+                                    extension.id,
+                                  ),
+                                )}
+                                disabled={controlsDisabled}
+                                onToggle={() =>
+                                  toggleReadingExtension(extension.id)
+                                }
+                              />
+                            ),
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </section>
             <section className="min-w-0">
-              <SectionTitle>Models</SectionTitle>
+              <SectionTitle>{t("Models")}</SectionTitle>
               <div className="space-y-1.5 text-xs">
                 {(resources?.models.llm || []).map((profile) => (
                   <div
@@ -548,41 +648,8 @@ export function GrantEditor({ userId }: { userId: string }) {
                 ))}
               </div>
             </section>
-            <section className="min-w-0 md:col-span-2">
-              <SectionTitle>Provider access</SectionTitle>
-              <p className="mb-2 px-1 text-[11px] leading-relaxed text-[var(--muted-foreground)]">
-                BYOK permissions only allow the user to use their own encrypted
-                profile. Platform permissions control administrator-provided
-                spend. Sandbox and tool permissions are unchanged.
-              </p>
-                  <div className="grid gap-2 lg:grid-cols-3">
-                {(["llm", "embedding", "mineru"] as const).map((service) => (
-                  <div key={service} className="rounded-lg border border-[var(--border)]/60 p-2">
-                    <p className="mb-2 text-xs font-medium text-[var(--foreground)]">{service === "mineru" ? "MinerU" : service === "embedding" ? "Embedding" : "LLM"}</p>
-                    <div className="space-y-1.5">
-                      <CheckRow
-                        label="Allow BYOK"
-                        description="User's own key"
-                        checked={grant.byok[service].enabled}
-                        disabled={controlsDisabled}
-                        onToggle={() => toggleSourcePermission("byok", service)}
-                      />
-                      {service !== "llm" ? (
-                        <CheckRow
-                          label="Allow platform"
-                          description="Admin-provided resource"
-                          checked={grant.platform[service].enabled}
-                          disabled={controlsDisabled}
-                          onToggle={() => toggleSourcePermission("platform", service)}
-                        />
-                      ) : null}
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </section>
             <section className="min-w-0">
-              <SectionTitle>Knowledge</SectionTitle>
+              <SectionTitle>{t("Knowledge")}</SectionTitle>
               <div className="space-y-1.5 text-xs">
                 {(resources?.knowledge_bases || []).map((kb) => (
                   <CheckRow
@@ -596,7 +663,7 @@ export function GrantEditor({ userId }: { userId: string }) {
               </div>
             </section>
             <section className="min-w-0">
-              <SectionTitle>Skills</SectionTitle>
+              <SectionTitle>{t("Skills")}</SectionTitle>
               <div className="space-y-1.5 text-xs">
                 {(resources?.skills || []).map((skill) => (
                   <CheckRow
@@ -610,11 +677,11 @@ export function GrantEditor({ userId }: { userId: string }) {
               </div>
             </section>
             <section className="min-w-0">
-              <SectionTitle>Partners</SectionTitle>
+              <SectionTitle>{t("Partners")}</SectionTitle>
               <div className="space-y-1.5 text-xs">
                 {(resources?.partners || []).length === 0 ? (
                   <p className="px-1 text-[11px] leading-relaxed text-[var(--muted-foreground)]">
-                    No partners yet. Create one under Partners to assign it.
+                    {t("No partners yet. Create one under Partners to assign it.")}
                   </p>
                 ) : (
                   (resources?.partners || []).map((partner) => (
@@ -637,7 +704,7 @@ export function GrantEditor({ userId }: { userId: string }) {
             </section>
 
             <section className="min-w-0">
-              <SectionTitle>System tools</SectionTitle>
+              <SectionTitle>{t("System tools")}</SectionTitle>
               <ModeSwitch
                 isCustom={grant.enabled_tools !== null}
                 disabled={controlsDisabled}
@@ -667,11 +734,11 @@ export function GrantEditor({ userId }: { userId: string }) {
               )}
             </section>
             <section className="min-w-0">
-              <SectionTitle>MCP tools</SectionTitle>
+              <SectionTitle>{t("MCP tools")}</SectionTitle>
               <ModeSwitch
                 isCustom={grant.mcp_tools !== null}
                 disabled={controlsDisabled}
-                defaultLabel="Default · none"
+                defaultLabel={t("Default · none")}
                 onDefault={() => setToolList("mcp_tools", null)}
                 // Custom starts empty: the admin picks the services to assign,
                 // rather than un-picking hundreds of tools they never meant to
@@ -680,8 +747,7 @@ export function GrantEditor({ userId }: { userId: string }) {
               />
               {grant.mcp_tools === null ? (
                 <p className="px-1 text-[11px] leading-relaxed text-[var(--muted-foreground)]">
-                  MCP tools proxy host-side capabilities, so they stay denied by
-                  default. Switch to Custom to assign specific services.
+                  {t("MCP tools proxy host-side capabilities, so they stay denied by default. Switch to Custom to assign specific services.")}
                 </p>
               ) : null}
               {grant.mcp_tools !== null &&
@@ -704,7 +770,7 @@ export function GrantEditor({ userId }: { userId: string }) {
                         }
                         className="rounded px-1.5 py-0.5 text-[11px] text-[var(--muted-foreground)] hover:text-[var(--foreground)] disabled:opacity-50"
                       >
-                        All
+                        {t("All")}
                       </button>
                       <button
                         type="button"
@@ -712,7 +778,7 @@ export function GrantEditor({ userId }: { userId: string }) {
                         onClick={() => setToolList("mcp_tools", [])}
                         className="rounded px-1.5 py-0.5 text-[11px] text-[var(--muted-foreground)] hover:text-[var(--foreground)] disabled:opacity-50"
                       >
-                        None
+                        {t("None")}
                       </button>
                     </div>
                     <McpToolGroups
@@ -734,145 +800,32 @@ export function GrantEditor({ userId }: { userId: string }) {
                   </div>
                 ) : (
                   <p className="text-xs text-[var(--muted-foreground)]">
-                    No MCP servers configured.
+                    {t("No MCP servers configured.")}
                   </p>
                 ))}
             </section>
             <section className="min-w-0">
-              <SectionTitle>Code execution</SectionTitle>
+              <SectionTitle>{t("Code execution")}</SectionTitle>
               <div className="space-y-1.5 text-xs">
                 <CheckRow
-                  label="Allow code execution"
-                  description="Requires an isolated sandbox deployment; public users stay denied by default."
-                  checked={grant.exec_enabled === true}
+                  label={t("Allow code execution")}
+                  description={t("Follows the deployment sandbox policy. Uncheck to disable exec for this user.")}
+                  checked={grant.exec_enabled !== false}
                   disabled={controlsDisabled}
                   onToggle={() =>
                     setGrant((current) => ({
                       ...current,
-                      exec_enabled: current.exec_enabled === true ? null : true,
+                      exec_enabled:
+                        current.exec_enabled === false ? null : false,
                     }))
                   }
                 />
               </div>
             </section>
-            <section className="min-w-0 md:col-span-3">
-              <SectionTitle>Platform resource quotas</SectionTitle>
-              <p className="mb-3 px-1 text-[11px] leading-relaxed text-[var(--muted-foreground)]">
-                These limits override the new-user defaults for this user. Set
-                any period to 0 for unlimited platform usage. BYOK does not
-                consume these credits but still follows BYOK safety limits.
-              </p>
-              <div className="grid gap-3 lg:grid-cols-3">
-                <div className="rounded-lg border border-[var(--border)]/60 p-3">
-                  <p className="mb-2 text-xs font-medium text-[var(--foreground)]">
-                    LLM
-                  </p>
-                  <div className="space-y-2">
-                    <QuotaInput
-                      label="Daily"
-                      rawValue={grant.quota.llm.daily_tokens}
-                      unit={LLM_TOKEN_UNIT}
-                      suffix="10k tokens"
-                      disabled={controlsDisabled}
-                      onChange={(value) =>
-                        setQuota("llm", "daily_tokens", value, LLM_TOKEN_UNIT)
-                      }
-                    />
-                    <QuotaInput
-                      label="Monthly"
-                      rawValue={grant.quota.llm.monthly_tokens}
-                      unit={LLM_TOKEN_UNIT}
-                      suffix="10k tokens"
-                      disabled={controlsDisabled}
-                      onChange={(value) =>
-                        setQuota("llm", "monthly_tokens", value, LLM_TOKEN_UNIT)
-                      }
-                    />
-                  </div>
-                </div>
-                <div className="rounded-lg border border-[var(--border)]/60 p-3">
-                  <p className="mb-2 text-xs font-medium text-[var(--foreground)]">
-                    Embedding
-                  </p>
-                  <div className="space-y-2">
-                    <QuotaInput
-                      label="Daily"
-                      rawValue={grant.quota.embedding.daily_tokens}
-                      unit={EMBEDDING_TOKEN_UNIT}
-                      suffix="million tokens"
-                      disabled={controlsDisabled}
-                      onChange={(value) =>
-                        setQuota(
-                          "embedding",
-                          "daily_tokens",
-                          value,
-                          EMBEDDING_TOKEN_UNIT,
-                        )
-                      }
-                    />
-                    <QuotaInput
-                      label="Monthly"
-                      rawValue={grant.quota.embedding.monthly_tokens}
-                      unit={EMBEDDING_TOKEN_UNIT}
-                      suffix="million tokens"
-                      disabled={controlsDisabled}
-                      onChange={(value) =>
-                        setQuota(
-                          "embedding",
-                          "monthly_tokens",
-                          value,
-                          EMBEDDING_TOKEN_UNIT,
-                        )
-                      }
-                    />
-                  </div>
-                </div>
-                <div className="rounded-lg border border-[var(--border)]/60 p-3">
-                  <p className="mb-2 text-xs font-medium text-[var(--foreground)]">
-                    MinerU
-                  </p>
-                  <div className="space-y-2">
-                    <QuotaInput
-                      label="Daily pages"
-                      rawValue={grant.quota.mineru.daily_pages}
-                      unit={1}
-                      suffix="pages"
-                      rawSuffix="pages"
-                      disabled={controlsDisabled}
-                      onChange={(value) =>
-                        setQuota("mineru", "daily_pages", value)
-                      }
-                    />
-                    <QuotaInput
-                      label="Monthly pages"
-                      rawValue={grant.quota.mineru.monthly_pages}
-                      unit={1}
-                      suffix="pages"
-                      rawSuffix="pages"
-                      disabled={controlsDisabled}
-                      onChange={(value) =>
-                        setQuota("mineru", "monthly_pages", value)
-                      }
-                    />
-                    <QuotaInput
-                      label="Max pages / file"
-                      rawValue={grant.quota.mineru.max_pages_per_file}
-                      unit={1}
-                      suffix="pages"
-                      rawSuffix="pages"
-                      disabled={controlsDisabled}
-                      onChange={(value) =>
-                        setQuota("mineru", "max_pages_per_file", value)
-                      }
-                    />
-                  </div>
-                </div>
-              </div>
-            </section>
           </div>
         </div>
 
-        <div className="flex shrink-0 flex-col items-stretch justify-between gap-3 border-t border-[var(--border)] bg-[var(--card)] px-4 py-3 lg:flex-row lg:items-center lg:px-5">
+        <div className="flex shrink-0 items-center justify-between gap-3 border-t border-[var(--border)] bg-[var(--card)] px-5 py-3">
           <div
             aria-live="polite"
             className={`flex min-w-0 items-center gap-1.5 text-xs ${statusTone}`}
@@ -887,7 +840,7 @@ export function GrantEditor({ userId }: { userId: string }) {
           <button
             onClick={save}
             disabled={controlsDisabled || !dirty}
-            className="inline-flex min-h-10 w-full shrink-0 items-center justify-center gap-1.5 rounded-lg bg-[var(--foreground)] px-3 py-1.5 text-xs font-medium text-[var(--background)] transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-45 lg:w-auto"
+            className="inline-flex shrink-0 items-center gap-1.5 rounded-lg bg-[var(--foreground)] px-3 py-1.5 text-xs font-medium text-[var(--background)] transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-45"
           >
             {saving ? (
               <Loader2 className="h-3 w-3 animate-spin" />
@@ -897,10 +850,10 @@ export function GrantEditor({ userId }: { userId: string }) {
               <Save className="h-3 w-3" />
             )}
             {saving
-              ? "Saving..."
+              ? t("Saving...")
               : saveState === "saved" && !dirty
-                ? "Saved"
-                : "Save assignments"}
+                ? t("Saved")
+                : t("Save assignments")}
           </button>
         </div>
       </div>

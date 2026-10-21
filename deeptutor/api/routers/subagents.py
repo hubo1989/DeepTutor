@@ -1,16 +1,15 @@
 """Subagent connections API.
 
 Backs the "My Agents → connected agents" feature: detect which local agent CLIs
-(Claude Code, Codex, Gemini CLI, Kimi CLI, opencode, MiMo Code) are installed on
-this machine, connect one as a pointer KB the chat composer can select, and
-configure the consult budget. Connections are
+or configured remote backends are usable, connect one as a pointer KB the chat
+composer can select, and configure the consult budget. Connections are
 stored as ``type: subagent`` knowledge bases (per-user, via the KB manager), so
 they ride the same selection/persistence path as the other connected KB types —
 the subagent capability drives them live, nothing is indexed.
 
-The CLIs run on the host with the host user's own credentials, so detection is
-machine-global; whether a connection is usable is simply "is the CLI installed
-here". If it isn't, the UI just doesn't offer it.
+Local CLIs run on the host with the host user's credentials; remote backends
+use deployment-wide server configuration. Detection is therefore machine-
+global. Unavailable runtimes are not offered by the connection UI.
 """
 
 from __future__ import annotations
@@ -25,12 +24,9 @@ from pydantic import BaseModel, Field
 
 from deeptutor.api.routers.auth import require_admin
 from deeptutor.knowledge.kb_types import SUBAGENT_KB_TYPE
-from deeptutor.multi_user.context import get_current_user
-from deeptutor.multi_user.knowledge_access import current_kb_manager
-from deeptutor.multi_user.partner_access import assert_partner_allowed, visible_partner_cards
+from deeptutor.multi_user.knowledge_access import account_kb_manager
 from deeptutor.services.rag.linked_kb import assert_path_allowed
 from deeptutor.services.subagent import (
-    PARTNER_BACKEND_KIND,
     detect_all,
     list_backend_kinds,
     load_subagent_settings,
@@ -46,9 +42,6 @@ class ConnectSubagentRequest(BaseModel):
     name: str
     agent_kind: str
     cwd: str = ""
-    # For the partner backend (``agent_kind == "partner"``): which partner to
-    # consult. Ignored by the local-CLI backends, which use ``cwd`` instead.
-    partner_id: str = ""
 
 
 class SubagentSettingsPayload(BaseModel):
@@ -63,13 +56,15 @@ class SubagentMessageRequest(BaseModel):
 
 def _require_host_backend_admin() -> None:
     """Only admins may bind or execute a backend that can touch the host."""
+    from deeptutor.multi_user.context import get_current_user
+
     if not get_current_user().is_admin:
         raise HTTPException(status_code=403, detail="Admin access required for host agents")
 
 
 @router.get("/detect", dependencies=[Depends(require_admin)])
 async def detect_subagents():
-    """Report which agent CLIs are installed and usable on this machine."""
+    """Report which local and remote agent backends are usable."""
     detections = await detect_all()
     return {"backends": [d.to_dict() for d in detections]}
 
@@ -101,26 +96,16 @@ async def sync_backend(kind: str):
     return options.to_dict()
 
 
-@router.get("/partners")
-async def list_visible_partners():
-    """Partners the current user can connect & consult.
-
-    Returns every partner for an admin, or just the ones an admin has assigned
-    for a non-admin. The partner CRUD API (``/api/v1/partners``) stays fully
-    admin-gated; this is the read surface the connect flow and the partner list
-    page use, so a non-admin sees their assigned partners without a 403.
-    """
-    return {"partners": visible_partner_cards()}
-
-
 @router.get("/connections")
 async def list_connections():
     """List the current user's connected subagents."""
-    manager = current_kb_manager()
+    manager = account_kb_manager()
     connections = []
     for name in manager.list_knowledge_bases():
         meta = manager.get_metadata(name)
         if not isinstance(meta, dict) or meta.get("type") != SUBAGENT_KB_TYPE:
+            continue
+        if meta.get("agent_kind") == "partner":
             continue
         connections.append(
             {
@@ -138,51 +123,31 @@ async def list_connections():
 
 @router.post("/connections")
 async def create_connection(payload: ConnectSubagentRequest):
-    """Connect a subagent (a local CLI, or one of the user's partners) as a selectable KB.
-
-    A partner connection (``agent_kind == "partner"``) binds a ``partner_id``
-    instead of a working directory: consulting it opens a fresh session on that
-    partner, exactly as if the user started one from the partner page. Every
-    consult within one DeepTutor chat lands in that one partner session.
-    """
+    """Connect a local or remote subagent as a selectable KB."""
     name = (payload.name or "").strip()
     agent_kind = (payload.agent_kind or "").strip()
     if not name or not agent_kind:
         raise HTTPException(status_code=400, detail="Both name and agent_kind are required.")
-    if agent_kind not in list_backend_kinds():
+    if agent_kind == "partner" or agent_kind not in list_backend_kinds():
         raise HTTPException(status_code=400, detail=f"Unknown agent kind: {agent_kind!r}")
 
     resolved_cwd = ""
-    partner_id = ""
-    if agent_kind == PARTNER_BACKEND_KIND:
-        partner_id = (payload.partner_id or "").strip()
-        if not partner_id:
-            raise HTTPException(
-                status_code=400, detail="A partner_id is required to connect a partner."
-            )
-        # Partners are admin-managed, but an admin can assign one to a user via
-        # the grant system. An admin may connect any partner; a non-admin only a
-        # partner assigned to them (403 otherwise). The partner still runs in its
-        # own isolated scope — connecting just lets the user consult it in chat.
-        assert_partner_allowed(partner_id)
-        from deeptutor.services.partners import get_partner_manager
+    from deeptutor.services.subagent import get_backend
 
-        if not get_partner_manager().partner_exists(partner_id):
-            raise HTTPException(status_code=400, detail=f"No partner named {partner_id!r}.")
-    else:
+    # Host-touching backends (local CLI agents) are admin-only in the fork.
+    backend = get_backend(agent_kind)
+    if backend is None or getattr(backend, "local_cli", True):
         _require_host_backend_admin()
-        raw_cwd = (payload.cwd or "").strip()
-        if raw_cwd:
-            try:
-                resolved_cwd = str(assert_path_allowed(raw_cwd))
-            except ValueError as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
+    raw_cwd = (payload.cwd or "").strip()
+    if raw_cwd and backend is not None and getattr(backend, "local_cli", True):
+        try:
+            resolved_cwd = str(assert_path_allowed(raw_cwd))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     try:
-        manager = current_kb_manager()
-        entry = manager.register_subagent_connection(
-            name, agent_kind, cwd=resolved_cwd, partner_id=partner_id
-        )
+        manager = account_kb_manager()
+        entry = manager.register_subagent_connection(name, agent_kind, cwd=resolved_cwd)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:  # pragma: no cover - defensive
@@ -201,7 +166,7 @@ async def create_connection(payload: ConnectSubagentRequest):
 @router.delete("/connections/{name}")
 async def delete_connection(name: str):
     """Disconnect a subagent (removes the pointer KB; touches no files)."""
-    manager = current_kb_manager()
+    manager = account_kb_manager()
     meta = manager.get_metadata(name)
     if not isinstance(meta, dict) or meta.get("type") != SUBAGENT_KB_TYPE:
         raise HTTPException(status_code=404, detail=f"No connected subagent named {name!r}.")
@@ -231,11 +196,20 @@ async def message_connection(name: str, payload: SubagentMessageRequest):
     native run as newline-delimited JSON, in the same channel shape the chat WS
     uses, so the sidebar transcript renders it identically.
     """
+    from deeptutor.services.subagent import get_backend as _get_backend
+
+    _manager = account_kb_manager()
+    _meta = _manager.get_metadata(name) or {}
+    _backend = _get_backend(str(_meta.get("agent_kind") or ""))
+    # Host-touching backends (local CLI agents) are admin-only in the fork.
+    if _backend is None or getattr(_backend, "local_cli", True):
+        _require_host_backend_admin()
+
     message = (payload.message or "").strip()
     if not message:
         raise HTTPException(status_code=400, detail="A non-empty 'message' is required.")
 
-    manager = current_kb_manager()
+    manager = account_kb_manager()
     meta = manager.get_metadata(name)
     if not isinstance(meta, dict) or meta.get("type") != SUBAGENT_KB_TYPE:
         raise HTTPException(status_code=404, detail=f"No connected subagent named {name!r}.")
@@ -246,12 +220,6 @@ async def message_connection(name: str, payload: SubagentMessageRequest):
     kind = str(meta.get("agent_kind") or "")
     cwd = str(meta.get("cwd") or "")
     partner_id = str(meta.get("partner_id") or "")
-    if kind == PARTNER_BACKEND_KIND:
-        # Re-check on every execution so revoking a grant invalidates an
-        # already-saved connection immediately.
-        assert_partner_allowed(partner_id)
-    else:
-        _require_host_backend_admin()
     backend = get_backend(kind)
     if backend is None:
         raise HTTPException(status_code=400, detail=f"Unknown agent kind: {kind!r}")
@@ -307,7 +275,8 @@ async def message_connection(name: str, payload: SubagentMessageRequest):
                     break
         finally:
             if not task.done():
-                await task
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     return StreamingResponse(event_stream(), media_type="application/x-ndjson")
 

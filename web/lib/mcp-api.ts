@@ -30,6 +30,7 @@ export interface McpServerConfig {
   // which silently drops a hand-written blocklist.
   disabled_tools: string[];
   enabled: boolean;
+  allow_private_network?: boolean;
   /**
    * `"oauth"` when this server needs an authorization the account grants in a
    * browser rather than a credential typed into the form. Read-only from the
@@ -104,10 +105,10 @@ export interface McpStoreState extends McpSettings {
 }
 
 /** Deployment-global registry (admin-gated). */
-export const MCP_ADMIN_BASE_PATH = "/api/v1/settings/mcp";
+export const MCP_ADMIN_BASE_PATH = "/api/settings/mcp";
 
 /** The caller's own servers (auth-gated, remote transports only). */
-export const MCP_SPACE_BASE_PATH = "/api/v1/space/mcp";
+export const MCP_SPACE_BASE_PATH = "/api/space/mcp";
 
 /** Every transport the connection manager can open. */
 export const MCP_ALL_TRANSPORTS: readonly McpTransport[] = [
@@ -235,6 +236,7 @@ export interface McpServerFormDraft {
   headerPairs: McpKvPair[];
   toolTimeout: number;
   enabledToolsText: string;
+  allowPrivateNetwork?: boolean;
 }
 
 /**
@@ -264,6 +266,7 @@ export function buildMcpServerConfig(
     enabled: base.enabled,
     auth: base.auth,
     catalog_entry: base.catalog_entry,
+    ...(draft.allowPrivateNetwork !== undefined ? { allow_private_network: draft.allowPrivateNetwork } : base.allow_private_network !== undefined ? { allow_private_network: base.allow_private_network } : {}),
   };
 }
 
@@ -379,6 +382,7 @@ export function normalizeServerConfig(raw: unknown): McpServerConfig {
     enabled: item.enabled === undefined ? base.enabled : Boolean(item.enabled),
     auth: item.auth === "oauth" ? "oauth" : base.auth,
     catalog_entry: String(item.catalog_entry ?? base.catalog_entry),
+    ...(typeof item.allow_private_network === "boolean" ? { allow_private_network: item.allow_private_network } : {}),
   };
 }
 

@@ -8,11 +8,18 @@ Provides lookup, listing, and OpenAI schema generation.
 
 from __future__ import annotations
 
+import inspect
 import logging
 from typing import Any
 
 from deeptutor.core.tool_protocol import BaseTool, ToolDefinition, ToolPromptHints
-from deeptutor.tools.builtin import BUILTIN_TOOL_TYPES, TOOL_ALIASES
+from deeptutor.plugins.entry_points import load_entry_point_group
+from deeptutor.tools.builtin_specs import (
+    BUILTIN_TOOL_NAMES,
+    BUILTIN_TOOL_SPEC_BY_NAME,
+    TOOL_ALIASES,
+    BuiltinToolSpec,
+)
 from deeptutor.tools.prompting import compose_prompt_text
 
 logger = logging.getLogger(__name__)
@@ -32,6 +39,7 @@ class ToolRegistry:
 
     def __init__(self) -> None:
         self._tools: dict[str, BaseTool] = {}
+        self._builtin_specs: dict[str, BuiltinToolSpec] = {}
 
     def register(self, tool: BaseTool) -> None:
         name = tool.name
@@ -47,16 +55,45 @@ class ToolRegistry:
         return [t for t in self._tools.values() if getattr(t, "deferred", False)]
 
     def load_builtins(self) -> None:
-        """Instantiate and register all built-in tools."""
-        for tool_type in BUILTIN_TOOL_TYPES:
-            try:
-                tool = tool_type()
-            except Exception:
-                logger.warning("Failed to instantiate built-in tool %s", tool_type, exc_info=True)
-                continue
-            if tool.name in self._tools:
-                continue
-            self.register(tool)
+        """Register import-cheap descriptors for all built-in tools."""
+        self._builtin_specs.update(BUILTIN_TOOL_SPEC_BY_NAME)
+
+    def _load_builtin(self, name: str) -> BaseTool | None:
+        spec = self._builtin_specs.get(name)
+        if spec is None:
+            return None
+        try:
+            tool = spec.create()
+        except Exception:
+            logger.warning("Failed to instantiate built-in tool %s", spec.class_path, exc_info=True)
+            return None
+        existing = self._tools.get(name)
+        if existing is not None:
+            return existing
+        self._tools[name] = tool
+        logger.debug("Loaded built-in tool: %s", name)
+        return tool
+
+    def load_plugins(self) -> None:
+        from deeptutor.plugins.registry import PluginRegistry
+        from deeptutor.plugins.runtime import load_enabled_tools
+
+        def coerce(name, loaded):
+            candidate = loaded() if inspect.isclass(loaded) else loaded
+            if callable(candidate) and not isinstance(candidate, BaseTool):
+                candidate = candidate()
+            if not isinstance(candidate, BaseTool):
+                return None
+            if candidate.name in BUILTIN_TOOL_SPEC_BY_NAME or candidate.name in self._tools:
+                return None
+            return candidate
+
+        for tool in (
+            *load_entry_point_group("deeptutor.tools", coerce, log=logger),
+            *load_enabled_tools(PluginRegistry()),
+        ):
+            if tool.name not in BUILTIN_TOOL_SPEC_BY_NAME and tool.name not in self._tools:
+                self.register(tool)
 
     def _resolve_request(
         self,
@@ -71,12 +108,21 @@ class ToolRegistry:
 
         return resolved_name, merged_kwargs
 
+    def resolve_request(
+        self,
+        name: str,
+        kwargs: dict[str, Any] | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        """Return the canonical tool name and alias-defaulted arguments."""
+        return self._resolve_request(name, kwargs)
+
     def get(self, name: str) -> BaseTool | None:
         resolved_name, _ = self._resolve_request(name)
-        return self._tools.get(resolved_name)
+        return self._tools.get(resolved_name) or self._load_builtin(resolved_name)
 
     def list_tools(self) -> list[str]:
-        return list(self._tools.keys())
+        builtin = [name for name in BUILTIN_TOOL_NAMES if name in self._builtin_specs]
+        return [*builtin, *(name for name in self._tools if name not in self._builtin_specs)]
 
     def get_enabled(self, names: list[str]) -> list[BaseTool]:
         """Return tool instances for the given names (skipping unknown)."""
@@ -92,7 +138,7 @@ class ToolRegistry:
 
     def get_definitions(self, names: list[str] | None = None) -> list[ToolDefinition]:
         """Return definitions for *names* (or all if None)."""
-        tools = self._tools.values() if names is None else self.get_enabled(names)
+        tools = self.get_enabled(self.list_tools()) if names is None else self.get_enabled(names)
         return [t.get_definition() for t in tools]
 
     def get_prompt_hints(
@@ -135,19 +181,42 @@ class ToolRegistry:
         positionally.
         """
         resolved_name, resolved_kwargs = self._resolve_request(name, kwargs)
-        tool = self._tools.get(resolved_name)
+        tool = self._tools.get(resolved_name) or self._load_builtin(resolved_name)
         if tool is None:
             raise KeyError(f"Unknown tool: {name}")
         return await tool.execute(**resolved_kwargs)
 
 
 _default_registry: ToolRegistry | None = None
+_default_plugin_scope: tuple[str, int, int] | None = None
 
 
 def get_tool_registry() -> ToolRegistry:
     """Return the global ToolRegistry (creating & loading builtins on first call)."""
-    global _default_registry
-    if _default_registry is None:
+    global _default_registry, _default_plugin_scope
+    from deeptutor.plugins.registry import PluginRegistry
+
+    path = PluginRegistry().state_path
+    try:
+        stat = path.stat()
+        scope = (str(path.resolve()), stat.st_mtime_ns, stat.st_size)
+    except FileNotFoundError:
+        scope = (str(path.resolve()), 0, 0)
+    if _default_registry is None or _default_plugin_scope != scope:
+        _default_plugin_scope = scope
+        shared = (
+            [
+                tool
+                for tool in _default_registry._tools.values()
+                if getattr(tool, "provider_kind", "") == "mcp"
+                and getattr(tool, "owner", None) == "_shared"
+            ]
+            if _default_registry is not None
+            else []
+        )
         _default_registry = ToolRegistry()
         _default_registry.load_builtins()
+        for tool in shared:
+            _default_registry.register(tool)
+        _default_registry.load_plugins()
     return _default_registry

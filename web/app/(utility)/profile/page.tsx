@@ -1,22 +1,14 @@
 "use client";
 
+import { FeaturePage, PageHeader } from '@/components/layout/FeaturePage'
 import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { createElement } from "react";
-import {
-  ArrowLeft,
-  Download,
-  ImageUp,
-  LogOut,
-  ShieldCheck,
-  Trash2,
-} from "lucide-react";
+import { ArrowLeft, ImageUp, KeyRound, LogOut, ShieldCheck, Trash2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { fetchAuthStatus, logout } from "@/lib/auth";
 import {
-  deleteOwnAccount,
-  getAccountExport,
   getProfile,
   removeAvatarImage,
   setAvatarMarker,
@@ -33,6 +25,7 @@ import {
 } from "@/components/UserAvatar";
 import { parseAvatarMarker } from "@/lib/avatar";
 import { formatDate, type Language } from "@/lib/datetime";
+import { accountRoleLabelKey } from "@/lib/account-role";
 
 const AVATAR_OUTPUT_SIZE = 256;
 // Decoding a huge photo just to throw away most pixels wastes memory; the
@@ -109,10 +102,6 @@ export default function ProfilePage() {
   const [profile, setProfile] = useState<ProfileInfo | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
-  const [exporting, setExporting] = useState(false);
-  const [deleting, setDeleting] = useState(false);
-  const [deleteOpen, setDeleteOpen] = useState(false);
-  const [deletePassword, setDeletePassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -195,43 +184,6 @@ export default function ProfilePage() {
     router.replace("/login");
   }, [router]);
 
-  const handleExport = useCallback(async () => {
-    setExporting(true);
-    setError(null);
-    try {
-      const archive = await getAccountExport();
-      const url = URL.createObjectURL(archive);
-      const anchor = document.createElement("a");
-      anchor.href = url;
-      anchor.download = "deeptutor-account-export.zip";
-      document.body.appendChild(anchor);
-      anchor.click();
-      anchor.remove();
-      URL.revokeObjectURL(url);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setExporting(false);
-    }
-  }, []);
-
-  const handleDeleteAccount = useCallback(async () => {
-    if (!deletePassword) {
-      setError(t("commercial.account.passwordRequired"));
-      return;
-    }
-    setDeleting(true);
-    setError(null);
-    try {
-      await deleteOwnAccount(deletePassword);
-      router.replace("/login");
-      router.refresh();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-      setDeleting(false);
-    }
-  }, [deletePassword, router, t]);
-
   const descriptor = parseAvatarMarker(profile?.avatar);
   const hasImage = descriptor.kind === "image";
   const fallback = fallbackAvatarFor(profile?.username ?? "");
@@ -256,10 +208,9 @@ export default function ProfilePage() {
       : null;
 
   return (
-    <div className="h-screen overflow-y-auto bg-[var(--background)] px-4 py-10 [scrollbar-gutter:stable]">
-      <div className="mx-auto max-w-2xl">
+    <FeaturePage>
         {/* Header */}
-        <div className="mb-8">
+        <div>
           <Link
             href="/"
             className="mb-4 inline-flex items-center gap-1.5 text-sm text-[var(--muted-foreground)] hover:text-[var(--foreground)] transition-colors"
@@ -267,14 +218,7 @@ export default function ProfilePage() {
             <ArrowLeft size={16} />
             {t("Back")}
           </Link>
-          <div>
-            <h1 className="text-xl font-semibold text-[var(--foreground)]">
-              {t("My profile")}
-            </h1>
-            <p className="mt-0.5 text-sm text-[var(--muted-foreground)]">
-              {t("View your account and personalize your avatar")}
-            </p>
-          </div>
+          <PageHeader title={t("My profile")} description={t("View your account and personalize your avatar")} />
         </div>
 
         {error && (
@@ -312,7 +256,7 @@ export default function ProfilePage() {
                       }`}
                     >
                       {isAdmin && <ShieldCheck size={11} strokeWidth={2} />}
-                      {isAdmin ? t("Administrator") : t("User")}
+                      {isAdmin ? t("Administrator") : t(accountRoleLabelKey(profile.role))}
                     </span>
                   </div>
                   {joined && (
@@ -322,6 +266,13 @@ export default function ProfilePage() {
                   )}
                 </div>
               </div>
+              <Link
+                href="/session-handoff"
+                className="mt-5 inline-flex items-center gap-1.5 rounded-lg border border-[var(--border)] px-3 py-1.5 text-sm text-[var(--foreground)] transition-colors hover:bg-[var(--background)]/60"
+              >
+                <KeyRound size={14} />
+                {t("Public device sign-in")}
+              </Link>
             </div>
 
             {/* Avatar card */}
@@ -428,93 +379,6 @@ export default function ProfilePage() {
               </div>
             </div>
 
-            {/* Account data card */}
-            <div
-              id="account-data"
-              className="mt-4 scroll-mt-6 rounded-2xl border border-[var(--border)] bg-[var(--card)] p-6 shadow-sm"
-            >
-              <h2 className="text-sm font-semibold text-[var(--foreground)]">
-                {t("commercial.account.dataTitle")}
-              </h2>
-              <p className="mt-0.5 text-sm text-[var(--muted-foreground)]">
-                {t("commercial.account.dataDescription")}
-              </p>
-
-              <div className="mt-4 flex flex-wrap gap-2.5">
-                <button
-                  type="button"
-                  onClick={() => void handleExport()}
-                  disabled={exporting || deleting}
-                  className="flex items-center gap-1.5 rounded-lg border border-[var(--border)] px-3 py-1.5 text-sm text-[var(--foreground)] transition-colors hover:bg-[var(--background)]/60 disabled:opacity-50"
-                >
-                  <Download size={14} aria-hidden="true" />
-                  {exporting
-                    ? t("commercial.account.exporting")
-                    : t("commercial.account.export")}
-                </button>
-                {!isAdmin && !deleteOpen && (
-                  <button
-                    type="button"
-                    onClick={() => setDeleteOpen(true)}
-                    disabled={exporting}
-                    className="flex items-center gap-1.5 rounded-lg border border-red-500/40 px-3 py-1.5 text-sm text-red-600 transition-colors hover:bg-red-500/10 disabled:opacity-50 dark:text-red-400"
-                  >
-                    <Trash2 size={14} aria-hidden="true" />
-                    {t("commercial.account.delete")}
-                  </button>
-                )}
-              </div>
-
-              {!isAdmin && deleteOpen && (
-                <div className="mt-4 rounded-xl border border-red-500/30 bg-red-500/10 p-4">
-                  <p className="text-sm font-medium text-red-700 dark:text-red-300">
-                    {t("commercial.account.deleteConfirmTitle")}
-                  </p>
-                  <p className="mt-1 text-xs leading-relaxed text-[var(--muted-foreground)]">
-                    {t("commercial.account.deleteConfirmDescription")}
-                  </p>
-                  <label
-                    htmlFor="delete-account-password"
-                    className="mt-3 block text-xs font-medium text-[var(--foreground)]"
-                  >
-                    {t("commercial.account.confirmPassword")}
-                  </label>
-                  <input
-                    id="delete-account-password"
-                    type="password"
-                    autoComplete="current-password"
-                    value={deletePassword}
-                    onChange={(event) => setDeletePassword(event.target.value)}
-                    disabled={deleting}
-                    className="mt-1.5 w-full rounded-lg border border-[var(--border)] bg-[var(--background)] px-3 py-2 text-sm text-[var(--foreground)] focus:border-transparent focus:outline-none focus:ring-2 focus:ring-red-500 disabled:opacity-50"
-                  />
-                  <div className="mt-3 flex flex-wrap gap-2">
-                    <button
-                      type="button"
-                      onClick={() => void handleDeleteAccount()}
-                      disabled={deleting || !deletePassword}
-                      className="rounded-lg bg-red-600 px-3 py-2 text-xs font-medium text-white transition-colors hover:bg-red-700 disabled:opacity-50"
-                    >
-                      {deleting
-                        ? t("commercial.account.deleting")
-                        : t("commercial.account.deletePermanently")}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setDeleteOpen(false);
-                        setDeletePassword("");
-                      }}
-                      disabled={deleting}
-                      className="rounded-lg border border-[var(--border)] px-3 py-2 text-xs font-medium text-[var(--foreground)] transition-colors hover:bg-[var(--background)]/60 disabled:opacity-50"
-                    >
-                      {t("commercial.account.cancel")}
-                    </button>
-                  </div>
-                </div>
-              )}
-            </div>
-
             {/* Sign out card */}
             <div className="mt-4 flex items-center justify-between rounded-2xl border border-[var(--border)] bg-[var(--card)] p-6 shadow-sm">
               <div>
@@ -537,7 +401,6 @@ export default function ProfilePage() {
             </div>
           </>
         )}
-      </div>
-    </div>
+    </FeaturePage>
   );
 }

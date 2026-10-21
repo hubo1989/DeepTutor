@@ -4,7 +4,6 @@ import { useEffect, useMemo, useState } from "react";
 import { Check, KeyRound, Loader2, Trash2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
-import SettingsBreadcrumb from "@/components/settings/SettingsBreadcrumb";
 import {
   deleteByokProfile,
   fetchByokStatus,
@@ -243,7 +242,7 @@ export default function ByokSettingsPage() {
 
   return (
     <div className="mx-auto w-full max-w-4xl pb-12">
-      <SettingsBreadcrumb />
+      <div className="mt-5" />
       <header className="mb-6 mt-5 flex items-start gap-3">
         <div className="rounded-xl bg-violet-500/10 p-2.5 text-violet-600 dark:text-violet-400">
           <KeyRound size={20} />

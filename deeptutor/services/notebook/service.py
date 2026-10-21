@@ -19,9 +19,7 @@ import uuid
 
 from pydantic import BaseModel
 
-from deeptutor.commercial.storage_limits import (
-    atomic_write_bytes_with_storage_limits,
-)
+from deeptutor.services.file_io import atomic_write_json
 from deeptutor.services.llm import clean_thinking_tags
 from deeptutor.services.path_service import get_path_service
 
@@ -37,6 +35,8 @@ class RecordType(str, Enum):
     CHAT = "chat"
     CO_WRITER = "co_writer"
     TUTORBOT = "tutorbot"
+    READING = "reading"
+    VIDEO_LEARNING = "video_learning"
 
 
 class NotebookRecord(BaseModel):
@@ -89,14 +89,6 @@ def _clean_record_summary(summary: str) -> str:
     return clean_thinking_tags(str(summary or "")).strip()
 
 
-def _json_bytes(payload: dict) -> bytes:
-    return json.dumps(payload, indent=2, ensure_ascii=False).encode("utf-8")
-
-
-def _atomic_write_json(path: Path, payload: dict) -> None:
-    atomic_write_bytes_with_storage_limits(path, _json_bytes(payload))
-
-
 class NotebookManager:
     """Manage notebook files stored under ``data/user/workspace/notebook``."""
 
@@ -135,7 +127,7 @@ class NotebookManager:
 
     def _ensure_index(self) -> None:
         if not self.index_file.exists():
-            _atomic_write_json(self.index_file, {"notebooks": []})
+            atomic_write_json(self.index_file, {"notebooks": []})
 
     def _load_index(self) -> dict:
         try:
@@ -158,7 +150,15 @@ class NotebookManager:
             try:
                 with open(path, encoding="utf-8") as f:
                     notebook = json.load(f)
-            except Exception:
+            except Exception as exc:
+                # The file is left untouched on disk, so the damage stays
+                # visible and repairable: list_notebooks() re-adopts it as an
+                # ``unreadable`` entry instead of the notebook quietly vanishing.
+                logger.warning(
+                    "notebook file %s is unreadable (%s); excluded from the rebuilt index",
+                    path,
+                    exc,
+                )
                 continue
             entries.append(self._index_row(notebook))
         return entries
@@ -178,10 +178,14 @@ class NotebookManager:
         }
 
     def _save_index(self, index: dict) -> None:
-        _atomic_write_json(self.index_file, index)
+        atomic_write_json(self.index_file, index)
 
     def _get_notebook_file(self, notebook_id: str) -> Path:
-        return self.base_dir / f"{notebook_id}.json"
+        base = self.base_dir.resolve()
+        target = (base / f"{notebook_id}.json").resolve()
+        if not target.is_relative_to(base):
+            raise ValueError(f"notebook id escapes base directory: {notebook_id!r}")
+        return target
 
     def _load_notebook(self, notebook_id: str) -> dict | None:
         """Return the notebook, or ``None`` when no such file exists.
@@ -203,7 +207,7 @@ class NotebookManager:
             raise NotebookCorruptedError(notebook_id, filepath, exc) from exc
         if self._sanitize_loaded_notebook(notebook):
             try:
-                self._save_notebook(notebook)
+                self._save_notebook(notebook_id, notebook)
             except Exception:
                 logger.warning("could not persist sanitized notebook %s", notebook_id)
         return notebook
@@ -223,8 +227,8 @@ class NotebookManager:
                 changed = True
         return changed
 
-    def _save_notebook(self, notebook: dict) -> None:
-        _atomic_write_json(self._get_notebook_file(notebook["id"]), notebook)
+    def _save_notebook(self, notebook_id: str, notebook: dict) -> None:
+        atomic_write_json(self._get_notebook_file(notebook_id), notebook)
 
     def _touch_index_entry(self, notebook_id: str, notebook: dict) -> None:
         """Refresh this notebook's index row, re-adding it if it went missing."""
@@ -262,9 +266,23 @@ class NotebookManager:
         }
 
         with self._locked(notebook_id):
-            self._save_notebook(notebook)
+            self._save_notebook(notebook_id, notebook)
             self._touch_index_entry(notebook_id, notebook)
         return notebook
+
+    def get_or_create_notebook(
+        self, name: str, description: str = "", color: str = "#3B82F6", icon: str = "book"
+    ) -> dict:
+        """Return an existing notebook with this exact name, or create one."""
+        with self._index_lock:
+            for row in self._load_index().get("notebooks", []):
+                if row.get("name") != name:
+                    continue
+                notebook_id = str(row.get("id") or "")
+                notebook = self._load_notebook(notebook_id) if notebook_id else None
+                if notebook:
+                    return notebook
+            return self.create_notebook(name=name, description=description, color=color, icon=icon)
 
     def list_notebooks(self) -> list[dict]:
         """List every notebook on disk, newest first.
@@ -364,7 +382,7 @@ class NotebookManager:
                 notebook["icon"] = icon
 
             notebook["updated_at"] = time.time()
-            self._save_notebook(notebook)
+            self._save_notebook(notebook_id, notebook)
             self._touch_index_entry(notebook_id, notebook)
             return notebook
 
@@ -433,7 +451,7 @@ class NotebookManager:
                 # others — use ``copy_record`` for an explicit independent copy.
                 notebook.setdefault("records", []).append(dict(record))
                 notebook["updated_at"] = now
-                self._save_notebook(notebook)
+                self._save_notebook(notebook_id, notebook)
                 self._touch_index_entry(notebook_id, notebook)
                 added_to.append(notebook_id)
 
@@ -503,7 +521,7 @@ class NotebookManager:
                 return None
 
             notebook["updated_at"] = time.time()
-            self._save_notebook(notebook)
+            self._save_notebook(notebook_id, notebook)
             self._touch_index_entry(notebook_id, notebook)
             return updated_record
 
@@ -555,7 +573,7 @@ class NotebookManager:
                 return False
 
             notebook["updated_at"] = time.time()
-            self._save_notebook(notebook)
+            self._save_notebook(notebook_id, notebook)
             self._touch_index_entry(notebook_id, notebook)
             return True
 
@@ -588,7 +606,7 @@ class NotebookManager:
                 return None
             target.setdefault("records", []).append(copied)
             target["updated_at"] = time.time()
-            self._save_notebook(target)
+            self._save_notebook(target_notebook_id, target)
             self._touch_index_entry(target_notebook_id, target)
         return copied
 

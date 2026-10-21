@@ -14,6 +14,8 @@ from dataclasses import dataclass
 import re
 from typing import TYPE_CHECKING, Any
 
+from deeptutor.utils.text_display import decode_escaped_unicode_for_display
+
 if TYPE_CHECKING:
     from deeptutor.learning.models import PendingQuestion
 
@@ -92,11 +94,6 @@ def has_option_bodies(options: dict[str, str]) -> bool:
     )
 
 
-def format_options(options: dict[str, str]) -> list[str]:
-    """Render a choice map as canonical, persistable ``"label: body"`` strings."""
-    return [f"{label}: {body}" for label, body in options.items()]
-
-
 def resolve_answer(answer: str, options: dict[str, str]) -> str:
     """Resolve a label, labelled option, or unique body to its stable label."""
     candidate = str(answer or "").strip()
@@ -169,6 +166,52 @@ def resolve_choice_submission(answer: str, options: dict[str, str]) -> str:
     return mentioned[0] if len(mentioned) == 1 else ""
 
 
+def is_readable_choice_answer(answer: str, options: list[str] | dict[str, str]) -> bool:
+    """Whether *answer* identifies exactly one option on a choice question.
+
+    Composer text that is a clarifying question (or otherwise unmappable) must
+    not be treated as a committed pick — see mastery gate stall #1004.
+    """
+    option_map = parse_options(options) if isinstance(options, list) else options
+    if not option_map:
+        return False
+    candidate = str(answer or "").strip()
+    resolved = resolve_choice_submission(candidate, option_map)
+    if not resolved:
+        return False
+
+    # Exact labels (optionally followed by declarative punctuation), labelled
+    # answers, and exact option bodies are unambiguous without extra wording.
+    if re.fullmatch(rf"{re.escape(resolved)}[。.!！]?", candidate, re.IGNORECASE):
+        return True
+    prefix_match = OPTION_PREFIX_RE.match(candidate)
+    if prefix_match and prefix_match.group(1).upper() == resolved:
+        return True
+    if _squeezed(candidate) == _squeezed(option_map[resolved]):
+        return True
+
+    # Merely mentioning one label is not an answer. In particular, questions
+    # such as "why is B wrong?" used to resolve to B and freeze the gate.
+    if re.search(
+        r"[?？]|\b(?:why|what|how|can|could|would|explain)\b|"
+        r"(?:为什么|为何|怎么|如何|什么|解释一下|请解释)",
+        candidate,
+        re.IGNORECASE,
+    ):
+        return False
+
+    label = re.escape(resolved)
+    return bool(
+        re.search(
+            rf"(?:\b(?:answer(?:\s+is)?|choose|pick|select|"
+            rf"think(?:\s+it(?:'s|\s+is))?|go\s+with)\s*(?:option\s*)?{label}\b|"
+            rf"(?:答案(?:是|为)?|我?选(?:择)?|应该是|我觉得是)\s*{label})",
+            candidate,
+            re.IGNORECASE,
+        )
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class PublicPendingOption:
     """One learner-visible option; ``id`` and ``label`` are intentionally stable."""
@@ -180,9 +223,6 @@ class PublicPendingOption:
     def to_dict(self) -> dict[str, str]:
         return {"id": self.id, "label": self.label, "body": self.body}
 
-    def to_ask_user_dict(self) -> dict[str, str]:
-        return {"label": self.label, "description": self.body}
-
 
 @dataclass(frozen=True, slots=True)
 class PublicPendingQuestion:
@@ -192,41 +232,43 @@ class PublicPendingQuestion:
     prompt: str
     question_type: str
     options: tuple[PublicPendingOption, ...] = ()
+    questions: tuple[PublicPendingQuestion, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "question_id": self.question_id,
             "prompt": self.prompt,
             "question_type": self.question_type,
             "options": [option.to_dict() for option in self.options],
         }
-
-    def to_ask_user_dict(self) -> dict[str, Any]:
-        return {
-            "id": self.question_id,
-            "prompt": self.prompt,
-            "options": [option.to_ask_user_dict() for option in self.options],
-            "multi_select": False,
-            "allow_free_text": True,
-        }
+        if self.questions:
+            result["questions"] = [question.to_dict() for question in self.questions]
+        return result
 
 
 def public_pending_question(pending: PendingQuestion) -> PublicPendingQuestion:
     """Project persisted pending state without exposing ``expected_answer``."""
-    choice_map = parse_options(list(pending.options or []))
     options = (
         tuple(
-            PublicPendingOption(id=label, label=label, body=body)
-            for label, body in choice_map.items()
+            PublicPendingOption(id=option.label, label=option.label, body=option.body)
+            for option in pending.options
         )
         if pending.question_type == "choice"
         else ()
     )
     return PublicPendingQuestion(
         question_id=pending.question_id,
-        prompt=pending.prompt,
+        prompt=decode_escaped_unicode_for_display(pending.prompt),
         question_type=pending.question_type,
-        options=options,
+        questions=tuple(public_pending_question(q) for q in pending.questions),
+        options=tuple(
+            PublicPendingOption(
+                id=option.id,
+                label=decode_escaped_unicode_for_display(option.label),
+                body=decode_escaped_unicode_for_display(option.body),
+            )
+            for option in options
+        ),
     )
 
 
@@ -235,8 +277,8 @@ __all__ = [
     "canonical_labels",
     "PublicPendingOption",
     "PublicPendingQuestion",
-    "format_options",
     "has_option_bodies",
+    "is_readable_choice_answer",
     "option_label_intent",
     "parse_options",
     "positional_label",

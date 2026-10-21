@@ -3,21 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import ipaddress
 import json
 from typing import Any
 from urllib.parse import urlparse
 
-from deeptutor.multi_user.byok_policy import (
-    allowed_binding,
-    byok_runtime_enabled,
-    grant_service_enabled,
-    load_policy,
-    official_endpoint,
-    validate_endpoint,
-)
-from deeptutor.multi_user.byok_vault import get_user_byok_vault
-from deeptutor.multi_user.context import get_current_user
-from deeptutor.multi_user.grants import load_grant
 from deeptutor.services.imagegen.config import ImagegenConfig
 from deeptutor.services.keypool import primary_api_key
 from deeptutor.services.model_selection import LLMSelection, apply_llm_selection_to_catalog
@@ -25,11 +15,14 @@ from deeptutor.services.provider_registry import (
     NANOBOT_LLM_PROVIDERS,
     PROVIDERS,
     ProviderSpec,
+    api_format_for_provider,
+    api_format_from_legacy,
     canonical_provider_name,
     find_by_model,
     find_by_name,
     find_gateway,
     wire_api_for_provider,
+    wire_api_from_api_format,
 )
 from deeptutor.services.videogen.config import VideogenConfig
 from deeptutor.services.voice.config import (
@@ -39,6 +32,7 @@ from deeptutor.services.voice.config import (
     STT_MULTIPART,
     STTConfig,
     TTSConfig,
+    resolve_tts_request_timeout,
 )
 
 from .embedding_endpoint import (
@@ -50,7 +44,13 @@ from .embedding_endpoint import (
     normalize_embedding_endpoint_for_display,
 )
 from .loader import load_config_with_main
-from .model_catalog import ModelCatalogService, get_model_catalog_service
+from .model_catalog import (
+    LLM_SHAPED_SERVICES,
+    MODEL_CAPABILITY_KEYS,
+    ModelCatalogService,
+    get_model_catalog_service,
+)
+from .provider_links import resolve_profile_provider
 
 
 @dataclass(frozen=True)
@@ -99,6 +99,7 @@ SEARCH_PROVIDERS: dict[str, SearchProviderSpec] = {
         supports_answer=True,
     ),
     "serper": SearchProviderSpec(label="Serper", requires_api_key=True, soft_fallback=False),
+    "serply": SearchProviderSpec(label="Serply", requires_api_key=True, soft_fallback=False),
     "firecrawl": SearchProviderSpec(label="Firecrawl", requires_api_key=True, soft_fallback=False),
     # China-hosted engines. Doubao is the one that writes its own answer: Ark
     # exposes web search only as a tool on a Doubao model, never standalone.
@@ -224,6 +225,13 @@ EMBEDDING_PROVIDERS: dict[str, EmbeddingProviderSpec] = {
         keywords=("vllm", "lmstudio"),
         is_local=True,
     ),
+    "lemonade": EmbeddingProviderSpec(
+        label="Lemonade Server",
+        mode="local",
+        default_api_base=EMBEDDING_PROVIDER_DEFAULT_ENDPOINTS["lemonade"],
+        keywords=("lemonade",),
+        is_local=True,
+    ),
     "siliconflow": EmbeddingProviderSpec(
         label="SiliconFlow",
         adapter="openai_compat",
@@ -276,11 +284,11 @@ EMBEDDING_PROVIDERS: dict[str, EmbeddingProviderSpec] = {
         keywords=("openrouter",),
         is_local=False,
     ),
-    "orcarouter": EmbeddingProviderSpec(
-        label="OrcaRouter",
+    "opper": EmbeddingProviderSpec(
+        label="Opper",
         adapter="openai_compat",
-        default_api_base=EMBEDDING_PROVIDER_DEFAULT_ENDPOINTS["orcarouter"],
-        keywords=("orcarouter", "orca_router"),
+        default_api_base=EMBEDDING_PROVIDER_DEFAULT_ENDPOINTS["opper"],
+        keywords=("opper",),
         is_local=False,
         default_model="openai/text-embedding-3-large",
         default_dim=3072,
@@ -310,58 +318,97 @@ class VoiceProviderSpec:
     is_local: bool = False
 
 
-# Voice providers in the OpenAI-compatible cluster. A single adapter covers all
-# of these; bespoke providers (DashScope native, ElevenLabs, Gemini, Deepgram)
-# would register their own ``adapter`` value once implemented.
+# Voice providers either use the shared OpenAI-compatible adapter or a native
+# protocol adapter registered by name (DashScope and Volcengine Speech TTS/STT).
 TTS_PROVIDERS: dict[str, VoiceProviderSpec] = {
+    "xiaomi_mimo": VoiceProviderSpec(
+        label="Xiaomi MiMo",
+        default_api_base="https://api.xiaomimimo.com/v1",
+        adapter="mimo_tts",
+        default_model="mimo-v2.5-tts",
+    ),
+    "minimax": VoiceProviderSpec(
+        label="MiniMax",
+        default_api_base="https://api.minimax.io/v1",
+        adapter="minimax",
+        default_model="speech-2.8-hd",
+    ),
+    "volcengine_speech": VoiceProviderSpec(
+        label="Volcengine Speech (Doubao)",
+        default_api_base="https://openspeech.bytedance.com/api/v3",
+        adapter="volcengine",
+        default_model="seed-tts-2.0",
+    ),
+    "dashscope": VoiceProviderSpec(
+        label="Aliyun DashScope",
+        default_api_base="https://dashscope.aliyuncs.com/api/v1",
+        adapter="dashscope",
+        default_model="qwen3-tts-flash",
+    ),
     "openai": VoiceProviderSpec(
         label="OpenAI",
         default_api_base="https://api.openai.com/v1",
         default_model="gpt-4o-mini-tts",
-        default_voice="alloy",
+    ),
+    # Gemini TTS only speaks the native generateContent audio API, never the
+    # OpenAI-compatible /audio/speech endpoint, so it gets its own adapter.
+    "gemini": VoiceProviderSpec(
+        label="Google Gemini",
+        default_api_base="https://generativelanguage.googleapis.com/v1beta",
+        adapter="gemini",
+        default_model="gemini-2.5-flash-preview-tts",
     ),
     "openrouter": VoiceProviderSpec(
         label="OpenRouter",
         default_api_base="https://openrouter.ai/api/v1",
         adapter="openrouter_tts",
         default_model="openai/gpt-4o-mini-tts",
-        default_voice="alloy",
     ),
     "groq": VoiceProviderSpec(
         label="Groq",
         default_api_base="https://api.groq.com/openai/v1",
         default_model="canopylabs/orpheus-v1-english",
-        default_voice="autumn",
     ),
     "siliconflow": VoiceProviderSpec(
         label="SiliconFlow",
         default_api_base="https://api.siliconflow.cn/v1",
         default_model="FunAudioLLM/CosyVoice2-0.5B",
-        default_voice="FunAudioLLM/CosyVoice2-0.5B:alex",
     ),
     "azure_openai": VoiceProviderSpec(
         label="Azure OpenAI",
         default_api_base="",
         auth_style=AUTH_API_KEY_HEADER,
         default_model="tts-1",
-        default_voice="alloy",
     ),
     "vllm": VoiceProviderSpec(
         label="vLLM / Local",
         default_api_base="http://localhost:8000/v1",
         default_model="",
-        default_voice="",
         is_local=True,
     ),
     "custom": VoiceProviderSpec(
         label="OpenAI Compatible",
         default_api_base="",
         default_model="",
-        default_voice="",
     ),
 }
 
 STT_PROVIDERS: dict[str, VoiceProviderSpec] = {
+    "volcengine_speech": VoiceProviderSpec(
+        label="Volcengine Speech (Doubao)",
+        default_api_base="https://openspeech.bytedance.com/api/v3",
+        adapter="volcengine",
+        default_model="bigmodel",
+    ),
+    # DashScope's native adapter speaks the Paraformer real-time WebSocket API,
+    # which only accepts `paraformer-realtime-*` ids. `paraformer-v2` is a batch
+    # transcription id and the handshake fails with "Model not found".
+    "dashscope": VoiceProviderSpec(
+        label="Aliyun DashScope",
+        default_api_base="https://dashscope.aliyuncs.com/api/v1",
+        adapter="dashscope",
+        default_model="paraformer-realtime-v2",
+    ),
     "openai": VoiceProviderSpec(
         label="OpenAI",
         default_api_base="https://api.openai.com/v1",
@@ -404,6 +451,10 @@ STT_PROVIDERS: dict[str, VoiceProviderSpec] = {
 
 # Provider-name aliases accepted from older/loose catalog values.
 VOICE_PROVIDER_ALIASES = {
+    "volcengine": "volcengine_speech",
+    "doubao": "volcengine_speech",
+    "aliyun": "dashscope",
+    "bailian": "dashscope",
     "azure": "azure_openai",
     "aoai": "azure_openai",
     "openai_compatible": "custom",
@@ -440,6 +491,12 @@ class GenerationProviderSpec:
 # Image-generation providers in the OpenAI-compatible cluster. A single adapter
 # covers all of these; ``default_model`` is only a Settings prefill hint.
 IMAGEGEN_PROVIDERS: dict[str, GenerationProviderSpec] = {
+    "dashscope": GenerationProviderSpec(
+        label="Aliyun DashScope",
+        default_api_base="https://dashscope.aliyuncs.com/api/v1",
+        adapter="dashscope",
+        default_model="wanx2.1-t2i-turbo",
+    ),
     "openai": GenerationProviderSpec(
         label="OpenAI",
         default_api_base="https://api.openai.com/v1",
@@ -486,6 +543,12 @@ IMAGEGEN_PROVIDERS: dict[str, GenerationProviderSpec] = {
 # Video-generation providers. Text-to-video has no synchronous standard; these
 # all use the async-task adapter (submit → poll → download).
 VIDEOGEN_PROVIDERS: dict[str, GenerationProviderSpec] = {
+    "dashscope": GenerationProviderSpec(
+        label="Aliyun DashScope",
+        default_api_base="https://dashscope.aliyuncs.com/api/v1",
+        adapter="dashscope",
+        default_model="wanx2.1-t2v-turbo",
+    ),
     "volcengine": GenerationProviderSpec(
         label="Volcengine Ark (Seedance)",
         default_api_base="https://ark.cn-beijing.volces.com/api/v3",
@@ -502,6 +565,8 @@ VIDEOGEN_PROVIDERS: dict[str, GenerationProviderSpec] = {
 
 # Provider-name aliases accepted from older/loose catalog values.
 GENERATION_PROVIDER_ALIASES = {
+    "aliyun": "dashscope",
+    "bailian": "dashscope",
     "ark": "volcengine",
     "volces": "volcengine",
     "doubao": "volcengine",
@@ -547,9 +612,11 @@ class ResolvedLLMConfig:
     api_version: str | None = None
     extra_headers: dict[str, str] = field(default_factory=dict)
     wire_api: str = "auto"
+    api_format: str = "auto"
     reasoning_effort: str | None = None
     context_window: int | None = None
-    source: str = "platform"
+    # The active model's explicit capability overrides (see MODEL_CAPABILITY_KEYS).
+    capabilities: dict[str, bool] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -659,6 +726,40 @@ def _with_personal_llm_profiles(catalog: dict[str, Any]) -> dict[str, Any]:
         return catalog
 
 
+def _model_capabilities(model: dict[str, Any] | None) -> dict[str, bool]:
+    raw = (model or {}).get("capabilities")
+    if not isinstance(raw, dict):
+        return {}
+    return {key: bool(raw[key]) for key in MODEL_CAPABILITY_KEYS if isinstance(raw.get(key), bool)}
+
+
+def _register_catalog_capabilities(catalog: dict[str, Any]) -> None:
+    """Publish every model's explicit capability overrides to the LLM tables.
+
+    Runs on each resolution so an override removed in Settings stops applying
+    without a restart. Imported lazily: ``deeptutor.services.llm`` imports this
+    module for its config, so a module-level import would close a cycle.
+    """
+    from deeptutor.services.llm.capabilities import set_catalog_capability_overrides
+
+    entries: list[tuple[str, str, dict[str, bool]]] = []
+    for service_name in LLM_SHAPED_SERVICES:
+        service = catalog.get("services", {}).get(service_name, {})
+        for profile in service.get("profiles", []) or []:
+            if not isinstance(profile, dict):
+                continue
+            binding = canonical_provider_name(_as_str(profile.get("binding"))) or ""
+            for model in profile.get("models", []) or []:
+                if not isinstance(model, dict):
+                    continue
+                effective = resolve_profile_provider(catalog, service_name, profile, model)
+                binding = canonical_provider_name(_as_str(effective.get("binding"))) or ""
+                overrides = _model_capabilities(model)
+                if overrides:
+                    entries.append((binding, _as_str(model.get("model")), overrides))
+    set_catalog_capability_overrides(entries)
+
+
 def _active_profile_and_model(
     catalog: dict[str, Any],
     service: ModelCatalogService,
@@ -672,7 +773,10 @@ def _active_profile_and_model(
 def _collect_provider_pool(catalog: dict[str, Any]) -> dict[str, NormalizedProviderConfig]:
     providers: dict[str, NormalizedProviderConfig] = {}
     llm_profiles = catalog.get("services", {}).get("llm", {}).get("profiles", [])
-    for profile in llm_profiles:
+    for raw in llm_profiles:
+        profile = resolve_profile_provider(
+            catalog, "llm", raw, next(iter(raw.get("models", [])), None)
+        )
         name = canonical_provider_name(_as_str(profile.get("binding")))
         if not name:
             continue
@@ -736,99 +840,40 @@ def _choose_resolved_provider(
     return find_by_name("openai") or PROVIDERS[0]
 
 
-def _resolve_byok_llm_runtime_config(selection: LLMSelection) -> ResolvedLLMConfig:
-    """Resolve a user-owned LLM profile without touching the platform catalog."""
-    user = get_current_user()
-    policy = load_policy()
-    grant = load_grant(user.id)
-    if not byok_runtime_enabled("llm", policy):
-        raise PermissionError("BYOK is disabled for LLM requests")
-    if not user.is_admin and not grant_service_enabled(grant, "byok", "llm"):
-        raise PermissionError("BYOK is not enabled for this account")
-    if not selection.profile_id:
-        raise ValueError("Invalid BYOK selection: profile_id is required")
-
-    metadata, api_key = get_user_byok_vault().load_secret(user.id, selection.profile_id)
-    if str(metadata.get("service") or "") != "llm":
-        raise PermissionError("The selected BYOK profile is not an LLM profile")
-    current_generation = int(metadata.get("generation") or 0)
-    if selection.generation is not None and current_generation != selection.generation:
-        raise PermissionError("The selected BYOK profile changed; reload and select it again")
-
-    binding_hint_raw = _as_str(metadata.get("provider"))
-    if not binding_hint_raw or not allowed_binding("llm", binding_hint_raw, policy):
-        raise PermissionError("This BYOK provider is not allowed by the administrator")
-    binding_hint = canonical_provider_name(binding_hint_raw) or binding_hint_raw
-    spec = find_by_name(binding_hint)
-    if spec is None:
-        raise ValueError("The selected BYOK provider is not registered")
-
-    model = _as_str(metadata.get("model"))
-    if not model:
-        raise ValueError("The selected BYOK profile has no model")
-    configured_endpoint = _as_str(metadata.get("base_url")) or official_endpoint(binding_hint)
-    if not configured_endpoint:
-        raise ValueError("The selected BYOK profile has no usable endpoint")
-    endpoint = validate_endpoint(
-        configured_endpoint,
-        service="llm",
-        binding=binding_hint,
-        policy=policy,
-        # Profile creation validates DNS synchronously before persistence. Keep
-        # runtime resolution off that path so it cannot block the event loop.
-        resolve_dns=False,
-    )
-    if not endpoint:
-        raise ValueError("The selected BYOK profile has no usable endpoint")
-
-    return ResolvedLLMConfig(
-        model=model,
-        provider_name=spec.name,
-        provider_mode=spec.mode,
-        binding_hint=binding_hint,
-        binding=spec.name,
-        api_key=api_key,
-        base_url=endpoint,
-        effective_url=endpoint,
-        api_version=None,
-        extra_headers={},
-        reasoning_effort=None,
-        context_window=None,
-        source="byok",
-    )
-
-
 def resolve_llm_runtime_config(
     catalog: dict[str, Any] | None = None,
     *,
     service: ModelCatalogService | None = None,
     llm_selection: dict[str, Any] | LLMSelection | None = None,
+    service_name: str = "llm",
 ) -> ResolvedLLMConfig:
-    """Resolve active LLM config with TutorBot-style provider matching."""
-    resolved_selection = LLMSelection.from_payload(llm_selection)
-    if resolved_selection is None and not get_current_user().is_admin:
-        from deeptutor.multi_user.model_access import default_llm_selection
+    """Resolve active LLM config with TutorBot-style provider matching.
 
-        resolved_selection = LLMSelection.from_payload(default_llm_selection())
-        if resolved_selection is None:
-            raise PermissionError("No LLM model is assigned to your account")
-    if resolved_selection is not None and resolved_selection.source == "byok":
-        return _resolve_byok_llm_runtime_config(resolved_selection)
-    if resolved_selection is not None and not get_current_user().is_admin:
-        # Runtime resolution is also a public server boundary for callers that
-        # do not pass through TurnRuntimeManager.
-        from deeptutor.multi_user.model_access import apply_allowed_llm_selection
-
-        resolved_selection = (
-            LLMSelection.from_payload(apply_allowed_llm_selection(resolved_selection.to_dict()))
-            or resolved_selection
-        )
-
+    ``service_name`` selects which catalog service supplies the profile and
+    model. It is ``llm`` for everything the user drives; the ``task`` service
+    is the same shape and stands in for it on the calls DeepTutor makes on its
+    own. The provider pool it falls back to stays the LLM one either way —
+    a task profile that names a bare model still resolves against the
+    credentials configured for chat.
+    """
     catalog_service = service or get_model_catalog_service()
     loaded = _with_personal_llm_profiles(_load_catalog(catalog))
-    loaded = apply_llm_selection_to_catalog(loaded, resolved_selection)
+    # Parse the payload once: ``apply_llm_selection_to_catalog`` would otherwise
+    # re-parse it, so a malformed selection would be validated (and rejected)
+    # from two places. ``from_payload`` is idempotent on an already-parsed value.
+    if service_name == "task" and llm_selection is None:
+        task = loaded.get("services", {}).get("task", {})
+        if task.get("mode") == "reference":
+            llm_selection = task.get("selection")
+            if not llm_selection:
+                raise ValueError("Choose a task model from a configured provider.")
+            service_name = "llm"
+        elif task.get("mode") == "inherit":
+            service_name = "llm"
+    selection = LLMSelection.from_payload(llm_selection)
+    loaded = apply_llm_selection_to_catalog(loaded, selection)
 
-    profile, model = _active_profile_and_model(loaded, catalog_service, "llm")
+    profile, model = _active_profile_and_model(loaded, catalog_service, service_name)
     resolved_model = _as_str((model or {}).get("model"))
 
     binding_hint_raw = _as_str((profile or {}).get("binding"))
@@ -838,17 +883,23 @@ def resolve_llm_runtime_config(
     active_api_base = _as_str((profile or {}).get("base_url"))
     active_api_version = _as_str((profile or {}).get("api_version"))
     configured_wire_api = _as_str((profile or {}).get("wire_api")) or "auto"
+    configured_api_format = (profile or {}).get("api_format")
     reasoning_effort = _as_str((model or {}).get("reasoning_effort")) or None
     # Per-conversation override (#641): an explicit reasoning_effort on the
     # caller's LLMSelection takes precedence over the profile/model default
     # resolved above. The model/global config value stays the fallback when
     # no override is present, preserving today's behavior.
-    if resolved_selection is not None and resolved_selection.reasoning_effort:
-        reasoning_effort = resolved_selection.reasoning_effort
+    if selection is not None and selection.reasoning_effort:
+        reasoning_effort = selection.reasoning_effort
     active_extra_headers = _to_headers((profile or {}).get("extra_headers"))
     context_window = _coerce_optional_int((model or {}).get("context_window"))
     if context_window is None:
         context_window = _coerce_optional_int((model or {}).get("context_window_tokens"))
+
+    # Old diagnostics allowed users to adopt a guessed budget as model capacity.
+    # Preserve manual/provider values, but retire those explicitly marked fallback.
+    if (model or {}).get("context_window_source") == "default":
+        context_window = None
 
     provider_pool = _collect_provider_pool(loaded)
     spec = _choose_resolved_provider(
@@ -859,15 +910,28 @@ def resolve_llm_runtime_config(
         provider_pool=provider_pool,
     )
 
-    mapped = provider_pool.get(spec.name)
+    # Profiles written before ``api_format`` existed carry only ``wire_api``.
+    # Settle the protocol before choosing its vendor-specific default address.
+    if configured_api_format is None:
+        api_format = api_format_from_legacy(spec, configured_wire_api)
+    else:
+        api_format = api_format_for_provider(configured_api_format, spec)
+    wire_api = wire_api_for_provider(wire_api_from_api_format(api_format), spec)
+
+    mapped = (
+        None
+        if (profile or {}).get("provider_ref") or (model or {}).get("provider_ref")
+        else provider_pool.get(spec.name)
+    )
     api_key = active_api_key or (mapped.api_key if mapped else "")
     api_base = active_api_base or ((mapped.api_base or "") if mapped else "")
     api_version = active_api_version or ((mapped.api_version or "") if mapped else "")
-    if not api_base and spec.default_api_base:
-        api_base = spec.default_api_base
+    if not api_base:
+        api_base = spec.default_api_base_for(api_format)
     if not api_key and spec.is_local:
         api_key = "sk-no-key-required"
     extra_headers = active_extra_headers or ((mapped.extra_headers or {}) if mapped else {})
+    _register_catalog_capabilities(loaded)
 
     return ResolvedLLMConfig(
         model=resolved_model,
@@ -880,10 +944,11 @@ def resolve_llm_runtime_config(
         effective_url=api_base or None,
         api_version=api_version or None,
         extra_headers=extra_headers,
-        wire_api=wire_api_for_provider(configured_wire_api, spec),
+        wire_api=wire_api,
+        api_format=api_format,
         reasoning_effort=reasoning_effort,
         context_window=context_window,
-        source="platform",
+        capabilities=_model_capabilities(model),
     )
 
 
@@ -906,7 +971,10 @@ def _collect_embedding_provider_pool(
 ) -> dict[str, NormalizedProviderConfig]:
     providers: dict[str, NormalizedProviderConfig] = {}
     embedding_profiles = catalog.get("services", {}).get("embedding", {}).get("profiles", [])
-    for profile in embedding_profiles:
+    for raw in embedding_profiles:
+        profile = resolve_profile_provider(
+            catalog, "embedding", raw, next(iter(raw.get("models", [])), None)
+        )
         name = _canonical_embedding_provider_name(_as_str(profile.get("binding")))
         if not name:
             continue
@@ -967,6 +1035,53 @@ def _coerce_optional_int(value: Any) -> int | None:
     return parsed if parsed > 0 else None
 
 
+def _is_nonpublic_embedding_host(hostname: str) -> bool:
+    """Loopback, LAN, and container names that are not a public vendor host."""
+    host = hostname.lower().strip("[]").rstrip(".")
+    if not host:
+        return False
+    if host in {
+        "localhost",
+        "127.0.0.1",
+        "::1",
+        "lemonade",
+        "host.docker.internal",
+        "gateway.docker.internal",
+    }:
+        return True
+    if host.endswith(".local") or host.endswith(".internal"):
+        return True
+    # Docker Compose service names are a single DNS label.
+    if "." not in host:
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return bool(address.is_private or address.is_loopback or address.is_link_local)
+
+
+def _is_legacy_lemonade_endpoint(api_base: str) -> bool:
+    """Keyless Lemonade servers saved as a generic OpenAI-compatible URL.
+
+    Unraid and Docker installs often point at a LAN address or
+    ``host.docker.internal`` and store the chat root (``/api/v1``) rather than
+    the embeddings path. Those still have to resolve as local Lemonade, or
+    knowledge-base creation demands an API key the server does not use (#1782).
+    A public host on the same port stays a remote OpenAI-compatible endpoint.
+    """
+    try:
+        endpoint = urlparse(api_base if "://" in api_base else f"http://{api_base}")
+        if endpoint.port != 13305:
+            return False
+    except ValueError:
+        return False
+    if not _is_nonpublic_embedding_host(endpoint.hostname or ""):
+        return False
+    path = endpoint.path.rstrip("/")
+    return path.endswith(("/embeddings", "/v1")) or path in {"", "/"}
+
+
 def _resolve_embedding_provider(
     *,
     hint: str | None,
@@ -974,6 +1089,25 @@ def _resolve_embedding_provider(
     api_base: str | None,
     provider_pool: dict[str, NormalizedProviderConfig],
 ) -> str:
+    if api_base and _is_legacy_lemonade_endpoint(api_base) and hint in {None, "custom", "openai"}:
+        # Older keyless Lemonade profiles were saved as generic OpenAI
+        # Compatible embeddings. Recognize that endpoint before a Qwen3 model
+        # name is mistaken for a remote embedding vendor (#1568, #1782).
+        return "lemonade"
+
+    if _is_local_base_url(api_base) and hint in {None, "custom", "openai"}:
+        # Ollama also serves OpenAI-compatible embeddings on /v1/embeddings.
+        # Select the wire protocol by path, not by a port substring.
+        endpoint = urlparse(api_base if "://" in api_base else f"http://{api_base}")
+        path = endpoint.path.rstrip("/")
+        try:
+            native_root = not path and endpoint.port == 11434
+        except ValueError:
+            native_root = False
+        if path in {"/api/embed", "/api/embeddings"} or native_root:
+            return "ollama"
+        return "vllm"
+
     if hint and hint in EMBEDDING_PROVIDERS:
         return hint
 
@@ -985,11 +1119,6 @@ def _resolve_embedding_provider(
     for provider_name, spec in EMBEDDING_PROVIDERS.items():
         if any(keyword in model_lower for keyword in spec.keywords):
             return provider_name
-
-    if _is_local_base_url(api_base):
-        if api_base and "11434" in api_base:
-            return "ollama"
-        return "vllm"
 
     for provider_name, spec in EMBEDDING_PROVIDERS.items():
         configured = provider_pool.get(provider_name)
@@ -1015,7 +1144,7 @@ def resolve_embedding_runtime_config(
     resolved_model = _as_str((model or {}).get("model"))
     if not resolved_model:
         raise ValueError(
-            "No active embedding model is configured. Please set it in Settings > Catalog."
+            "No active embedding model is configured. Set it in Settings > Embedding models."
         )
 
     binding_hint_raw = _as_str((profile or {}).get("binding"))
@@ -1041,7 +1170,11 @@ def resolve_embedding_runtime_config(
         provider_pool=provider_pool,
     )
     spec = EMBEDDING_PROVIDERS[provider_name]
-    mapped = provider_pool.get(provider_name)
+    mapped = (
+        None
+        if (profile or {}).get("provider_ref") or (model or {}).get("provider_ref")
+        else provider_pool.get(provider_name)
+    )
 
     api_key = active_api_key or (mapped.api_key if mapped else "")
     api_base = active_api_base or ((mapped.api_base or "") if mapped else "")
@@ -1053,6 +1186,11 @@ def resolve_embedding_runtime_config(
             api_base = gemini_default_embedding_endpoint(resolved_model)
         elif spec.default_api_base:
             api_base = spec.default_api_base
+    if provider_name == "lemonade" and api_base:
+        # Chat-root URLs such as ``/api/v1`` are what Settings saves for an
+        # OpenAI-compatible Lemonade connection. Embedding calls need the
+        # ``/embeddings`` path or the client rejects them after the key check.
+        api_base = normalize_embedding_endpoint_for_display("lemonade", api_base)
     if provider_name == "aliyun":
         # DashScope's SDK derives the endpoint from the model id and ignores any
         # configured URL, so a saved multimodal endpoint would mislead the
@@ -1113,8 +1251,18 @@ def resolve_tts_runtime_config(
     api_key = _as_str((profile or {}).get("api_key"))
     if not api_key and spec.is_local:
         api_key = "sk-no-key-required"
-    voice = _as_str((model or {}).get("voice")) or spec.default_voice
-    response_format = _as_str((model or {}).get("response_format")) or "mp3"
+    from deeptutor.services.voice.options import voice_model_options
+
+    options = voice_model_options(provider, "tts", resolved_model)
+    voice = _as_str((model or {}).get("voice"))
+    response_format = _as_str((model or {}).get("response_format")) or options["formats"][0]
+    raw_speed = (model or {}).get("speed")
+    speed = _coerce_optional_float(raw_speed)
+    if raw_speed not in (None, "") and speed is None:
+        raise ValueError("Speech speed must be a positive number.")
+    limits = options.get("speed")
+    if speed is not None and limits and not limits["min"] <= speed <= limits["max"]:
+        raise ValueError(f"Speech speed must be between {limits['min']} and {limits['max']}.")
 
     return TTSConfig(
         model=resolved_model,
@@ -1122,12 +1270,19 @@ def resolve_tts_runtime_config(
         adapter=spec.adapter,
         auth_style=spec.auth_style,
         api_key=api_key,
+        app_id=_as_str((profile or {}).get("app_id")),
+        resource_id=_as_str((model or {}).get("resource_id")),
         base_url=api_base,
         api_version=_as_str((profile or {}).get("api_version")) or None,
         extra_headers=_to_headers((profile or {}).get("extra_headers")),
         voice=voice,
         response_format=response_format,
-        speed=_coerce_optional_float((model or {}).get("speed")),
+        speed=speed,
+        language=_as_str((model or {}).get("language")) or None,
+        sample_rate=int((model or {}).get("sample_rate") or 24000),
+        instructions=_as_str((model or {}).get("instructions")),
+        max_input_chars=options.get("max_input_chars", 4096),
+        request_timeout=resolve_tts_request_timeout((model or {}).get("request_timeout")),
     )
 
 
@@ -1158,6 +1313,8 @@ def resolve_stt_runtime_config(
         request_style=spec.request_style,
         auth_style=spec.auth_style,
         api_key=api_key,
+        app_id=_as_str((profile or {}).get("app_id")),
+        resource_id=_as_str((model or {}).get("resource_id")),
         base_url=api_base,
         api_version=_as_str((profile or {}).get("api_version")) or None,
         extra_headers=_to_headers((profile or {}).get("extra_headers")),
@@ -1283,7 +1440,11 @@ def _resolve_search_max_results(catalog: dict[str, Any], default: int = 5) -> in
 
 def _search_profiles(catalog: dict[str, Any]) -> list[dict[str, Any]]:
     profiles = catalog.get("services", {}).get("search", {}).get("profiles", [])
-    return [profile for profile in profiles if isinstance(profile, dict)]
+    return [
+        resolve_profile_provider(catalog, "search", profile)
+        for profile in profiles
+        if isinstance(profile, dict) and not profile.get("provider_only")
+    ]
 
 
 def search_provider_credentials(
@@ -1327,8 +1488,6 @@ def search_missing_credential(provider: str, api_key: str, base_url: str) -> str
 def search_fallback_candidates(
     requested: str,
     catalog: dict[str, Any] | None = None,
-    *,
-    service: ModelCatalogService | None = None,
 ) -> list[str]:
     """Ordered providers to try after *requested* fails at runtime.
 
@@ -1339,7 +1498,6 @@ def search_fallback_candidates(
     enter the chain, and ``none`` — an explicit "search is off" — is excluded.
     """
     name = (requested or "").strip().lower()
-    catalog_service = service or get_model_catalog_service()
     loaded = _load_catalog(catalog)
     candidates: list[str] = []
     for profile in _search_profiles(loaded):

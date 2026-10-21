@@ -7,12 +7,6 @@ import os
 from pathlib import Path
 from typing import Any, Callable
 
-from deeptutor.multi_user.quota_config import (
-    DEFAULT_QUOTA,
-    DEFAULT_TOKEN_QUOTA,
-    default_quotas,
-    normalize_quotas,
-)
 from deeptutor.services.file_io import atomic_write_json as _atomic_write_json
 from deeptutor.services.path_service import get_path_service
 
@@ -21,7 +15,13 @@ from .origins import normalize_origins
 
 DEFAULT_SYSTEM_SETTINGS: dict[str, Any] = {
     "version": 1,
+    # About → Updates performs at most one release lookup per process/day.
+    # Operators may disable even that explicit network boundary for offline or
+    # audited deployments; DEEPTUTOR_VERSION_CHECK_ENABLED is the deployment
+    # override for read-only settings volumes.
+    "version_check_enabled": True,
     "backend_port": 8001,
+    "backend_workers": 1,
     "frontend_port": 3782,
     "next_public_api_base_external": "",
     "next_public_api_base": "",
@@ -30,16 +30,11 @@ DEFAULT_SYSTEM_SETTINGS: dict[str, Any] = {
     "disable_ssl_verify": False,
     "chat_attachment_dir": "",
     # Enable the restricted-subprocess code-execution sandbox (the `exec` /
-    # `code_execution` tools the office skills — docx/pdf/pptx/xlsx — run on).
+    # unified `exec` tool the office skills — docx/pdf/pptx/xlsx — run on).
     # Default on so document generation works out of the box across all
     # deployment shapes; a stronger backend (runner sidecar / bwrap) still
     # takes precedence when available. Set false to disable host-side exec.
     "sandbox_allow_subprocess": True,
-    # Public/non-admin users stay fail-closed until the runner provides
-    # per-user filesystem isolation. The stock Docker Compose runner only
-    # mounts the admin workspace, so enabling this requires an explicit,
-    # deployment-specific isolation review.
-    "sandbox_allow_untrusted_users": False,
     # Conservative chat -> deep_question routing. Explicit requests only, and
     # callers can still pass config.auto_route=false for a single turn.
     "capability_routing_enabled": False,
@@ -66,6 +61,31 @@ DEFAULT_SYSTEM_SETTINGS: dict[str, Any] = {
     "chat_attachment_max_total_mb": 25,
     "chat_attachment_max_chars_per_doc": 200_000,
     "chat_attachment_max_chars_total": 150_000,
+    # Images the manifest cannot carry across turns are re-attached by the
+    # turn executor instead (#1438). This bounds how many of a conversation's
+    # earlier images ride along on every later turn — a re-sent payload, so
+    # it is a policy like the caps above, not an LLM budget.
+    "chat_prior_image_reinject_max": 4,
+    # Opt-in fastapi-guard request screening (deeptutor/api/security_guard.py).
+    # Off by default: when disabled, the package is never imported and the
+    # middleware stack is unchanged. ``trusted_proxies`` are the only peers
+    # whose X-Forwarded-For is believed; an empty list means the socket peer is
+    # always the client. The rate limit counts every HTTP request from one
+    # client address, so it is sized for the frontend's polling, not for one
+    # call per page view.
+    "security_guard": {
+        "enabled": False,
+        "rate_limit": 300,
+        "rate_limit_window": 60,
+        "trusted_proxies": ["127.0.0.1", "::1"],
+        # Skip the rate limit only. The bundled frontend hides browser
+        # addresses, so its traffic arrives as loopback and would share one
+        # bucket; loopback requests that carry X-Forwarded-For still resolve
+        # to, and are limited as, the forwarded client.
+        "exempt_ips": ["127.0.0.1", "::1"],
+        "whitelist": [],
+        "blacklist": [],
+    },
 }
 
 # Clamp bounds for the chat attachment knobs. The MB ceilings are deliberately
@@ -74,6 +94,9 @@ DEFAULT_SYSTEM_SETTINGS: dict[str, Any] = {
 CHAT_ATTACHMENT_MAX_FILE_MB_RANGE = (1, 1024)
 CHAT_ATTACHMENT_MAX_TOTAL_MB_RANGE = (1, 2048)
 CHAT_ATTACHMENT_CHARS_RANGE = (10_000, 5_000_000)
+# Zero is a real choice here — it turns prior-image re-injection off for a
+# deployment whose model or bandwidth cannot afford it.
+CHAT_PRIOR_IMAGE_REINJECT_RANGE = (0, 20)
 
 DEFAULT_AUTH_SETTINGS: dict[str, Any] = {
     "version": 1,
@@ -82,30 +105,25 @@ DEFAULT_AUTH_SETTINGS: dict[str, Any] = {
     "password_hash": "",
     "token_expire_hours": 24,
     "cookie_secure": False,
-    # Per-user LLM credit defaults. Zero means unlimited; these values are
-    # snapshotted into a regular user's grant when the account is created.
-    "default_quota": default_quotas(),
-    # Deprecated compatibility alias for the LLM block above.
-    "default_token_quota": dict(DEFAULT_TOKEN_QUOTA),
-    # Public self-registration is protected by email verification. It remains
-    # fail-closed when SMTP is not configured, so enabling auth alone never
-    # creates an account-creation path that cannot verify ownership.
-    "self_registration_enabled": True,
-    "email_verification_required": True,
-    "verification_code_ttl_minutes": 10,
-    "verification_resend_cooldown_seconds": 60,
-    "verification_max_attempts": 5,
-    "verification_max_per_email_hour": 5,
-    "verification_max_per_ip_hour": 30,
+    "private_login_hosts": [],
 }
 
 DEFAULT_INTEGRATIONS_SETTINGS: dict[str, Any] = {
-    "version": 1,
+    "version": 2,
     "pocketbase_url": "",
     "pocketbase_port": 8090,
     "pocketbase_external_url": "",
     "pocketbase_admin_email": "",
     "pocketbase_admin_password": "",
+    "turn_coordination": {
+        "backend": "memory",
+        "redis_url": "",
+        "key_prefix": "deeptutor",
+        "lease_ttl_seconds": 30,
+        "renew_interval_seconds": 10,
+        "recovery_interval_seconds": 10,
+        "stream_retention_seconds": 86_400,
+    },
 }
 
 # Document parsing settings. The parse layer (deeptutor/services/parsing)
@@ -188,8 +206,8 @@ _DEFAULT_MINERU_ENGINE: dict[str, Any] = {
     "enable_formula": True,
     "enable_table": True,
     "is_ocr": False,
-    "normalize_tiny_scans": False,
     "max_pages_per_part": 180,
+    "normalize_tiny_scans": False,
     "allow_local_model_download": False,
 }
 
@@ -249,6 +267,8 @@ _MINERU_ENGINE_KEYS = frozenset(_DEFAULT_MINERU_ENGINE.keys())
 DEFAULT_DOCUMENT_PARSING_SETTINGS: dict[str, Any] = {
     "version": 2,
     "engine": _DEFAULT_DOCUMENT_PARSING_ENGINE,
+    # Caption embedded figures with a vision model at ingest, so a text-only
+    # model reading the material can still describe its images.
     "image_caption": False,
     "image_description_model": None,
     "engines": {
@@ -277,6 +297,21 @@ DEFAULT_PAGEINDEX_SETTINGS: dict[str, Any] = {
     "api_key": "",
 }
 
+# Query-rewrite layer for retrieval (``RAGService.search``). Disabled by
+# default so behaviour is unchanged until an operator opts in; ``strategy``
+# reserves the ``multi_query`` slot for a follow-up PR.
+DEFAULT_QUERY_REWRITE_SETTINGS: dict[str, Any] = {
+    "version": 1,
+    "enabled": False,
+    "strategy": "standalone",
+    "model": "",
+    "timeout_seconds": 5.0,
+    "min_query_chars": 12,
+}
+
+#: Strategies the query-rewrite layer accepts.
+QUERY_REWRITE_STRATEGIES = ("off", "standalone")
+
 # Tencent IMA. The credential pair (``client_id`` + ``api_key``, issued at
 # https://ima.qq.com/agent-interface) identifies one IMA account, and every
 # library in that account is reachable with it — so it belongs here, beside the
@@ -297,6 +332,10 @@ DEFAULT_IMA_SETTINGS: dict[str, Any] = {
 # * ``top_k`` — default number of chunks a query returns.
 # * ``vector_top_k_multiplier`` / ``bm25_top_k_multiplier`` — how many extra
 #   candidates each child retriever fetches before fusion re-ranks to ``top_k``.
+# * ``reranker_model`` / ``rerank_top_k`` — optional cross-encoder refinement.
+#   An empty model keeps the existing embedding-only ranking.
+# * ``vector_index_type`` — FAISS index type for the next full index build.
+#   HNSW is opt-in and trades exact recall for sub-linear search at scale.
 # * ``chunk_size`` / ``chunk_overlap`` — indexing chunk geometry; changes apply
 #   on the next (re-)index, not retroactively.
 # * ``image_description_concurrency`` / ``image_description_timeout_seconds`` —
@@ -308,6 +347,11 @@ DEFAULT_IMA_SETTINGS: dict[str, Any] = {
 LLAMAINDEX_VECTOR_PROFILE = "vector"
 LLAMAINDEX_HYBRID_PROFILE = "hybrid"
 _LLAMAINDEX_PROFILES = frozenset({LLAMAINDEX_VECTOR_PROFILE, LLAMAINDEX_HYBRID_PROFILE})
+LLAMAINDEX_FLAT_VECTOR_INDEX = "flat"
+LLAMAINDEX_HNSW_VECTOR_INDEX = "hnsw"
+_LLAMAINDEX_VECTOR_INDEX_TYPES = frozenset(
+    {LLAMAINDEX_FLAT_VECTOR_INDEX, LLAMAINDEX_HNSW_VECTOR_INDEX}
+)
 
 DEFAULT_LLAMAINDEX_SETTINGS: dict[str, Any] = {
     "version": 1,
@@ -315,6 +359,12 @@ DEFAULT_LLAMAINDEX_SETTINGS: dict[str, Any] = {
     "top_k": 5,
     "vector_top_k_multiplier": 2,
     "bm25_top_k_multiplier": 2,
+    "reranker_model": "",
+    "rerank_top_k": 50,
+    "vector_index_type": LLAMAINDEX_FLAT_VECTOR_INDEX,
+    "hnsw_m": 32,
+    "hnsw_ef_construction": 200,
+    "hnsw_ef_search": 64,
     "chunk_size": 512,
     "chunk_overlap": 50,
     "image_description_concurrency": 4,
@@ -336,23 +386,55 @@ DEFAULT_GRAPHRAG_SETTINGS: dict[str, Any] = {
     "dynamic_community_selection": False,
 }
 
-# LightRAG retrieval + indexing knobs (HKUDS/LightRAG via RAG-Anything). ``top_k``
+# LightRAG retrieval + indexing knobs (HKUDS/LightRAG native SDK). ``top_k``
 # is the number of entities/relations the query pulls; ``response_type`` mirrors
-# GraphRAG's. These ride into ``QueryParam`` via the engine's aquery() call;
-# wiring is defensive (an older RAG-Anything that rejects a kwarg degrades to a
-# mode-only query). ``max_concurrent_files`` maps to RAGAnythingConfig's batch
-# knob; ``llm_model_max_async`` / ``entity_extract_max_gleaning`` ride into
-# LightRAG's own constructor via RAGAnything's ``lightrag_kwargs`` passthrough.
+# GraphRAG's. These ride into ``QueryParam`` and the pinned SDK constructor.
+# ``max_concurrent_files`` sizes the native parser worker pool after DeepTutor
+# has frozen each ParseService result; pre-parsing itself remains serial.
+# Stable catalog references let LightRAG use a dedicated LLM while the global
+# active chat model remains unchanged for ordinary chat.
 DEFAULT_LIGHTRAG_SETTINGS: dict[str, Any] = {
-    "version": 1,
+    "version": 2,
     "top_k": 60,
     "response_type": "Multiple Paragraphs",
     "max_concurrent_files": 1,
     "llm_model_max_async": 4,
     "entity_extract_max_gleaning": 1,
+    # Maps to LightRAG's ``default_llm_timeout`` (seconds). LightRAG derives its
+    # worker execution cap as 2x this value, so 240 -> a 480s per-call ceiling.
+    "llm_timeout": 240,
+    "llm_profile_id": "",
+    "llm_model_id": "",
+}
+
+# LightRAG Server connection defaults. Individual knowledge bases remain free
+# to override the URL/key when they are connected; this account-level slice is
+# the reusable starting point shown on the engine page and in the create flow.
+DEFAULT_LIGHTRAG_SERVER_SETTINGS: dict[str, Any] = {
+    "version": 1,
+    "server_url": "",
+    "api_key": "",
 }
 
 IGNORE_PROCESS_OVERRIDES_ENV = "DEEPTUTOR_IGNORE_PROCESS_ENV_OVERRIDES"
+
+# Names of the variables a parent DeepTutor process rendered out of the settings
+# files, handed to its children so they can tell "our own launcher derived this
+# from system.json" from "an operator set this in the deployment". Without it the
+# launcher's export looks like a deployment override to the backend and the file
+# can never win again: toggling "check for updates" wrote system.json while the
+# live API kept answering with the value captured at startup (#1536).
+SETTINGS_DERIVED_ENV_KEYS = "DEEPTUTOR_SETTINGS_DERIVED_ENV_KEYS"
+# (process env name, security_guard key) deployment overrides.
+_SECURITY_GUARD_ENV_KEYS = (
+    ("DEEPTUTOR_GUARD_ENABLED", "enabled"),
+    ("DEEPTUTOR_GUARD_RATE_LIMIT", "rate_limit"),
+    ("DEEPTUTOR_GUARD_RATE_LIMIT_WINDOW", "rate_limit_window"),
+    ("DEEPTUTOR_GUARD_TRUSTED_PROXIES", "trusted_proxies"),
+    ("DEEPTUTOR_GUARD_EXEMPT_IPS", "exempt_ips"),
+    ("DEEPTUTOR_GUARD_WHITELIST", "whitelist"),
+    ("DEEPTUTOR_GUARD_BLACKLIST", "blacklist"),
+)
 TRUTHY = {"1", "true", "yes", "on"}
 FALSY = {"0", "false", "no", "off"}
 
@@ -407,6 +489,17 @@ def _string(value: Any) -> str:
     return "" if value is None else str(value).strip()
 
 
+def _host_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [item for raw in value if (item := _string(raw).lower().rstrip("."))]
+    raw = _string(value)
+    return [
+        item
+        for piece in raw.replace(";", ",").split(",")
+        if (item := piece.strip().lower().rstrip("."))
+    ]
+
+
 def _string_or_list(value: Any) -> str | list[str]:
     if isinstance(value, list):
         return [item for raw in value if (item := _string(raw))]
@@ -433,6 +526,10 @@ class RuntimeSettingsService:
         self.process_env = process_env if process_env is not None else os.environ
         self._external_process_keys: set[str] = set()
         self._internal_exported_values: dict[str, str] = {}
+        derived = self.process_env.get(SETTINGS_DERIVED_ENV_KEYS, "") or ""
+        self._settings_derived_keys: frozenset[str] = frozenset(
+            part.strip() for part in derived.split(",") if part.strip()
+        )
 
     @classmethod
     def get_instance(
@@ -470,23 +567,17 @@ class RuntimeSettingsService:
         return payload
 
     def load_auth(self, *, include_process_overrides: bool = True) -> dict[str, Any]:
-        # ``default_token_quota`` predates the resource-oriented
-        # ``default_quota`` shape. Do not let the new default object injected
-        # here mask a legacy file that still contains a customized LLM quota.
-        loaded = _json_object(self.path_for("auth"))
-        defaults = _deepcopy_default(DEFAULT_AUTH_SETTINGS)
-        if loaded and "default_quota" not in loaded and "default_token_quota" in loaded:
-            defaults.pop("default_quota", None)
-        payload = self._load_or_create("auth", defaults, self._normalize_auth)
+        payload = self._load_or_create(
+            "auth",
+            DEFAULT_AUTH_SETTINGS,
+            self._normalize_auth,
+        )
         if include_process_overrides:
             payload = self._apply_auth_process_overrides(payload)
         return payload
 
     def save_auth(self, settings: dict[str, Any]) -> dict[str, Any]:
-        merged = {**DEFAULT_AUTH_SETTINGS, **settings}
-        if "default_quota" not in settings and "default_token_quota" in settings:
-            merged.pop("default_quota", None)
-        payload = self._normalize_auth(merged)
+        payload = self._normalize_auth({**DEFAULT_AUTH_SETTINGS, **settings})
         _atomic_write_json(self.path_for("auth"), payload)
         return payload
 
@@ -575,6 +666,21 @@ class RuntimeSettingsService:
         _atomic_write_json(self.path_for("pageindex"), payload)
         return payload
 
+    def load_query_rewrite(self, *, include_process_overrides: bool = True) -> dict[str, Any]:
+        payload = self._load_or_create(
+            "query_rewrite",
+            DEFAULT_QUERY_REWRITE_SETTINGS,
+            self._normalize_query_rewrite,
+        )
+        if include_process_overrides:
+            payload = self._apply_query_rewrite_process_overrides(payload)
+        return payload
+
+    def save_query_rewrite(self, settings: dict[str, Any]) -> dict[str, Any]:
+        payload = self._normalize_query_rewrite({**DEFAULT_QUERY_REWRITE_SETTINGS, **settings})
+        _atomic_write_json(self.path_for("query_rewrite"), payload)
+        return payload
+
     def load_ima(self, *, include_process_overrides: bool = True) -> dict[str, Any]:
         payload = self._load_or_create("ima", DEFAULT_IMA_SETTINGS, self._normalize_ima)
         if include_process_overrides:
@@ -610,11 +716,37 @@ class RuntimeSettingsService:
         return payload
 
     def load_lightrag(self) -> dict[str, Any]:
+        path = self.path_for("lightrag")
+        if path.exists():
+            # Invalid role settings must never become legacy chat-model fallback.
+            with path.open(encoding="utf-8") as handle:
+                loaded = json.load(handle)
+            if not isinstance(loaded, dict):
+                raise ValueError("LightRAG settings must be an object.")
+            # Existing files without a version predate independent roles.
+            normalized = self._normalize_lightrag(
+                {**DEFAULT_LIGHTRAG_SETTINGS, "version": 1, **loaded}
+            )
+            if normalized != loaded:
+                _atomic_write_json(path, normalized)
+            return normalized
         return self._load_or_create("lightrag", DEFAULT_LIGHTRAG_SETTINGS, self._normalize_lightrag)
 
     def save_lightrag(self, settings: dict[str, Any]) -> dict[str, Any]:
         payload = self._normalize_lightrag({**DEFAULT_LIGHTRAG_SETTINGS, **settings})
         _atomic_write_json(self.path_for("lightrag"), payload)
+        return payload
+
+    def load_lightrag_server(self) -> dict[str, Any]:
+        return self._load_or_create(
+            "lightrag_server",
+            DEFAULT_LIGHTRAG_SERVER_SETTINGS,
+            self._normalize_lightrag_server,
+        )
+
+    def save_lightrag_server(self, settings: dict[str, Any]) -> dict[str, Any]:
+        payload = self._normalize_lightrag_server({**DEFAULT_LIGHTRAG_SERVER_SETTINGS, **settings})
+        _atomic_write_json(self.path_for("lightrag_server"), payload)
         return payload
 
     def ensure_defaults(self) -> None:
@@ -625,8 +757,10 @@ class RuntimeSettingsService:
         self.load_pageindex(include_process_overrides=False)
         self.load_ima(include_process_overrides=False)
         self.load_llamaindex(include_process_overrides=False)
+        self.load_query_rewrite(include_process_overrides=False)
         self.load_graphrag()
         self.load_lightrag()
+        self.load_lightrag_server()
 
     def render_environment(self) -> dict[str, str]:
         """Render non-model settings into process env names for subprocesses."""
@@ -634,7 +768,9 @@ class RuntimeSettingsService:
         auth = self.load_auth()
         integrations = self.load_integrations()
         return {
+            "DEEPTUTOR_VERSION_CHECK_ENABLED": _bool_env(system["version_check_enabled"]),
             "BACKEND_PORT": str(system["backend_port"]),
+            "BACKEND_WORKERS": str(system["backend_workers"]),
             "FRONTEND_PORT": str(system["frontend_port"]),
             "NEXT_PUBLIC_API_BASE_EXTERNAL": system["next_public_api_base_external"],
             "NEXT_PUBLIC_API_BASE": system["next_public_api_base"],
@@ -643,25 +779,12 @@ class RuntimeSettingsService:
             "DISABLE_SSL_VERIFY": _bool_env(system["disable_ssl_verify"]),
             "CHAT_ATTACHMENT_DIR": system["chat_attachment_dir"],
             "DEEPTUTOR_SANDBOX_ALLOW_SUBPROCESS": _bool_env(system["sandbox_allow_subprocess"]),
-            "DEEPTUTOR_SANDBOX_ALLOW_UNTRUSTED_USERS": _bool_env(
-                system["sandbox_allow_untrusted_users"]
-            ),
             "AUTH_ENABLED": _bool_env(auth["enabled"]),
             "AUTH_USERNAME": auth["username"],
             "AUTH_PASSWORD_HASH": auth["password_hash"],
             "AUTH_TOKEN_EXPIRE_HOURS": str(auth["token_expire_hours"]),
             "AUTH_COOKIE_SECURE": _bool_env(auth["cookie_secure"]),
-            "DEEPTUTOR_SELF_REGISTRATION_ENABLED": _bool_env(auth["self_registration_enabled"]),
-            "DEEPTUTOR_EMAIL_VERIFICATION_REQUIRED": _bool_env(auth["email_verification_required"]),
-            "DEEPTUTOR_VERIFICATION_CODE_TTL_MINUTES": str(auth["verification_code_ttl_minutes"]),
-            "DEEPTUTOR_VERIFICATION_RESEND_COOLDOWN_SECONDS": str(
-                auth["verification_resend_cooldown_seconds"]
-            ),
-            "DEEPTUTOR_VERIFICATION_MAX_ATTEMPTS": str(auth["verification_max_attempts"]),
-            "DEEPTUTOR_VERIFICATION_MAX_PER_EMAIL_HOUR": str(
-                auth["verification_max_per_email_hour"]
-            ),
-            "DEEPTUTOR_VERIFICATION_MAX_PER_IP_HOUR": str(auth["verification_max_per_ip_hour"]),
+            "AUTH_PRIVATE_LOGIN_HOSTS": ",".join(auth["private_login_hosts"]),
             "NEXT_PUBLIC_AUTH_ENABLED": _bool_env(auth["enabled"]),
             # Consumed server-side by the Next.js middleware (web/proxy.ts) at
             # request time — NOT inlined into the browser bundle. The proxy
@@ -693,8 +816,14 @@ class RuntimeSettingsService:
     def export_environment(self, *, overwrite: bool = True) -> dict[str, str]:
         env = self.render_environment()
         for key, value in env.items():
-            current = os.environ.get(key)
-            if current and self._internal_exported_values.get(key) != current:
+            # Read through the same view the override policy reads, so "the
+            # operator set this" means one thing in both places.
+            current = self.process_env.get(key)
+            if (
+                current
+                and key not in self._settings_derived_keys
+                and self._internal_exported_values.get(key) != current
+            ):
                 self._external_process_keys.add(key)
             if overwrite or key not in os.environ:
                 os.environ[key] = value
@@ -702,8 +831,23 @@ class RuntimeSettingsService:
                     self._internal_exported_values[key] = value
         return env
 
+    def settings_derived_keys(self) -> frozenset[str]:
+        """Variables this process exported out of the settings files.
+
+        What a child needs in order to read its inherited environment correctly
+        (see :data:`SETTINGS_DERIVED_ENV_KEYS`). Anything the operator had
+        already set is excluded: there the environment is the authority and the
+        child must keep honouring it, exactly as this process does.
+        """
+        return frozenset(self._internal_exported_values)
+
     def _process_env_value(self, key: str) -> str:
         if self._ignore_process_overrides():
+            return ""
+        if key in self._settings_derived_keys:
+            # A parent DeepTutor process rendered this out of the settings files,
+            # so the files stay in charge and a later save takes effect live
+            # (#1536). An operator-set variable is never on that list.
             return ""
         value = self.process_env.get(key, "")
         if not value:
@@ -756,6 +900,8 @@ class RuntimeSettingsService:
 
     def _apply_system_process_overrides(self, settings: dict[str, Any]) -> dict[str, Any]:
         payload = dict(settings)
+        if value := self._process_env_value("DEEPTUTOR_VERSION_CHECK_ENABLED"):
+            payload["version_check_enabled"] = value
         if value := self._process_env_value("BACKEND_PORT"):
             payload["backend_port"] = value
         if value := self._process_env_value("FRONTEND_PORT"):
@@ -774,10 +920,15 @@ class RuntimeSettingsService:
             payload["disable_ssl_verify"] = value
         if value := self._process_env_value("CHAT_ATTACHMENT_DIR"):
             payload["chat_attachment_dir"] = value
+        if value := (
+            self._process_env_value("DEEPTUTOR_BACKEND_WORKERS")
+            or self._process_env_value("BACKEND_WORKERS")
+        ):
+            payload["backend_workers"] = value
         if value := self._process_env_value("DEEPTUTOR_SANDBOX_ALLOW_SUBPROCESS"):
             payload["sandbox_allow_subprocess"] = value
-        if value := self._process_env_value("DEEPTUTOR_SANDBOX_ALLOW_UNTRUSTED_USERS"):
-            payload["sandbox_allow_untrusted_users"] = value
+        if value := self._process_env_value("DEEPTUTOR_CAPABILITY_ROUTING_ENABLED"):
+            payload["capability_routing_enabled"] = value
         if value := self._process_env_value("CHAT_ATTACHMENT_MAX_FILE_MB"):
             payload["chat_attachment_max_file_mb"] = value
         if value := self._process_env_value("CHAT_ATTACHMENT_MAX_TOTAL_MB"):
@@ -786,6 +937,13 @@ class RuntimeSettingsService:
             payload["chat_attachment_max_chars_per_doc"] = value
         if value := self._process_env_value("CHAT_ATTACHMENT_MAX_CHARS_TOTAL"):
             payload["chat_attachment_max_chars_total"] = value
+        if value := self._process_env_value("CHAT_PRIOR_IMAGE_REINJECT_MAX"):
+            payload["chat_prior_image_reinject_max"] = value
+        guard = dict(payload.get("security_guard") or {})
+        for env_name, key in _SECURITY_GUARD_ENV_KEYS:
+            if value := self._process_env_value(env_name):
+                guard[key] = value
+        payload["security_guard"] = guard
         return self._normalize_system(payload)
 
     def _apply_auth_process_overrides(self, settings: dict[str, Any]) -> dict[str, Any]:
@@ -803,20 +961,8 @@ class RuntimeSettingsService:
             payload["token_expire_hours"] = value
         if value := self._process_env_value("AUTH_COOKIE_SECURE"):
             payload["cookie_secure"] = value
-        if value := self._process_env_value("DEEPTUTOR_SELF_REGISTRATION_ENABLED"):
-            payload["self_registration_enabled"] = value
-        if value := self._process_env_value("DEEPTUTOR_EMAIL_VERIFICATION_REQUIRED"):
-            payload["email_verification_required"] = value
-        if value := self._process_env_value("DEEPTUTOR_VERIFICATION_CODE_TTL_MINUTES"):
-            payload["verification_code_ttl_minutes"] = value
-        if value := self._process_env_value("DEEPTUTOR_VERIFICATION_RESEND_COOLDOWN_SECONDS"):
-            payload["verification_resend_cooldown_seconds"] = value
-        if value := self._process_env_value("DEEPTUTOR_VERIFICATION_MAX_ATTEMPTS"):
-            payload["verification_max_attempts"] = value
-        if value := self._process_env_value("DEEPTUTOR_VERIFICATION_MAX_PER_EMAIL_HOUR"):
-            payload["verification_max_per_email_hour"] = value
-        if value := self._process_env_value("DEEPTUTOR_VERIFICATION_MAX_PER_IP_HOUR"):
-            payload["verification_max_per_ip_hour"] = value
+        if value := self._process_env_value("AUTH_PRIVATE_LOGIN_HOSTS"):
+            payload["private_login_hosts"] = value
         return self._normalize_auth(payload)
 
     def _apply_integrations_process_overrides(self, settings: dict[str, Any]) -> dict[str, Any]:
@@ -831,6 +977,14 @@ class RuntimeSettingsService:
             payload["pocketbase_admin_email"] = value
         if value := self._process_env_value("POCKETBASE_ADMIN_PASSWORD"):
             payload["pocketbase_admin_password"] = value
+        coordination = dict(payload.get("turn_coordination") or {})
+        if value := self._process_env_value("DEEPTUTOR_TURN_COORDINATION_BACKEND"):
+            coordination["backend"] = value
+        if value := self._process_env_value("DEEPTUTOR_REDIS_URL"):
+            coordination["redis_url"] = value
+        if value := self._process_env_value("DEEPTUTOR_REDIS_KEY_PREFIX"):
+            coordination["key_prefix"] = value
+        payload["turn_coordination"] = coordination
         return self._normalize_integrations(payload)
 
     def _apply_mineru_process_overrides(self, settings: dict[str, Any]) -> dict[str, Any]:
@@ -867,6 +1021,43 @@ class RuntimeSettingsService:
             "api_key": _string(settings.get("api_key")),
         }
 
+    def _apply_query_rewrite_process_overrides(self, settings: dict[str, Any]) -> dict[str, Any]:
+        payload = dict(settings)
+        if value := self._process_env_value("DEEPTUTOR_QUERY_REWRITE_ENABLED"):
+            payload["enabled"] = value
+        if value := self._process_env_value("DEEPTUTOR_QUERY_REWRITE_STRATEGY"):
+            payload["strategy"] = value
+        if value := self._process_env_value("DEEPTUTOR_QUERY_REWRITE_MODEL"):
+            payload["model"] = value
+        if value := self._process_env_value("DEEPTUTOR_QUERY_REWRITE_TIMEOUT_SECONDS"):
+            payload["timeout_seconds"] = value
+        if value := self._process_env_value("DEEPTUTOR_QUERY_REWRITE_MIN_QUERY_CHARS"):
+            payload["min_query_chars"] = value
+        return self._normalize_query_rewrite(payload)
+
+    def _normalize_query_rewrite(self, settings: dict[str, Any]) -> dict[str, Any]:
+        strategy = str(settings.get("strategy") or "standalone").strip().lower()
+        if strategy not in QUERY_REWRITE_STRATEGIES:
+            strategy = "standalone"
+        try:
+            timeout = float(settings.get("timeout_seconds", 5.0))
+        except (TypeError, ValueError):
+            timeout = 5.0
+        timeout = min(max(timeout, 0.5), 60.0)
+        try:
+            min_chars = int(settings.get("min_query_chars", 12))
+        except (TypeError, ValueError):
+            min_chars = 12
+        min_chars = min(max(min_chars, 0), 500)
+        return {
+            "version": 1,
+            "enabled": _coerce_bool(settings.get("enabled"), False),
+            "strategy": strategy,
+            "model": str(settings.get("model") or "").strip(),
+            "timeout_seconds": timeout,
+            "min_query_chars": min_chars,
+        }
+
     def _apply_ima_process_overrides(self, settings: dict[str, Any]) -> dict[str, Any]:
         payload = dict(settings)
         if value := self._process_env_value("IMA_CLIENT_ID"):
@@ -897,6 +1088,9 @@ class RuntimeSettingsService:
         profile = _string(settings.get("retrieval_profile")).lower()
         if profile not in _LLAMAINDEX_PROFILES:
             profile = LLAMAINDEX_HYBRID_PROFILE
+        vector_index_type = _string(settings.get("vector_index_type")).lower()
+        if vector_index_type not in _LLAMAINDEX_VECTOR_INDEX_TYPES:
+            vector_index_type = LLAMAINDEX_FLAT_VECTOR_INDEX
         chunk_size = _coerce_clamped_int(settings.get("chunk_size"), 512, 64, 8192)
         # Overlap must stay below the chunk size or chunking degenerates.
         chunk_overlap = _coerce_clamped_int(
@@ -912,6 +1106,14 @@ class RuntimeSettingsService:
             "bm25_top_k_multiplier": _coerce_clamped_int(
                 settings.get("bm25_top_k_multiplier"), 2, 1, 10
             ),
+            "reranker_model": _string(settings.get("reranker_model"))[:200],
+            "rerank_top_k": _coerce_clamped_int(settings.get("rerank_top_k"), 50, 1, 100),
+            "vector_index_type": vector_index_type,
+            "hnsw_m": _coerce_clamped_int(settings.get("hnsw_m"), 32, 4, 64),
+            "hnsw_ef_construction": _coerce_clamped_int(
+                settings.get("hnsw_ef_construction"), 200, 16, 512
+            ),
+            "hnsw_ef_search": _coerce_clamped_int(settings.get("hnsw_ef_search"), 64, 1, 512),
             "chunk_size": chunk_size,
             "chunk_overlap": chunk_overlap,
             "image_description_concurrency": _coerce_clamped_int(
@@ -942,8 +1144,22 @@ class RuntimeSettingsService:
         }
 
     def _normalize_lightrag(self, settings: dict[str, Any]) -> dict[str, Any]:
-        return {
-            "version": 1,
+        from .lightrag_roles import LightRagRoleModels
+
+        version = settings.get("version", 1)
+        if type(version) is not int or version not in {1, 2}:
+            raise ValueError("Unsupported LightRAG settings version.")
+
+        # Missing means a released, legacy setting. Never turn malformed new
+        # configuration back into a legacy model fallback.
+        role_models = settings.get("role_models")
+        roles = (
+            LightRagRoleModels.model_validate(role_models).model_dump()
+            if "role_models" in settings
+            else None
+        )
+        result = {
+            "version": 2 if roles is not None or settings.get("version") == 2 else 1,
             "top_k": _coerce_clamped_int(settings.get("top_k"), 60, 1, 200),
             "response_type": self._normalize_response_type(settings.get("response_type")),
             "max_concurrent_files": _coerce_clamped_int(
@@ -955,6 +1171,19 @@ class RuntimeSettingsService:
             "entity_extract_max_gleaning": _coerce_clamped_int(
                 settings.get("entity_extract_max_gleaning"), 1, 0, 5
             ),
+            "llm_timeout": _coerce_clamped_int(settings.get("llm_timeout"), 240, 60, 3600),
+            "llm_profile_id": _string(settings.get("llm_profile_id"))[:128],
+            "llm_model_id": _string(settings.get("llm_model_id"))[:128],
+        }
+        if roles is not None:
+            result["role_models"] = roles
+        return result
+
+    def _normalize_lightrag_server(self, settings: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "version": 1,
+            "server_url": _string(settings.get("server_url")).rstrip("/"),
+            "api_key": _string(settings.get("api_key")),
         }
 
     def _normalize_document_parsing(self, settings: dict[str, Any]) -> dict[str, Any]:
@@ -1039,10 +1268,10 @@ class RuntimeSettingsService:
             "enable_formula": _coerce_bool(settings.get("enable_formula"), True),
             "enable_table": _coerce_bool(settings.get("enable_table"), True),
             "is_ocr": _coerce_bool(settings.get("is_ocr"), False),
-            "normalize_tiny_scans": _coerce_bool(settings.get("normalize_tiny_scans"), False),
             "max_pages_per_part": _coerce_clamped_int(
                 settings.get("max_pages_per_part"), 180, 1, 200
             ),
+            "normalize_tiny_scans": _coerce_bool(settings.get("normalize_tiny_scans"), False),
             "allow_local_model_download": _coerce_bool(
                 settings.get("allow_local_model_download"), False
             ),
@@ -1135,9 +1364,14 @@ class RuntimeSettingsService:
         )
         # A per-message total below the per-file cap is contradictory; lift it.
         max_total_mb = max(max_total_mb, max_file_mb)
+        raw_guard = settings.get("security_guard")
+        guard = raw_guard if isinstance(raw_guard, dict) else {}
+        guard_defaults = DEFAULT_SYSTEM_SETTINGS["security_guard"]
         return {
             "version": 1,
+            "version_check_enabled": _coerce_bool(settings.get("version_check_enabled"), True),
             "backend_port": _coerce_port(settings.get("backend_port"), 8001),
+            "backend_workers": _coerce_clamped_int(settings.get("backend_workers"), 1, 1, 64),
             "frontend_port": _coerce_port(settings.get("frontend_port"), 3782),
             "next_public_api_base_external": public_api_base,
             "next_public_api_base": _string(settings.get("next_public_api_base")),
@@ -1147,9 +1381,6 @@ class RuntimeSettingsService:
             "chat_attachment_dir": _string(settings.get("chat_attachment_dir")),
             "sandbox_allow_subprocess": _coerce_bool(
                 settings.get("sandbox_allow_subprocess"), True
-            ),
-            "sandbox_allow_untrusted_users": _coerce_bool(
-                settings.get("sandbox_allow_untrusted_users"), False
             ),
             "capability_routing_enabled": _coerce_bool(
                 settings.get("capability_routing_enabled"), False
@@ -1166,6 +1397,11 @@ class RuntimeSettingsService:
             },
             "chat_attachment_max_file_mb": max_file_mb,
             "chat_attachment_max_total_mb": max_total_mb,
+            "chat_prior_image_reinject_max": _coerce_clamped_int(
+                settings.get("chat_prior_image_reinject_max"),
+                DEFAULT_SYSTEM_SETTINGS["chat_prior_image_reinject_max"],
+                *CHAT_PRIOR_IMAGE_REINJECT_RANGE,
+            ),
             "chat_attachment_max_chars_per_doc": _coerce_clamped_int(
                 settings.get("chat_attachment_max_chars_per_doc"),
                 DEFAULT_SYSTEM_SETTINGS["chat_attachment_max_chars_per_doc"],
@@ -1176,14 +1412,28 @@ class RuntimeSettingsService:
                 DEFAULT_SYSTEM_SETTINGS["chat_attachment_max_chars_total"],
                 *CHAT_ATTACHMENT_CHARS_RANGE,
             ),
+            "security_guard": {
+                "enabled": _coerce_bool(guard.get("enabled"), False),
+                "rate_limit": _coerce_clamped_int(
+                    guard.get("rate_limit"), guard_defaults["rate_limit"], 1, 1_000_000
+                ),
+                "rate_limit_window": _coerce_clamped_int(
+                    guard.get("rate_limit_window"), guard_defaults["rate_limit_window"], 1, 86_400
+                ),
+                # An absent key keeps the loopback default; an explicit empty
+                # list means "trust no proxy".
+                "trusted_proxies": _host_list(guard["trusted_proxies"])
+                if "trusted_proxies" in guard
+                else list(guard_defaults["trusted_proxies"]),
+                "exempt_ips": _host_list(guard["exempt_ips"])
+                if "exempt_ips" in guard
+                else list(guard_defaults["exempt_ips"]),
+                "whitelist": _host_list(guard.get("whitelist")),
+                "blacklist": _host_list(guard.get("blacklist")),
+            },
         }
 
     def _normalize_auth(self, settings: dict[str, Any]) -> dict[str, Any]:
-        default_quota = normalize_quotas(
-            settings.get("default_quota"),
-            fallback=DEFAULT_QUOTA,
-            legacy_token_quota=settings.get("default_token_quota"),
-        )
         return {
             "version": 1,
             "enabled": _coerce_bool(settings.get("enabled"), False),
@@ -1191,50 +1441,40 @@ class RuntimeSettingsService:
             "password_hash": _string(settings.get("password_hash")),
             "token_expire_hours": max(1, _coerce_int(settings.get("token_expire_hours"), 24)),
             "cookie_secure": _coerce_bool(settings.get("cookie_secure"), False),
-            "default_quota": default_quota,
-            # Keep old readers and deployments working while the LLM block is
-            # migrated to the resource-oriented shape.
-            "default_token_quota": dict(default_quota["llm"]),
-            "self_registration_enabled": _coerce_bool(
-                settings.get("self_registration_enabled"), True
-            ),
-            "email_verification_required": _coerce_bool(
-                settings.get("email_verification_required"), True
-            ),
-            "verification_code_ttl_minutes": max(
-                5, min(60, _coerce_int(settings.get("verification_code_ttl_minutes"), 10))
-            ),
-            "verification_resend_cooldown_seconds": max(
-                30,
-                min(
-                    3600,
-                    _coerce_int(settings.get("verification_resend_cooldown_seconds"), 60),
-                ),
-            ),
-            "verification_max_attempts": max(
-                3, min(10, _coerce_int(settings.get("verification_max_attempts"), 5))
-            ),
-            "verification_max_per_email_hour": max(
-                1,
-                min(
-                    50,
-                    _coerce_int(settings.get("verification_max_per_email_hour"), 5),
-                ),
-            ),
-            "verification_max_per_ip_hour": max(
-                5,
-                min(200, _coerce_int(settings.get("verification_max_per_ip_hour"), 30)),
-            ),
+            "private_login_hosts": _host_list(settings.get("private_login_hosts")),
         }
 
     def _normalize_integrations(self, settings: dict[str, Any]) -> dict[str, Any]:
+        raw_coordination = settings.get("turn_coordination")
+        coordination = raw_coordination if isinstance(raw_coordination, dict) else {}
+        backend = _string(coordination.get("backend")).lower()
+        if backend not in {"memory", "redis"}:
+            backend = "memory"
+        key_prefix = _string(coordination.get("key_prefix")).strip(":") or "deeptutor"
         return {
-            "version": 1,
+            "version": 2,
             "pocketbase_url": _string(settings.get("pocketbase_url")).rstrip("/"),
             "pocketbase_port": _coerce_port(settings.get("pocketbase_port"), 8090),
             "pocketbase_external_url": _string(settings.get("pocketbase_external_url")).rstrip("/"),
             "pocketbase_admin_email": _string(settings.get("pocketbase_admin_email")),
             "pocketbase_admin_password": _string(settings.get("pocketbase_admin_password")),
+            "turn_coordination": {
+                "backend": backend,
+                "redis_url": _string(coordination.get("redis_url")),
+                "key_prefix": key_prefix,
+                "lease_ttl_seconds": _coerce_clamped_int(
+                    coordination.get("lease_ttl_seconds"), 30, 10, 300
+                ),
+                "renew_interval_seconds": _coerce_clamped_int(
+                    coordination.get("renew_interval_seconds"), 10, 1, 100
+                ),
+                "recovery_interval_seconds": _coerce_clamped_int(
+                    coordination.get("recovery_interval_seconds"), 10, 1, 300
+                ),
+                "stream_retention_seconds": _coerce_clamped_int(
+                    coordination.get("stream_retention_seconds"), 86_400, 60, 2_592_000
+                ),
+            },
         }
 
 
@@ -1316,6 +1556,23 @@ def compute_ws_max_size(max_total_bytes: int) -> int:
     return max(_WS_MAX_SIZE_FLOOR, inflated + 8 * 1024 * 1024)
 
 
+def get_prior_image_reinject_limit() -> int:
+    """How many earlier images a later turn re-attaches.
+
+    Read at call time like the attachment policy above, so a deployment can
+    change it without a restart, and 0 turns the behaviour off entirely.
+
+    Resolved with the seeded default rather than by subscript: a system.json
+    written before this key existed is the normal state of every upgraded
+    install, and a missing knob must not take image re-injection down with it.
+    """
+    return _coerce_clamped_int(
+        load_system_settings().get("chat_prior_image_reinject_max"),
+        DEFAULT_SYSTEM_SETTINGS["chat_prior_image_reinject_max"],
+        *CHAT_PRIOR_IMAGE_REINJECT_RANGE,
+    )
+
+
 def get_ws_max_size() -> int:
     """Frame ceiling for the current settings — wire into every uvicorn launch."""
     return compute_ws_max_size(get_chat_attachment_limits().max_total_bytes)
@@ -1356,8 +1613,16 @@ def load_graphrag_settings() -> dict[str, Any]:
     return get_runtime_settings_service().load_graphrag()
 
 
+def load_query_rewrite_settings() -> dict[str, Any]:
+    return get_runtime_settings_service().load_query_rewrite()
+
+
 def load_lightrag_settings() -> dict[str, Any]:
     return get_runtime_settings_service().load_lightrag()
+
+
+def load_lightrag_server_settings() -> dict[str, Any]:
+    return get_runtime_settings_service().load_lightrag_server()
 
 
 def load_document_parsing_settings() -> dict[str, Any]:
@@ -1378,9 +1643,11 @@ __all__ = [
     "DEFAULT_IMA_SETTINGS",
     "DEFAULT_INTEGRATIONS_SETTINGS",
     "DEFAULT_LIGHTRAG_SETTINGS",
+    "DEFAULT_LIGHTRAG_SERVER_SETTINGS",
     "DEFAULT_LLAMAINDEX_SETTINGS",
     "DEFAULT_MINERU_SETTINGS",
     "DEFAULT_PAGEINDEX_SETTINGS",
+    "DEFAULT_QUERY_REWRITE_SETTINGS",
     "DEFAULT_SYSTEM_SETTINGS",
     "DOCUMENT_PARSING_ENGINE_DOCLING",
     "DOCUMENT_PARSING_ENGINE_LITEPARSE",
@@ -1394,6 +1661,8 @@ __all__ = [
     "LITEPARSE_IMAGE_MODES",
     "MINERU_MODE_CLOUD",
     "MINERU_MODE_LOCAL",
+    "QUERY_REWRITE_STRATEGIES",
+    "SETTINGS_DERIVED_ENV_KEYS",
     "ChatAttachmentLimits",
     "RuntimeSettingsService",
     "compute_ws_max_size",
@@ -1407,7 +1676,9 @@ __all__ = [
     "load_graphrag_settings",
     "load_integrations_settings",
     "load_lightrag_settings",
+    "load_lightrag_server_settings",
     "load_llamaindex_settings",
     "load_mineru_settings",
+    "load_query_rewrite_settings",
     "load_system_settings",
 ]

@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import asyncio
 import os
-from pathlib import Path
 import shlex
 import sys
 
 import pytest
 
-from deeptutor.services.sandbox.backends import BwrapBackend, RestrictedSubprocessBackend
+from deeptutor.services.sandbox.backends import (
+    BwrapBackend,
+    RestrictedSubprocessBackend,
+    RunnerSidecarBackend,
+    _decode_process_output,
+)
 from deeptutor.services.sandbox.config import SandboxSettings, build_backend
 from deeptutor.services.sandbox.quota import QuotaExceeded, UserExecQuota
 from deeptutor.services.sandbox.service import SandboxService
@@ -176,6 +180,88 @@ async def test_restricted_subprocess_runs() -> None:
     assert result.exit_code == 0
 
 
+def test_restricted_subprocess_prefers_configured_virtualenv(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bare ``python``/``pip`` must resolve inside DeepTutor's own env.
+
+    A Windows desktop install can inherit MSYS Python before the interpreter
+    that launched DeepTutor.  That split makes ``pip install`` and the next
+    ``python -c`` target different environments.
+    """
+    venv = tmp_path / "deeptutor-venv"
+    bin_dir = venv / ("Scripts" if os.name == "nt" else "bin")
+    bin_dir.mkdir(parents=True)
+    monkeypatch.setenv("PATH", os.pathsep.join(["foreign-python", "system-tools"]))
+
+    backend = RestrictedSubprocessBackend(venv_path=venv)
+    env = backend._build_env({})
+
+    assert env["VIRTUAL_ENV"] == str(venv.resolve())
+    assert env["PATH"].split(os.pathsep)[0] == str(bin_dir.resolve())
+    assert env["PATH"].split(os.pathsep).count(str(bin_dir.resolve())) == 1
+
+
+def test_restricted_subprocess_request_path_keeps_virtualenv_first(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    venv = tmp_path / "deeptutor-venv"
+    bin_dir = venv / ("Scripts" if os.name == "nt" else "bin")
+    bin_dir.mkdir(parents=True)
+    monkeypatch.setenv("PATH", "host-tools")
+
+    backend = RestrictedSubprocessBackend(venv_path=venv)
+    env = backend._build_env({"PATH": os.pathsep.join(["turn-tools", str(bin_dir)])})
+
+    assert env["PATH"].split(os.pathsep) == [str(bin_dir.resolve()), "turn-tools"]
+
+
+def test_backends_inherit_the_conda_environment_that_launched_deeptutor(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A base Conda env has prefix == base_prefix but is still authoritative."""
+    conda_env = tmp_path / "miniconda" / "envs" / "deeptutor"
+    bin_dir = conda_env / ("Scripts" if sys.platform == "win32" else "bin")
+    bin_dir.mkdir(parents=True)
+    executable = bin_dir / ("python.exe" if sys.platform == "win32" else "python")
+    executable.touch()
+
+    monkeypatch.setattr(sys, "prefix", str(conda_env))
+    monkeypatch.setattr(sys, "base_prefix", str(conda_env))
+    monkeypatch.setattr(sys, "executable", str(executable))
+    monkeypatch.setenv("PATH", "system-tools")
+
+    subprocess_backend = RestrictedSubprocessBackend()
+    env = subprocess_backend._build_env({})
+
+    assert env["VIRTUAL_ENV"] == str(conda_env.resolve())
+    assert env["PATH"].split(os.pathsep)[0] == str(bin_dir.resolve())
+
+    if sys.platform != "win32":
+        argv = BwrapBackend()._build_argv(ExecRequest(command="python3 -V"))
+        resolved_env = str(conda_env.resolve())
+        ro_binds = [
+            tuple(argv[index + 1 : index + 3])
+            for index, item in enumerate(argv)
+            if item == "--ro-bind"
+        ]
+        assert (resolved_env, resolved_env) in ro_binds
+        assert _bwrap_setenv(argv)["PATH"].split(os.pathsep)[0] == str(bin_dir.resolve())
+
+
+def test_windows_process_output_falls_back_to_the_console_encoding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    message = "不是内部或外部命令"
+    monkeypatch.setattr("deeptutor.services.sandbox.backends.sys.platform", "win32")
+    monkeypatch.setattr(
+        "deeptutor.services.sandbox.backends.locale.getpreferredencoding",
+        lambda _do_setlocale=False: "gbk",
+    )
+
+    assert _decode_process_output(message.encode("gbk")) == message
+
+
 @pytest.mark.asyncio
 async def test_restricted_subprocess_timeout() -> None:
     backend = RestrictedSubprocessBackend()
@@ -188,8 +274,8 @@ async def test_restricted_subprocess_timeout() -> None:
 async def test_restricted_subprocess_caps_output_while_draining_streams() -> None:
     backend = RestrictedSubprocessBackend()
     result = await backend.exec(
-        ExecRequest(
-            command="python3 -c \"print('x' * 50_000, end='')\"",
+        ExecRequest.of_argv(
+            [sys.executable, "-X", "utf8", "-c", "print('x' * 50_000, end='')"],
             limits=ResourceLimits(timeout_s=10, max_output_chars=1_000),
         )
     )
@@ -242,63 +328,78 @@ async def test_service_runs_with_subprocess() -> None:
     assert "sandboxed" in result.stdout
 
 
+_LOOPBACK_STDERR = "bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted\n"
+
+
 @pytest.mark.asyncio
-async def test_non_admin_exec_is_fail_closed_without_per_user_isolation(
-    monkeypatch,
+async def test_bwrap_health_treats_loopback_denial_as_unhealthy(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from deeptutor.multi_user.context import reset_current_user, set_current_user
-    from deeptutor.multi_user.models import CurrentUser, UserScope
-    from deeptutor.services import config as config_module
-
+    """A bwrap probe that exits 1 with empty ``error`` is not healthy (#1516)."""
+    backend = BwrapBackend()
     monkeypatch.setattr(
-        config_module,
-        "load_system_settings",
-        lambda: {"sandbox_allow_untrusted_users": False},
+        "deeptutor.services.sandbox.backends.shutil.which",
+        lambda _name: "/usr/bin/bwrap",
     )
-    svc = SandboxService(SandboxSettings(allow_subprocess=True))
-    svc._backend = RestrictedSubprocessBackend()
-    user_token = set_current_user(
-        CurrentUser(
-            id="u_alice",
-            username="alice",
-            role="user",
-            scope=UserScope(kind="user", user_id="u_alice", root=Path("/tmp/u_alice")),
-        )
-    )
-    try:
-        result = await svc.run(ExecRequest(command="echo should-not-run"), user_id="u_alice")
-    finally:
-        reset_current_user(user_token)
-    assert "disabled" in result.error.lower()
-    assert result.stdout == ""
+
+    async def fake_exec(_request: ExecRequest) -> ExecResult:
+        return ExecResult(stderr=_LOOPBACK_STDERR, exit_code=1)
+
+    monkeypatch.setattr(backend, "exec", fake_exec)
+
+    healthy, detail = await backend.health()
+    assert healthy is False
+    assert "RTM_NEWADDR" in detail
+    assert "Operation not permitted" in detail
 
 
 @pytest.mark.asyncio
-async def test_non_admin_cannot_use_application_sandbox_even_when_opted_in(monkeypatch) -> None:
-    from deeptutor.multi_user.context import reset_current_user, set_current_user
-    from deeptutor.multi_user.models import CurrentUser, UserScope
-    from deeptutor.services import config as config_module
-
-    monkeypatch.setattr(
-        config_module,
-        "load_system_settings",
-        lambda: {"sandbox_allow_untrusted_users": True},
-    )
+async def test_service_falls_back_to_subprocess_when_bwrap_unhealthy() -> None:
+    """``sandbox_allow_subprocess`` must recover partner/file exec when bwrap cannot run."""
     svc = SandboxService(SandboxSettings(allow_subprocess=True))
-    svc._backend = RestrictedSubprocessBackend()
-    user_token = set_current_user(
-        CurrentUser(
-            id="u_alice",
-            username="alice",
-            role="user",
-            scope=UserScope(kind="user", user_id="u_alice", root=Path("/tmp/u_alice")),
-        )
-    )
-    try:
-        result = await svc.run(ExecRequest(command="echo should-not-run"), user_id="u_alice")
-    finally:
-        reset_current_user(user_token)
-    assert "disabled" in result.error.lower()
+
+    class UnhealthyBwrap(BwrapBackend):
+        async def health(self) -> tuple[bool, str]:
+            return False, _LOOPBACK_STDERR.strip()
+
+    svc._backend = UnhealthyBwrap()
+
+    assert await svc.isolation_level() is IsolationLevel.APPLICATION
+    assert isinstance(svc._backend, RestrictedSubprocessBackend)
+    result = await svc.run(ExecRequest(command="echo recovered"), user_id="u1")
+    assert "recovered" in result.stdout
+
+
+@pytest.mark.asyncio
+async def test_service_surfaces_bwrap_failure_when_subprocess_disallowed() -> None:
+    svc = SandboxService(SandboxSettings(allow_subprocess=False))
+
+    class UnhealthyBwrap(BwrapBackend):
+        async def health(self) -> tuple[bool, str]:
+            return False, _LOOPBACK_STDERR.strip()
+
+    svc._backend = UnhealthyBwrap()
+
+    assert await svc.isolation_level() is IsolationLevel.OFF
+    assert isinstance(svc._backend, UnhealthyBwrap)
+    result = await svc.run(ExecRequest(command="echo hi"), user_id="u1")
+    assert not result.ok
+    assert "RTM_NEWADDR" in result.error
+
+
+@pytest.mark.asyncio
+async def test_service_does_not_fallback_from_unhealthy_runner() -> None:
+    """A down runner sidecar must not start executing untrusted shell in-process."""
+    svc = SandboxService(SandboxSettings(allow_subprocess=True))
+
+    class UnhealthyRunner(RunnerSidecarBackend):
+        async def health(self) -> tuple[bool, str]:
+            return False, "runner unreachable"
+
+    svc._backend = UnhealthyRunner("http://sandbox-runner:8900")
+
+    assert await svc.isolation_level() is IsolationLevel.OFF
+    assert isinstance(svc._backend, UnhealthyRunner)
 
 
 @pytest.mark.asyncio
@@ -387,10 +488,3 @@ def test_runner_server_rejects_workdir_outside_allowed_roots(
     )
     assert inside["error"] == ""
     assert inside["exit_code"] == 0
-
-
-def test_compose_runner_does_not_mount_all_user_workspaces() -> None:
-    compose = Path(__file__).resolve().parents[3] / "docker-compose.yml"
-    content = compose.read_text(encoding="utf-8")
-    assert "./data/users:/app/data/users" not in content
-    assert "sandbox_allow_untrusted_users" not in content

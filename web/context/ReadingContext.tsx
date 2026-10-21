@@ -30,10 +30,10 @@ import {
  *
  * This provider lives in the workspace layout, NOT inside the chat page, and
  * that placement is the whole point: sending the first message of a session
- * changes the URL from `/home` to `/home/<id>`, which remounts the page
+ * changes the URL from `/chat` to `/chat/<id>`, which remounts the page
  * component. State held inside the reader pane died with it, so the document
  * vanished the moment the user asked their first question. The layout persists
- * across that navigation — which is exactly why `UnifiedChatProvider` sits there
+ * across that navigation — which is exactly why the chat runtime sits there
  * too.
  *
  * The viewport (scroll position, selection) is deliberately NOT state: it
@@ -48,13 +48,15 @@ export interface ReadingContextValue {
   loading: boolean;
   /** Last failure worth showing the user; cleared by `dismissError`. */
   error: string | null;
-  openMaterial: (candidate: MaterialDetail | MaterialInfo) => Promise<void>;
+  openMaterial: (
+    candidate: MaterialDetail | MaterialInfo | string,
+  ) => Promise<boolean>;
   closeMaterial: () => void;
   /** Insert or update an annotation, optimistically. */
   saveMark: (
     draft: AnnotationDraft,
     optimistic: AnnotationItem,
-  ) => Promise<void>;
+  ) => Promise<boolean>;
   /** Remove an annotation, optimistically. */
   removeMark: (annotation: AnnotationItem) => Promise<void>;
   /** Accept a mark the assistant just made (arrives via a tool result). */
@@ -62,7 +64,11 @@ export interface ReadingContextValue {
   dismissError: () => void;
   setError: (message: string) => void;
   /** Report scroll position / selection. Does not trigger a render. */
-  reportViewport: (next: { locator?: number; selection?: string }) => void;
+  reportViewport: (next: {
+    locator?: number;
+    selection?: string;
+    timeSeconds?: number | null;
+  }) => void;
 }
 
 const noop = () => {};
@@ -72,9 +78,9 @@ const ReadingContext = createContext<ReadingContextValue>({
   annotations: [],
   loading: false,
   error: null,
-  openMaterial: async () => {},
+  openMaterial: async () => false,
   closeMaterial: noop,
-  saveMark: async () => {},
+  saveMark: async () => false,
   removeMark: async () => {},
   mergeMark: noop,
   dismissError: noop,
@@ -89,35 +95,49 @@ export function ReadingProvider({ children }: { children: ReactNode }) {
   const [error, setErrorState] = useState<string | null>(null);
   // Guards against a slow open landing after the user opened something else.
   const openTokenRef = useRef(0);
+  const annotationScopeRef = useRef(0);
+  useEffect(() => () => {
+    openTokenRef.current += 1;
+    annotationScopeRef.current += 1;
+  }, []);
 
   // Mirror the open document into the turn-state cell, which is what the chat
   // reads when it sends. One effect rather than writes scattered through the
   // mutators, so the two can never disagree.
   useEffect(() => {
-    setReadingMaterial(material?.material_id ?? null);
+    setReadingMaterial(
+      material?.material_id ?? null,
+      material?.revision ?? null,
+    );
   }, [material]);
 
   const openMaterial = useCallback(
-    async (candidate: MaterialDetail | MaterialInfo) => {
+    async (candidate: MaterialDetail | MaterialInfo | string) => {
       const token = ++openTokenRef.current;
       setLoading(true);
       setErrorState(null);
       try {
         const detail =
-          "outline" in candidate
-            ? (candidate as MaterialDetail)
-            : await getMaterial(candidate.material_id);
+          typeof candidate === "string"
+            ? await getMaterial(candidate)
+            : "outline" in candidate
+              ? (candidate as MaterialDetail)
+              : await getMaterial(candidate.material_id);
+        if (token !== openTokenRef.current) return false;
         const marks = await listAnnotations(detail.material_id);
-        if (token !== openTokenRef.current) return;
+        if (token !== openTokenRef.current) return false;
+        annotationScopeRef.current += 1;
         setMaterial(detail);
         setAnnotations(marks);
+        return true;
       } catch (caught) {
-        if (token !== openTokenRef.current) return;
+        if (token !== openTokenRef.current) return false;
         setErrorState(
           caught instanceof Error
             ? caught.message
             : "This document could not be opened.",
         );
+        return false;
       } finally {
         if (token === openTokenRef.current) setLoading(false);
       }
@@ -128,6 +148,7 @@ export function ReadingProvider({ children }: { children: ReactNode }) {
   const closeMaterial = useCallback(() => {
     // Bump the token so an open still in flight cannot resurrect the document.
     openTokenRef.current += 1;
+    annotationScopeRef.current += 1;
     setMaterial(null);
     setAnnotations([]);
     setErrorState(null);
@@ -137,50 +158,44 @@ export function ReadingProvider({ children }: { children: ReactNode }) {
   const saveMark = useCallback(
     async (draft: AnnotationDraft, optimistic: AnnotationItem) => {
       const materialId = material?.material_id;
-      if (!materialId) return;
-      // Shown immediately: waiting for a round trip before any ink appears
-      // makes highlighting feel broken.
-      setAnnotations((current) => [...current, optimistic]);
+      if (!materialId) return false;
+      const token = openTokenRef.current;
+      const previous = annotations.find(row => row.annotation_id === optimistic.annotation_id);
+      setAnnotations(current => previous
+        ? current.map(row => row.annotation_id === optimistic.annotation_id ? optimistic : row)
+        : [...current, optimistic]);
       try {
         const saved = await saveAnnotation(materialId, draft);
-        setAnnotations((current) =>
-          current.map((row) =>
-            row.annotation_id === optimistic.annotation_id ? saved : row,
-          ),
-        );
+        if (token === openTokenRef.current) setAnnotations(current => current.map(row => row.annotation_id === optimistic.annotation_id ? saved : row));
+        return true;
       } catch (caught) {
-        setAnnotations((current) =>
-          current.filter(
-            (row) => row.annotation_id !== optimistic.annotation_id,
-          ),
-        );
-        setErrorState(
-          caught instanceof Error
-            ? caught.message
-            : "That annotation could not be saved.",
-        );
+        if (token !== openTokenRef.current) return false;
+        setAnnotations(current => previous
+          ? current.map(row => row.annotation_id === optimistic.annotation_id ? previous : row)
+          : current.filter(row => row.annotation_id !== optimistic.annotation_id));
+        setErrorState(caught instanceof Error ? caught.message : "That annotation could not be saved.");
+        return false;
       }
-    },
-    [material],
+    }, [material, annotations],
   );
 
   const removeMark = useCallback(
     async (annotation: AnnotationItem) => {
       const materialId = material?.material_id;
       if (!materialId) return;
-      let previous: AnnotationItem[] = [];
-      setAnnotations((current) => {
-        previous = current;
-        return current.filter(
-          (row) => row.annotation_id !== annotation.annotation_id,
-        );
-      });
+      const scope = annotationScopeRef.current;
+      setAnnotations((current) => current.filter(
+        (row) => row.annotation_id !== annotation.annotation_id,
+      ));
       try {
         await deleteAnnotationApi(materialId, annotation.annotation_id);
       } catch {
+        if (scope !== annotationScopeRef.current) return;
         // Put it back: pretending a failed delete succeeded would lose the mark
         // on the next reload.
-        setAnnotations(previous);
+        setAnnotations((current) => current.some(
+          (row) => row.annotation_id === annotation.annotation_id,
+        ) ? current : [...current, annotation]);
         setErrorState("That annotation could not be removed.");
       }
     },
@@ -198,8 +213,11 @@ export function ReadingProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const reportViewport = useCallback(
-    (next: { locator?: number; selection?: string }) =>
-      setReadingViewport(next),
+    (next: {
+      locator?: number;
+      selection?: string;
+      timeSeconds?: number | null;
+    }) => setReadingViewport(next),
     [],
   );
 

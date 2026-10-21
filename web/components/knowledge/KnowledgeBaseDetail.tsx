@@ -1,26 +1,37 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import Tooltip from "@/shared/ui/Tooltip";
+import { knowledgeBaseRef } from "@/lib/knowledge-helpers";
+import type { EmbeddingModelSelection } from "@/features/knowledge/model/types";
+
+import { useState } from "react";
 import { useTranslation } from "react-i18next";
+import LightRagEmbeddingWarning from "./LightRagEmbeddingWarning";
 import {
   ArrowLeft,
   Database,
   FileText,
+  FolderSync,
   Github,
+  Globe,
   Layers,
   Loader2,
-  Lock,
   RefreshCw,
   Settings as SettingsIcon,
   Smartphone,
   Star,
   Upload,
 } from "lucide-react";
-import type { KnowledgeUploadPolicy } from "@/lib/knowledge-api";
+import type {
+  IndexingLLMSelection,
+  LinkedFolderInfo,
+  KnowledgeUploadPolicy,
+  SyncFolderResponse,
+} from "@/features/knowledge/model/types";
 import {
   formatKnowledgeTimestamp,
-  isConnectedKb,
   isMarginNoteKb,
+  kbProvider,
   kbDetailSections,
   providerUsesEmbeddingMetadata,
   resolveKbStatus,
@@ -30,12 +41,20 @@ import {
 import type { TaskState } from "@/hooks/useKnowledgeProgress";
 import type { HistoryEntry } from "@/hooks/useKnowledgeHistory";
 import KbStatusBadge from "./KbStatusBadge";
+import KbTaskLogs from "./KbTaskLogs";
+import KbIndexingRun from "./KbIndexingRun";
 import KbFilesTab from "./KbFilesTab";
 import KbDocumentsSection from "./KbDocumentsSection";
 import KbIndexVersionsSection from "./KbIndexVersionsSection";
 import KbSettingsSection from "./KbSettingsSection";
 import KbGitHubSourcesSection from "./KbGitHubSourcesSection";
+import KbLinkedFoldersSection from "./KbLinkedFoldersSection";
+import KbWebSourcesSection from "./KbWebSourcesSection";
 import KbMarginNoteDevicesSection from "./KbMarginNoteDevicesSection";
+import KbKiwixArticlesSection from "./KbKiwixArticlesSection";
+import KnowledgeEngineIcon, {
+  knowledgeSourceIconId,
+} from "./KnowledgeEngineIcon";
 
 interface KnowledgeBaseDetailProps {
   kb: KnowledgeBase | null;
@@ -48,10 +67,24 @@ interface KnowledgeBaseDetailProps {
     files: File[],
     destSubdir?: string,
   ) => Promise<void>;
-  onReindex: (kbName: string) => Promise<void>;
+  onLinkFolder: (
+    kbName: string,
+    folderPath: string,
+  ) => Promise<LinkedFolderInfo>;
+  onUnlinkFolder: (kbName: string, folderId: string) => Promise<void>;
+  onSyncFolder: (
+    kbName: string,
+    folderId: string,
+  ) => Promise<SyncFolderResponse>;
+  onReindex: (
+    kbName: string,
+    configFingerprint?: string,
+    embeddingModel?: EmbeddingModelSelection,
+  ) => Promise<void>;
   onRetry: (kbName: string) => Promise<void>;
   onSetDefault: (kbName: string) => Promise<void>;
   onDelete: (kbName: string) => Promise<void>;
+  onMove?: (kbName: string, targetWorkspaceId: string) => Promise<void>;
   onClearHistory: (kbName: string) => void;
   onBack?: () => void;
 }
@@ -62,9 +95,12 @@ const SECTION_CHROME: Record<
 > = {
   files: { label: "Files", Icon: FileText },
   add: { label: "Add documents", Icon: Upload },
+  folders: { label: "Linked folders", Icon: FolderSync },
   github: { label: "GitHub", Icon: Github },
+  web: { label: "Web", Icon: Globe },
   versions: { label: "Index versions", Icon: Layers },
   devices: { label: "Devices", Icon: Smartphone },
+  kiwix: { label: "Articles", Icon: FileText },
   settings: { label: "Settings", Icon: SettingsIcon },
 };
 
@@ -78,31 +114,20 @@ export default function KnowledgeBaseDetail({
   history,
   onCreate,
   onUpload,
+  onLinkFolder,
+  onUnlinkFolder,
+  onSyncFolder,
   onReindex,
   onRetry,
   onSetDefault,
   onDelete,
+  onMove,
   onClearHistory,
   onBack,
 }: KnowledgeBaseDetailProps) {
   const { t } = useTranslation();
   const [section, setSection] = useState<KbDetailSection>("files");
   const [retrySubmitting, setRetrySubmitting] = useState(false);
-
-  // Connected KBs (obsidian / linked / subagent / lightrag_server / ima) are
-  // read-only pointers: their index lives elsewhere, so "Add documents" and
-  // "Index versions" tabs and retry/reindex actions don't apply. Computed
-  // before the early return so the effect below respects the rules of hooks.
-  const connected = kb ? isConnectedKb(kb) : false;
-  // A connected KB only exposes Files and Settings. If the user was on the
-  // "add" or "versions" tab of an ordinary KB and then opens a connected one
-  // (or the KB's type changes after a refresh), fall back to Files so the body
-  // never renders a tab that isn't in the nav.
-  useEffect(() => {
-    if (connected && (section === "add" || section === "versions")) {
-      setSection("files");
-    }
-  }, [connected, section]);
 
   if (!kb) {
     return (
@@ -135,11 +160,13 @@ export default function KnowledgeBaseDetail({
   const isMarginNote = isMarginNoteKb(kb);
   // A MarginNote library records no engine and no embedding: defaulting to
   // "llamaindex · Default embedding" here described a pipeline it never runs.
-  const provider = isMarginNote
+  const provider = kb.metadata?.type === "kiwix"
+    ? t("Kiwix / ZIM")
+    : isMarginNote
     ? t("MarginNote 4")
     : kb.statistics?.rag_provider || "llamaindex";
   const pageIndexProvider =
-    isMarginNote || !providerUsesEmbeddingMetadata(provider);
+    isMarginNote || kb.metadata?.type === "kiwix" || !providerUsesEmbeddingMetadata(provider);
   const embeddingLabel = meta.embedding_model
     ? typeof meta.embedding_dim === "number"
       ? `${meta.embedding_model} · ${meta.embedding_dim}${t("d")}`
@@ -153,15 +180,18 @@ export default function KnowledgeBaseDetail({
     (task?.kind === "reindex" || task?.kind === "retry") &&
     task.executing === true;
   const status = resolveKbStatus(kb);
-  // Nothing to re-run for a KB whose content arrives from outside (a
-  // connected source or the MarginNote add-on), not from a local index.
-  const canRetry = status === "error" && !kb.read_only && !connected && !isMarginNote;
+  // Nothing to re-run: its content arrives from the add-on, not an index.
+  const canRetry = status === "error" && !kb.read_only && !isMarginNote && kb.metadata?.type !== "kiwix";
 
   const handleRetry = async () => {
     if (!canRetry || retrySubmitting || isReindexingLocally) return;
+    if (kbProvider(kb) === "lightrag") {
+      setSection("versions");
+      return;
+    }
     setRetrySubmitting(true);
     try {
-      await onRetry(kb.name);
+      await onRetry(knowledgeBaseRef(kb));
     } finally {
       setRetrySubmitting(false);
     }
@@ -169,8 +199,7 @@ export default function KnowledgeBaseDetail({
 
   const sections = kbDetailSections(kb);
   // Switching to a KB without the selected section (a MarginNote library has
-  // no Files tab; a connected KB has no Add/Versions tabs) falls back to its
-  // first, instead of rendering nothing.
+  // no Files tab) falls back to its first, instead of rendering nothing.
   const activeSection = sections.includes(section) ? section : sections[0];
   const fullBleed = FULL_BLEED_SECTIONS.has(activeSection);
 
@@ -179,76 +208,81 @@ export default function KnowledgeBaseDetail({
       {/* Header */}
       <div className="border-b border-[var(--border)] bg-[var(--card)] px-6 py-4">
         <div className="flex items-start justify-between gap-3">
-          <div className="min-w-0 flex-1">
-            {onBack && (
-              <button
-                type="button"
-                onClick={onBack}
-                className="mb-1.5 inline-flex items-center gap-1 text-[11.5px] font-medium text-[var(--muted-foreground)] transition-colors hover:text-[var(--foreground)]"
-              >
-                <ArrowLeft className="h-3.5 w-3.5" />
-                {t("Knowledge bases")}
-              </button>
-            )}
-            <div className="flex flex-wrap items-center gap-2">
-              <h1 className="truncate font-serif text-[18px] font-semibold tracking-tight text-[var(--foreground)]">
-                {kb.name}
-              </h1>
-              {kb.is_default && (
-                <span className="inline-flex items-center gap-1 rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-medium text-amber-700 dark:bg-amber-950/30 dark:text-amber-300">
-                  <Star className="h-3 w-3" fill="currentColor" />
-                  {t("Default")}
-                </span>
-              )}
-              {kb.assigned && (
-                <span className="inline-flex items-center rounded-full bg-emerald-500/10 px-2 py-0.5 text-[10px] font-medium text-emerald-700 dark:bg-emerald-300/10 dark:text-emerald-300">
-                  {kb.provenance_label || t("Assigned by admin")}
-                </span>
-              )}
-              {connected && (
-                <span
-                  className="inline-flex items-center gap-1 rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-medium text-slate-600 dark:bg-slate-800/50 dark:text-slate-300"
-                  title={t(
-                    "This knowledge base is read-only. Documents are managed in its connected source; DeepTutor only searches it.",
-                  )}
+          <div className="flex min-w-0 flex-1 items-start gap-3">
+            <KnowledgeEngineIcon
+              engine={knowledgeSourceIconId({
+                provider: kbProvider(kb),
+                type: kb.metadata?.type,
+              })}
+              size={36}
+              className="mt-0.5"
+            />
+            <div className="min-w-0 flex-1">
+              {onBack && (
+                <button
+                  type="button"
+                  onClick={onBack}
+                  className="mb-1.5 inline-flex items-center gap-1 text-[11.5px] font-medium text-[var(--muted-foreground)] transition-colors hover:text-[var(--foreground)]"
                 >
-                  <Lock className="h-3 w-3" />
-                  {t("Read-only")}
-                </span>
+                  <ArrowLeft className="h-3.5 w-3.5" />
+                  {t("Knowledge bases")}
+                </button>
               )}
-              <KbStatusBadge
-                kb={kb}
-                isReindexingLocally={isReindexingLocally}
-              />
+              <div className="flex flex-wrap items-center gap-2">
+                <h1 className="truncate font-serif text-[18px] font-semibold tracking-tight text-[var(--foreground)]">
+                  {kb.name}
+                </h1>
+                {kb.is_default && (
+                  <span className="inline-flex items-center gap-1 rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-medium text-amber-700 dark:bg-amber-950/30 dark:text-amber-300">
+                    <Star className="h-3 w-3" fill="currentColor" />
+                    {t("Default")}
+                  </span>
+                )}
+                {(kb.assigned || kb.provenance_label) && (
+                  <span className="inline-flex items-center rounded-full bg-emerald-500/10 px-2 py-0.5 text-[10px] font-medium text-emerald-700 dark:text-emerald-300">
+                    {kb.provenance_label || t("Assigned by admin")}
+                  </span>
+                )}
+                <KbStatusBadge
+                  kb={kb}
+                  isReindexingLocally={isReindexingLocally}
+                />
+              </div>
+              <p className="mt-1 text-[12px] text-[var(--muted-foreground)]">
+                {provider}
+                {!pageIndexProvider ? ` · ${embeddingLabel}` : ""} ·{" "}
+                {t("Updated")} {updatedLabel}
+                {lastIndexedLabel
+                  ? ` · ${t("Last indexed")} ${lastIndexedLabel}`
+                  : ""}
+              </p>
+              <LightRagEmbeddingWarning kb={kb} />
             </div>
-            <p className="mt-1 text-[12px] text-[var(--muted-foreground)]">
-              {provider}
-              {!pageIndexProvider ? ` · ${embeddingLabel}` : ""} ·{" "}
-              {t("Updated")} {updatedLabel}
-              {lastIndexedLabel
-                ? ` · ${t("Last indexed")} ${lastIndexedLabel}`
-                : ""}
-            </p>
           </div>
           {canRetry && (
-            <button
-              type="button"
-              onClick={handleRetry}
-              disabled={retrySubmitting || isReindexingLocally}
-              title={t(
+            <Tooltip label={t(
                 "Retry indexing from the documents already stored in this knowledge base.",
-              )}
-              className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-red-200 bg-red-50 px-2.5 py-1 text-[12px] font-medium text-red-700 transition-colors hover:bg-red-100 disabled:opacity-50 dark:border-red-900 dark:bg-red-950/30 dark:text-red-300"
-            >
-              {retrySubmitting || isReindexingLocally ? (
-                <Loader2 className="h-3 w-3 animate-spin" />
-              ) : (
-                <RefreshCw className="h-3 w-3" />
-              )}
-              {retrySubmitting || isReindexingLocally
-                ? t("Retrying…")
-                : t("Retry indexing")}
-            </button>
+              )} side="top">
+              <button
+                type="button"
+                onClick={handleRetry}
+                disabled={retrySubmitting || isReindexingLocally}
+                className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-red-200 bg-red-50 px-2.5 py-1 text-[12px] font-medium text-red-700 transition-colors hover:bg-red-100 disabled:opacity-50 dark:border-red-900 dark:bg-red-950/30 dark:text-red-300"
+              >
+                {retrySubmitting || isReindexingLocally ? (
+                  <Loader2 className="h-3 w-3 animate-spin" />
+                ) : (
+                  <RefreshCw className="h-3 w-3" />
+                )}
+                {retrySubmitting || isReindexingLocally
+                  ? t("Retrying…")
+                  : t(
+                      kbProvider(kb) === "lightrag"
+                        ? "Review rebuild"
+                        : "Retry indexing",
+                    )}
+              </button>
+            </Tooltip>
           )}
         </div>
 
@@ -277,9 +311,11 @@ export default function KnowledgeBaseDetail({
       </div>
 
       {/* Body */}
+      <KbTaskLogs key={knowledgeBaseRef(kb)} kb={kb} task={task} />
+      <KbIndexingRun key={`run-${knowledgeBaseRef(kb)}`} kbName={knowledgeBaseRef(kb)} readOnly={kb.read_only} />
       <div className="min-h-0 flex-1 overflow-hidden">
         {activeSection === "files" ? (
-          <KbFilesTab key={kb.name} kb={kb} task={task} />
+          <KbFilesTab key={knowledgeBaseRef(kb)} kb={kb} task={task} />
         ) : (
           <div className="h-full overflow-y-auto px-6 py-5">
             <div className={fullBleed ? "" : "mx-auto max-w-3xl"}>
@@ -289,42 +325,74 @@ export default function KnowledgeBaseDetail({
                   uploadPolicy={uploadPolicy}
                   task={task}
                   history={history}
-                  onClearHistory={() => onClearHistory(kb.name)}
+                  onClearHistory={() => onClearHistory(knowledgeBaseRef(kb))}
                   onRetry={handleRetry}
                   onUpload={(files, destSubdir) =>
                     kb.read_only
                       ? Promise.resolve()
-                      : onUpload(kb.name, files, destSubdir)
+                      : onUpload(knowledgeBaseRef(kb), files, destSubdir)
                   }
+                />
+              )}
+              {activeSection === "folders" && (
+                <KbLinkedFoldersSection
+                  key={knowledgeBaseRef(kb)}
+                  kb={kb}
+                  task={task}
+                  onLinkFolder={async (folderPath) => {
+                    await onLinkFolder(knowledgeBaseRef(kb), folderPath);
+                  }}
+                  onUnlinkFolder={(folderId) => onUnlinkFolder(knowledgeBaseRef(kb), folderId)}
+                  onSyncFolder={(folderId) => onSyncFolder(knowledgeBaseRef(kb), folderId)}
                 />
               )}
               {activeSection === "versions" && (
                 <KbIndexVersionsSection
                   kb={kb}
                   task={task}
-                  onReindex={() =>
+                  onReindex={(configFingerprint, embeddingModel) =>
                     kb.read_only
                       ? Promise.resolve()
-                      : status === "error"
+                      : status === "error" &&
+                          kbProvider(kb) !== "lightrag" &&
+                          !embeddingModel
                         ? handleRetry()
-                        : onReindex(kb.name)
+                        : onReindex(
+                            knowledgeBaseRef(kb),
+                            configFingerprint,
+                            embeddingModel,
+                          )
                   }
                 />
               )}
               {activeSection === "github" && (
-                <KbGitHubSourcesSection kbName={kb.name} />
+                <KbGitHubSourcesSection kbName={knowledgeBaseRef(kb)} />
+              )}
+              {activeSection === "web" && (
+                <KbWebSourcesSection kbName={knowledgeBaseRef(kb)} />
               )}
               {activeSection === "devices" && (
-                <KbMarginNoteDevicesSection key={kb.name} kb={kb} />
+                <KbMarginNoteDevicesSection
+                  key={knowledgeBaseRef(kb)}
+                  kb={kb}
+                />
+              )}
+              {activeSection === "kiwix" && (
+                <KbKiwixArticlesSection key={knowledgeBaseRef(kb)} kb={kb} />
               )}
               {activeSection === "settings" && (
                 <KbSettingsSection
                   kb={kb}
+                  onMove={onMove ? (targetWorkspaceId) => onMove(knowledgeBaseRef(kb), targetWorkspaceId) : undefined}
                   onSetDefault={() =>
-                    kb.read_only ? Promise.resolve() : onSetDefault(kb.name)
+                    kb.read_only
+                      ? Promise.resolve()
+                      : onSetDefault(knowledgeBaseRef(kb))
                   }
                   onDelete={() =>
-                    kb.read_only ? Promise.resolve() : onDelete(kb.name)
+                    kb.read_only
+                      ? Promise.resolve()
+                      : onDelete(knowledgeBaseRef(kb))
                   }
                 />
               )}

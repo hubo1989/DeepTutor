@@ -4,12 +4,14 @@ export interface KnowledgeUploadPolicy {
   extensions: string[];
   accept: string;
   max_file_size_bytes: number;
+  allow_any_extension?: boolean;
 }
 
 export const DEFAULT_UPLOAD_POLICY: KnowledgeUploadPolicy = {
   extensions: [],
   accept: "",
   max_file_size_bytes: 200 * 1024 * 1024,
+  allow_any_extension: false,
 };
 
 const PAGEINDEX_UPLOAD_EXTENSIONS: Record<string, string[]> = {
@@ -35,7 +37,12 @@ export function uploadPolicyForProvider(
 ): KnowledgeUploadPolicy {
   const extensions = PAGEINDEX_UPLOAD_EXTENSIONS[provider || ""];
   return extensions
-    ? { ...policy, extensions, accept: extensions.join(",") }
+    ? {
+        ...policy,
+        extensions,
+        accept: extensions.join(","),
+        allow_any_extension: false,
+      }
     : policy;
 }
 
@@ -84,13 +91,69 @@ export interface KnowledgeIndexFailure {
 }
 
 export interface IndexVersion {
+  version?: string;
   signature?: string;
+  provider?: string;
+  state?: string;
   model?: string;
   dimension?: number;
   binding?: string;
   created_at?: string;
   ready?: boolean;
   legacy?: boolean;
+  failure_summary?: string;
+  indexing_policy?: LightRagIndexingPolicy;
+  embedding_model?: string;
+  embedding_dim?: number;
+}
+
+export interface LightRagIndexingPolicy {
+  schema_version?: number;
+  extract?: LightRagIndexingPolicy;
+  vlm?: { mode: "disabled" | "enabled"; snapshot?: LightRagIndexingPolicy };
+  policy: "pending_pinned" | "pinned" | "legacy_unpinned" | string;
+  selection?: {
+    profile_id: string;
+    model_id: string;
+    reasoning_effort?: string;
+  };
+  descriptor?: {
+    model?: string;
+    binding?: string;
+    provider_mode?: string;
+    reasoning_effort?: string | null;
+  };
+  fingerprint?: string | null;
+  vision_available?: boolean;
+  vlm_used?: boolean;
+}
+
+export type LightRagVersionDisplayState =
+  "published" | "building" | "failed" | "legacy" | "inactive";
+
+export function currentLightRagBuildCandidate(
+  versions: IndexVersion[],
+  rebuildActive: boolean,
+): IndexVersion | undefined {
+  if (!rebuildActive) return undefined;
+  return versions.find((version) => version.ready !== true);
+}
+
+export function lightRagVersionDisplayState(
+  version: IndexVersion,
+  options: {
+    published: boolean;
+    rebuildActive: boolean;
+    kbError: boolean;
+    legacy: boolean;
+  },
+): LightRagVersionDisplayState {
+  if (options.published) return "published";
+  if (options.legacy || version.legacy) return "legacy";
+  if (version.ready) return "inactive";
+  if (options.rebuildActive) return "building";
+  if (options.kbError || version.failure_summary) return "failed";
+  return "inactive";
 }
 
 export interface KnowledgeBase {
@@ -108,22 +171,31 @@ export interface KnowledgeBase {
     rag_provider?: string;
     needs_reindex?: boolean;
     embedding_model?: string;
+    embedding_selection?: { profile_id: string; model_id: string };
+    embedding_status?: "ready" | "missing" | "changed" | "unconfigured" | "legacy";
     embedding_dim?: number;
+    indexed_version?: string;
     embedding_mismatch?: boolean;
-    /**
-     * Connected-source kind; absent for ordinary indexed KBs. Mirrors the
-     * backend ``CONNECTED_KB_TYPES`` set (see deeptutor/knowledge/kb_types.py):
-     * "obsidian", "linked", "subagent", "lightrag_server", "ima".
-     */
+    indexed_embedding_model?: string;
+    indexed_embedding_dim?: number;
+    current_embedding_model?: string;
+    current_embedding_dim?: number;
+    /** Connected-source kind (e.g. "obsidian", "subagent"); absent for ordinary indexed KBs. */
     type?: string;
     /** Absolute path of a connected Obsidian vault (when type === "obsidian"). */
     vault_path?: string;
     /** SQLite store of a connected MarginNote 4 library (when type === "marginnote4"). */
     db_path?: string;
-    /** Backend of a connected subagent (when type === "subagent"): "claude_code" | "codex" | "gemini" | "antigravity" | "kimi" | "opencode" | "mimo" | "partner". */
+    /** Connected Kiwix archive; article bytes remain on the configured server. */
+    server_url?: string;
+    zim_name?: string;
+    zim_title?: string;
+    /** Backend of a connected subagent (when type === "subagent"): "claude_code" | "codex" | "antigravity" | "kimi" | "opencode" | "mimo" | "hermes" | "openclaw" | "deepseek_harness" | "partner". */
     agent_kind?: string;
     /** Bound partner id when agent_kind === "partner". */
     partner_id?: string;
+    indexing_policy?: LightRagIndexingPolicy;
+    indexing_model_unavailable?: boolean;
   };
   progress?: ProgressInfo;
   statistics?: {
@@ -146,7 +218,8 @@ export interface KnowledgeBase {
   available?: boolean;
 }
 
-export type ProviderConnectionStatus = "ready" | "needs_key" | "unavailable";
+export type ProviderConnectionStatus =
+  "ready" | "needs_key" | "needs_setup" | "unavailable";
 
 export const providerUsesEmbeddingMetadata = (provider?: string): boolean =>
   provider !== "pageindex" && provider !== "pageindex-oss";
@@ -155,7 +228,9 @@ export const providerConnectionStatus = (provider: {
   id: string;
   configured?: boolean;
   requires_api_key?: boolean;
+  setup_required?: boolean;
 }): ProviderConnectionStatus => {
+  if (provider.setup_required) return "needs_setup";
   if (provider.requires_api_key && provider.configured === false)
     return "needs_key";
   if (provider.configured === false) return "unavailable";
@@ -186,7 +261,19 @@ export const formatFileSize = (bytes: number): string => {
   return `${bytes} B`;
 };
 
-export const getFileExtension = (filename: string): string => {
+export const getFileExtension = (
+  filename: string,
+  allowedExtensions: Iterable<string> = [],
+): string => {
+  const lowerName = filename.toLowerCase();
+  const matches = Array.from(allowedExtensions, (extension) =>
+    extension.toLowerCase(),
+  ).filter((extension) => lowerName.endsWith(extension));
+  if (matches.length > 0) {
+    return matches.reduce((longest, extension) =>
+      extension.length > longest.length ? extension : longest,
+    );
+  }
   const index = filename.lastIndexOf(".");
   return index >= 0 ? filename.slice(index).toLowerCase() : "";
 };
@@ -217,13 +304,6 @@ export const formatKnowledgeTimestamp = (value?: string): string | null => {
   return parsed ? parsed.toLocaleString() : value || null;
 };
 
-/**
- * Connected KB types — pointer/read-only KBs whose index lives outside
- * ``data/knowledge_bases``. Must stay in sync with the backend's
- * ``CONNECTED_KB_TYPES`` (deeptutor/knowledge/kb_types.py). The backend now
- * sets ``read_only=True`` for these, but the frontend also gates on type so
- * the UI is correct even before a backend round-trip refreshes the field.
- */
 const CONNECTED_KB_TYPES = new Set([
   "obsidian",
   "linked",
@@ -232,11 +312,23 @@ const CONNECTED_KB_TYPES = new Set([
   "ima",
 ]);
 
-/** True for pointer KBs whose data lives outside DeepTutor (read-only here). */
+/** True for pointer KBs whose data lives outside LearnLeader (read-only here). */
 export const isConnectedKb = (kb: KnowledgeBase): boolean =>
   CONNECTED_KB_TYPES.has(kb.metadata?.type ?? "");
 
 export const MARGINNOTE4_KB_TYPE = "marginnote4";
+
+/**
+ * A connected subagent (partner or local CLI), reachable live via
+ * `consult_subagent`. It owns no documents and nothing to retrieve, so any
+ * picker that feeds static context into a generation step (Mastery topic
+ * sources, Book sources) must exclude it — unlike the chat composer's
+ * "attach knowledge" picker, where surfacing it is the point.
+ */
+export const SUBAGENT_KB_TYPE = "subagent";
+
+export const isSubagentKb = (kb: KnowledgeBase): boolean =>
+  kb.metadata?.type === SUBAGENT_KB_TYPE;
 
 /**
  * A connected MarginNote 4 library.
@@ -251,9 +343,12 @@ export const isMarginNoteKb = (kb: KnowledgeBase): boolean =>
 export const KB_DETAIL_SECTIONS = [
   "files",
   "add",
+  "folders",
   "github",
+  "web",
   "versions",
   "devices",
+  "kiwix",
   "settings",
 ] as const;
 
@@ -266,23 +361,24 @@ export type KbDetailSection = (typeof KB_DETAIL_SECTIONS)[number];
  * add-documents / index-versions would all render empty against it; what it
  * does have is the devices that feed it. Every other KB has the reverse.
  */
-export const kbDetailSections = (kb: KnowledgeBase): KbDetailSection[] => {
-  if (isMarginNoteKb(kb)) {
-    return ["devices", "settings"];
-  }
-  const base = KB_DETAIL_SECTIONS.filter((section) => section !== "devices");
-  // Connected KBs have no local index, so "Add documents" and "Index
-  // versions" don't apply — only Files and Settings are shown.
-  if (isConnectedKb(kb)) {
-    return base.filter((section) => section === "files" || section === "settings");
-  }
-  return base;
-};
+export const kbDetailSections = (kb: KnowledgeBase): KbDetailSection[] =>
+  isMarginNoteKb(kb)
+    ? ["devices", "settings"]
+    : kb.metadata?.type === "kiwix"
+      ? ["kiwix", "settings"]
+    : KB_DETAIL_SECTIONS.filter(
+        (section) => section !== "devices" && section !== "kiwix" && (section !== "folders" || !kb.metadata?.type),
+      );
+
+/** Local source folders belong to ordinary, LearnLeader-managed indexed KBs. */
+export const kbSupportsLinkedFolders = (kb: KnowledgeBase): boolean =>
+  !isMarginNoteKb(kb) && !kb.metadata?.type;
 
 /** The retrieval engine a KB is bound to. Connected vaults badge by source. */
 export const kbProvider = (kb: KnowledgeBase): string => {
   if (kb.metadata?.type === "obsidian") return "obsidian";
   if (isMarginNoteKb(kb)) return MARGINNOTE4_KB_TYPE;
+  if (kb.metadata?.type === "kiwix") return "kiwix";
   return (
     (kb.statistics?.rag_provider as string | undefined) ||
     (kb.metadata?.rag_provider as string | undefined) ||
@@ -292,6 +388,7 @@ export const kbProvider = (kb: KnowledgeBase): string => {
 
 /** Source-document count for a KB, or null when unknown. */
 export const kbDocCount = (kb: KnowledgeBase): number | null => {
+  if (kb.metadata?.type === "kiwix") return null;
   const raw = kb.statistics?.raw_documents;
   if (typeof raw === "number") return raw;
   const indexed = kb.metadata?.last_indexed_count;
@@ -328,6 +425,8 @@ export const resolveKnowledgeIndexFailure = (
   ]);
   const completionConfigurationCodes = new Set([
     "graphrag_model_incompatible",
+    "indexing_model_unavailable",
+    "reindex_required",
     "graphrag_provider_unsupported",
     "graphrag_model_authentication_failed",
     "graphrag_model_endpoint_failed",
@@ -341,9 +440,9 @@ export const resolveKnowledgeIndexFailure = (
     retryable: progress?.retryable ?? storedProgress?.retryable,
     requiresModelChange: requiresEmbeddingChange || requiresCompletionChange,
     settingsHref: requiresEmbeddingChange
-      ? "/settings/embedding"
+      ? "/settings#embedding"
       : requiresCompletionChange
-        ? "/settings/models"
+        ? "/settings#models"
         : undefined,
   };
 };
@@ -357,13 +456,33 @@ export const kbNeedsReindex = (kb: KnowledgeBase): boolean =>
   Boolean(kb.statistics?.needs_reindex) ||
   resolveKbStatus(kb) === "needs_reindex";
 
+export const kbRequiresLightRagRebuildBeforeAppend = (
+  kb: KnowledgeBase,
+): boolean =>
+  kbProvider(kb) === "lightrag" &&
+  (kb.metadata?.indexing_policy?.policy === "legacy_unpinned" ||
+    Boolean(kb.metadata?.embedding_mismatch));
+
 export const kbIsUploadable = (kb: KnowledgeBase): boolean =>
-  !isConnectedKb(kb) &&
   resolveKbStatus(kb) === "ready" &&
-  !kbNeedsReindex(kb);
+  !kbEmbeddingUnavailable(kb) &&
+  !kbNeedsReindex(kb) &&
+  !kb.metadata?.indexing_model_unavailable &&
+  !kbRequiresLightRagRebuildBeforeAppend(kb);
+
+export const kbCanUploadDocuments = (
+  kb: KnowledgeBase,
+  indexingActive: boolean,
+): boolean =>
+  kbIsUploadable(kb) ||
+  (resolveKbStatus(kb) === "error" &&
+    !kbEmbeddingUnavailable(kb) &&
+    !indexingActive &&
+    !kb.metadata?.indexing_model_unavailable &&
+    !kbRequiresLightRagRebuildBeforeAppend(kb));
 
 export const kbCanReindex = (kb: KnowledgeBase): boolean => {
-  if (isConnectedKb(kb)) return false;
+  if (kb.read_only) return false;
   const status = resolveKbStatus(kb);
   const hasSourceFiles =
     typeof kb.statistics?.raw_documents === "number"
@@ -371,11 +490,15 @@ export const kbCanReindex = (kb: KnowledgeBase): boolean => {
       : true;
   if (!hasSourceFiles) return false;
   if (status === "error") return true;
+  if (["llamaindex", "lightrag", "graphrag"].includes(kbProvider(kb))) return !kbHasLiveProgress(kb);
   return (
     Boolean(kb.statistics?.needs_reindex) ||
     kb.statistics?.active_match === false
   );
 };
+
+export const kbEmbeddingUnavailable = (kb: KnowledgeBase): boolean =>
+  ["missing", "changed", "unconfigured"].includes(kb.metadata?.embedding_status || "");
 
 const LIVE_PROGRESS_STAGES = new Set([
   "initializing",
@@ -415,10 +538,14 @@ export function validateFiles(
   );
 
   const items = files.map((file) => {
-    const extension = getFileExtension(file.name);
+    const extension = getFileExtension(file.name, allowedExtensions);
     let error: string | null = null;
 
-    if (allowedExtensions.size > 0 && !allowedExtensions.has(extension)) {
+    if (
+      !uploadPolicy.allow_any_extension &&
+      allowedExtensions.size > 0 &&
+      !allowedExtensions.has(extension)
+    ) {
       error = t("Unsupported file type");
     } else if (file.size > uploadPolicy.max_file_size_bytes) {
       error = t("This file exceeds the maximum size of {{size}}.", {
@@ -442,4 +569,9 @@ export function validateFiles(
     invalidFiles: items.filter((item) => !item.valid),
     totalBytes: files.reduce((total, file) => total + file.size, 0),
   };
+}
+
+/** Resource identity is distinct from its display name across workspace catalogs. */
+export function knowledgeBaseRef(kb: { id?: string; name: string; assigned?: boolean }): string {
+  return kb.assigned && kb.id ? kb.id : kb.id?.startsWith('account:kb:') || kb.id?.startsWith('workspace:') ? kb.id : kb.name;
 }

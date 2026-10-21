@@ -10,6 +10,7 @@ import {
   deleteNotebookEntry,
   getQuestionBankStats,
   listCategories,
+  listQuestionBankMaterials,
   listNotebookEntries,
   removeEntryFromCategory,
   renameCategory,
@@ -17,6 +18,9 @@ import {
   type NotebookCategory,
   type NotebookEntry,
   type QuestionBankStats,
+  type QuestionBankMaterial,
+  type AssessmentSource,
+  type ScoreTrend,
 } from "@/lib/notebook-api";
 
 /**
@@ -28,7 +32,7 @@ import {
  * uncategorized" representable when it is not a real thing.
  */
 export type BankScope =
-  | { kind: "all" | "wrong" | "bookmarked" | "uncategorized" }
+  | { kind: "all" | "wrong" | "unresolved" | "bookmarked" | "uncategorized" }
   | { kind: "category"; categoryId: number };
 
 export type BankSort = "recent" | "oldest";
@@ -39,15 +43,38 @@ const SEARCH_DEBOUNCE_MS = 250;
 
 export const DEFAULT_SCOPE: BankScope = { kind: "all" };
 
-function scopeToFilter(scope: BankScope, search: string, sort: BankSort) {
+export interface ReviewFilters {
+  source: AssessmentSource | "";
+  materialId: string;
+  scoreTrend: ScoreTrend | "";
+}
+
+/**
+ * A course narrows *which questions exist* for this visit; a scope narrows
+ * which of those to show. They are separate axes on purpose — the course comes
+ * from the URL and stays put while the learner clicks through wrong / bookmarked
+ * / a category inside it.
+ */
+export function buildQuestionBankFilter(
+  scope: BankScope,
+  filters: ReviewFilters,
+  search: string,
+  sort: BankSort,
+  courseId = "",
+) {
   return {
     category_id: scope.kind === "category" ? scope.categoryId : undefined,
     uncategorized: scope.kind === "uncategorized" || undefined,
     bookmarked: scope.kind === "bookmarked" ? true : undefined,
-    is_correct: scope.kind === "wrong" ? false : undefined,
+    is_correct: scope.kind === "wrong" || scope.kind === "unresolved" ? false : undefined,
+    source: filters.source || undefined,
+    material_id: filters.materialId || undefined,
+    resolved: scope.kind === "unresolved" ? false : undefined,
+    score_trend: filters.scoreTrend || undefined,
     search: search || undefined,
     sort,
     limit: PAGE_SIZE,
+    course_id: courseId || undefined,
   };
 }
 
@@ -56,7 +83,9 @@ export interface QuestionBankController {
   total: number;
   categories: NotebookCategory[];
   stats: QuestionBankStats;
+  materials: QuestionBankMaterial[];
   scope: BankScope;
+  reviewFilters: ReviewFilters;
   sort: BankSort;
   searchInput: string;
   loading: boolean;
@@ -67,9 +96,12 @@ export interface QuestionBankController {
   selectedIds: ReadonlySet<number>;
 
   setScope: (scope: BankScope) => void;
+  setReviewFilters: (filters: ReviewFilters) => void;
   setSort: (sort: BankSort) => void;
   setSearchInput: (value: string) => void;
   refresh: () => Promise<void>;
+  page: number;
+  setPage: (page: number) => void;
 
   toggleSelected: (id: number) => void;
   selectAll: () => void;
@@ -79,6 +111,7 @@ export interface QuestionBankController {
   // once, as a toast, from inside the hook — the boolean is for the caller's
   // own UI decisions (keep the menu open, keep the typed name).
   toggleBookmark: (entry: NotebookEntry) => Promise<boolean>;
+  toggleResolved: (entry: NotebookEntry) => Promise<boolean>;
   removeEntry: (entry: NotebookEntry) => Promise<boolean>;
   fileEntries: (ids: number[], categoryId: number) => Promise<boolean>;
   unfileEntries: (ids: number[], categoryId: number) => Promise<boolean>;
@@ -92,8 +125,15 @@ export interface QuestionBankController {
 const EMPTY_STATS: QuestionBankStats = {
   total: 0,
   wrong: 0,
+  unresolved: 0,
   bookmarked: 0,
   uncategorized: 0,
+};
+
+const EMPTY_FILTERS: ReviewFilters = {
+  source: "",
+  materialId: "",
+  scoreTrend: "",
 };
 
 /**
@@ -106,12 +146,19 @@ const EMPTY_STATS: QuestionBankStats = {
  *  - a re-fetch never blanks the list — `refreshing` dims it instead, so
  *    filing a question does not make the page jump.
  */
-export function useQuestionBank(): QuestionBankController {
+export function useQuestionBank(
+  options: { courseId?: string; mistakesOnly?: boolean } = {},
+): QuestionBankController {
+  const courseId = options.courseId ?? "";
+  const mistakesOnly = options.mistakesOnly ?? false;
+  const [page, setPage] = useState(0);
   const [items, setItems] = useState<NotebookEntry[]>([]);
   const [total, setTotal] = useState(0);
   const [categories, setCategories] = useState<NotebookCategory[]>([]);
   const [stats, setStats] = useState<QuestionBankStats>(EMPTY_STATS);
+  const [materials, setMaterials] = useState<QuestionBankMaterial[]>([]);
   const [scope, setScopeState] = useState<BankScope>(DEFAULT_SCOPE);
+  const [reviewFilters, setReviewFiltersState] = useState<ReviewFilters>(EMPTY_FILTERS);
   const [sort, setSort] = useState<BankSort>("recent");
   const [searchInput, setSearchInput] = useState("");
   const [search, setSearch] = useState("");
@@ -119,9 +166,7 @@ export function useQuestionBank(): QuestionBankController {
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [pendingIds, setPendingIds] = useState<ReadonlySet<number>>(new Set());
-  const [selectedIds, setSelectedIds] = useState<ReadonlySet<number>>(
-    new Set(),
-  );
+  const [selectedIds, setSelectedIds] = useState<ReadonlySet<number>>(new Set());
 
   const loadedOnce = useRef(false);
   // Guards against an older in-flight list response overwriting a newer one
@@ -129,10 +174,10 @@ export function useQuestionBank(): QuestionBankController {
   const requestSeq = useRef(0);
 
   useEffect(() => {
-    const timer = setTimeout(
-      () => setSearch(searchInput.trim()),
-      SEARCH_DEBOUNCE_MS,
-    );
+    const timer = setTimeout(() => {
+      setSearch(searchInput.trim());
+      setPage(0);
+    }, SEARCH_DEBOUNCE_MS);
     return () => clearTimeout(timer);
   }, [searchInput]);
 
@@ -141,19 +186,25 @@ export function useQuestionBank(): QuestionBankController {
     if (loadedOnce.current) setRefreshing(true);
     setError(null);
     try {
-      const response = await listNotebookEntries(
-        scopeToFilter(scope, search, sort),
-      );
+      const response = await listNotebookEntries({
+        ...buildQuestionBankFilter(scope, reviewFilters, search, sort, courseId),
+        mistakes_only: mistakesOnly,
+        offset: page * PAGE_SIZE,
+      });
       if (seq !== requestSeq.current) return;
+      if (response.items.length === 0 && page > 0 && response.total > 0) {
+        setPage(value => value - 1);
+        return;
+      }
       setItems(response.items);
       setTotal(response.total);
       // Converge the selection onto the new rows: searching, re-sorting or a
       // refresh after a write can all drop a selected row out of view, and a
       // bulk action must never reach something off screen.
-      const visible = new Set(response.items.map((item) => item.id));
-      setSelectedIds((prev) => {
+      const visible = new Set(response.items.map(item => item.id));
+      setSelectedIds(prev => {
         if (prev.size === 0) return prev;
-        const next = new Set([...prev].filter((id) => visible.has(id)));
+        const next = new Set([...prev].filter(id => visible.has(id)));
         return next.size === prev.size ? prev : next;
       });
     } catch (err) {
@@ -166,17 +217,18 @@ export function useQuestionBank(): QuestionBankController {
         setRefreshing(false);
       }
     }
-  }, [scope, search, sort]);
+  }, [courseId, scope, reviewFilters, search, sort, mistakesOnly, page]);
 
   const loadMeta = useCallback(async () => {
-    const [nextCategories, nextStats] = await Promise.allSettled([
-      listCategories(),
-      getQuestionBankStats(),
+    const [nextCategories, nextStats, nextMaterials] = await Promise.allSettled([
+      listCategories(courseId),
+      getQuestionBankStats(courseId),
+      listQuestionBankMaterials(courseId),
     ]);
-    if (nextCategories.status === "fulfilled")
-      setCategories(nextCategories.value);
+    if (nextCategories.status === "fulfilled") setCategories(nextCategories.value);
     if (nextStats.status === "fulfilled") setStats(nextStats.value);
-  }, []);
+    if (nextMaterials.status === "fulfilled") setMaterials(nextMaterials.value);
+  }, [courseId]);
 
   useEffect(() => {
     void loadEntries();
@@ -190,7 +242,13 @@ export function useQuestionBank(): QuestionBankController {
   // leave invisible rows staged for a bulk action.
   const setScope = useCallback((next: BankScope) => {
     setSelectedIds(new Set());
+    setPage(0);
     setScopeState(next);
+  }, []);
+
+  const setReviewFilters = useCallback((next: ReviewFilters) => {
+    setPage(0);
+    setReviewFiltersState(next);
   }, []);
 
   const refresh = useCallback(async () => {
@@ -218,13 +276,13 @@ export function useQuestionBank(): QuestionBankController {
 
   const withPending = useCallback(
     async (ids: number[], action: () => Promise<void>) => {
-      setPendingIds((prev) => new Set([...prev, ...ids]));
+      setPendingIds(prev => new Set([...prev, ...ids]));
       try {
         return await attempt(action);
       } finally {
-        setPendingIds((prev) => {
+        setPendingIds(prev => {
           const next = new Set(prev);
-          ids.forEach((id) => next.delete(id));
+          ids.forEach(id => next.delete(id));
           return next;
         });
       }
@@ -233,7 +291,7 @@ export function useQuestionBank(): QuestionBankController {
   );
 
   const toggleSelected = useCallback((id: number) => {
-    setSelectedIds((prev) => {
+    setSelectedIds(prev => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
       else next.add(id);
@@ -242,7 +300,7 @@ export function useQuestionBank(): QuestionBankController {
   }, []);
 
   const selectAll = useCallback(() => {
-    setSelectedIds(new Set(items.map((item) => item.id)));
+    setSelectedIds(new Set(items.map(item => item.id)));
   }, [items]);
 
   const clearSelection = useCallback(() => setSelectedIds(new Set()), []);
@@ -253,10 +311,22 @@ export function useQuestionBank(): QuestionBankController {
       return withPending([entry.id], async () => {
         await updateNotebookEntry(entry.id, { bookmarked: next });
         // Optimistic on the row itself; the counters come back from refresh.
-        setItems((prev) =>
-          prev.map((item) =>
-            item.id === entry.id ? { ...item, bookmarked: next } : item,
-          ),
+        setItems(prev =>
+          prev.map(item => (item.id === entry.id ? { ...item, bookmarked: next } : item)),
+        );
+        await refresh();
+      });
+    },
+    [refresh, withPending],
+  );
+
+  const toggleResolved = useCallback(
+    async (entry: NotebookEntry) => {
+      const next = !entry.resolved;
+      return withPending([entry.id], async () => {
+        await updateNotebookEntry(entry.id, { resolved: next });
+        setItems(prev =>
+          prev.map(item => (item.id === entry.id ? { ...item, resolved: next } : item)),
         );
         await refresh();
       });
@@ -268,7 +338,7 @@ export function useQuestionBank(): QuestionBankController {
     async (entry: NotebookEntry) => {
       return withPending([entry.id], async () => {
         await deleteNotebookEntry(entry.id);
-        setSelectedIds((prev) => {
+        setSelectedIds(prev => {
           const next = new Set(prev);
           next.delete(entry.id);
           return next;
@@ -310,13 +380,17 @@ export function useQuestionBank(): QuestionBankController {
     async (ids: number[], name: string) => {
       const trimmed = name.trim();
       if (!trimmed) return false;
-      return attempt(async () => {
-        const created = await createCategory(trimmed);
-        if (ids.length) await fileEntries(ids, created.id);
-        else await loadMeta();
-      });
+      let categoryId = categories.find(category => category.name === trimmed)?.id;
+      if (categoryId === undefined) {
+        const created = await attempt(async () => {
+          categoryId = (await createCategory(trimmed)).id;
+          await loadMeta();
+        });
+        if (!created || categoryId === undefined) return false;
+      }
+      return ids.length ? fileEntries(ids, categoryId) : true;
     },
-    [attempt, fileEntries, loadMeta],
+    [attempt, categories, fileEntries, loadMeta],
   );
 
   const addCategory = useCallback(
@@ -349,10 +423,8 @@ export function useQuestionBank(): QuestionBankController {
         await deleteCategory(id);
         // Deleting the category being viewed would otherwise leave the list
         // filtered by an id the server no longer knows.
-        setScopeState((prev) =>
-          prev.kind === "category" && prev.categoryId === id
-            ? DEFAULT_SCOPE
-            : prev,
+        setScopeState(prev =>
+          prev.kind === "category" && prev.categoryId === id ? DEFAULT_SCOPE : prev,
         );
         await refresh();
       });
@@ -362,11 +434,15 @@ export function useQuestionBank(): QuestionBankController {
 
   return useMemo(
     () => ({
+      page,
+      setPage,
       items,
       total,
       categories,
       stats,
+      materials,
       scope,
+      reviewFilters,
       sort,
       searchInput,
       loading,
@@ -375,6 +451,7 @@ export function useQuestionBank(): QuestionBankController {
       pendingIds,
       selectedIds,
       setScope,
+      setReviewFilters,
       setSort,
       setSearchInput,
       refresh,
@@ -382,6 +459,7 @@ export function useQuestionBank(): QuestionBankController {
       selectAll,
       clearSelection,
       toggleBookmark,
+      toggleResolved,
       removeEntry,
       fileEntries,
       unfileEntries,
@@ -391,11 +469,15 @@ export function useQuestionBank(): QuestionBankController {
       removeCategory,
     }),
     [
+      page,
+      setPage,
       items,
       total,
       categories,
       stats,
+      materials,
       scope,
+      reviewFilters,
       sort,
       searchInput,
       loading,
@@ -404,11 +486,13 @@ export function useQuestionBank(): QuestionBankController {
       pendingIds,
       selectedIds,
       setScope,
+      setReviewFilters,
       refresh,
       toggleSelected,
       selectAll,
       clearSelection,
       toggleBookmark,
+      toggleResolved,
       removeEntry,
       fileEntries,
       unfileEntries,

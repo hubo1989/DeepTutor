@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from pathlib import Path
 
-from fastapi import Depends, FastAPI
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 import pytest
 
@@ -33,14 +33,7 @@ def output_app(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> OutputAppFact
         monkeypatch.setattr(auth_router, "AUTH_ENABLED", auth_enabled)
         monkeypatch.setattr(auth_router, "decode_token", lambda token: tokens.get(token))
         app = FastAPI()
-        # Mirror api/main.py: the router reads the request-scoped current-user
-        # ContextVar installed by require_auth, so the dependency must be
-        # attached at mount time — a bare mount leaves every request 401.
-        app.include_router(
-            outputs.router,
-            prefix="/api/outputs",
-            dependencies=[Depends(auth_router.require_auth)],
-        )
+        app.include_router(outputs.router, prefix="/files/outputs")
         return TestClient(app), admin_root, users_root
 
     return make_app
@@ -69,7 +62,7 @@ def test_authenticated_user_downloads_own_output(output_app, headers, cookie) ->
     with client:
         if cookie:
             client.cookies.set("dt_token", "alice-token")
-        response = client.get(f"/api/outputs/{relative_path}", headers=headers)
+        response = client.get(f"/files/outputs/{relative_path}", headers=headers)
 
     assert response.status_code == 200
     assert response.content == b"alice report"
@@ -89,11 +82,11 @@ def test_same_output_url_is_isolated_between_users(output_app) -> None:
 
     with client:
         client.cookies.set("dt_token", "alice-token")
-        alice = client.get(f"/api/outputs/{relative_path}")
+        alice = client.get(f"/files/outputs/{relative_path}")
         client.cookies.set("dt_token", "bob-token")
-        bob = client.get(f"/api/outputs/{relative_path}")
+        bob = client.get(f"/files/outputs/{relative_path}")
         client.cookies.set("dt_token", "carol-token")
-        carol = client.get(f"/api/outputs/{relative_path}")
+        carol = client.get(f"/files/outputs/{relative_path}")
 
     assert alice.content == b"alice document"
     assert bob.content == b"bob document"
@@ -110,7 +103,7 @@ def test_invalid_auth_never_falls_back_to_admin_output(output_app, token) -> Non
     headers = {} if token is None else {"Authorization": f"Bearer {token}"}
 
     with client:
-        response = client.get(f"/api/outputs/{relative_path}", headers=headers)
+        response = client.get(f"/files/outputs/{relative_path}", headers=headers)
 
     assert response.status_code == 401
     assert "admin-only output" not in response.text
@@ -123,10 +116,71 @@ def test_auth_disabled_reads_local_admin_output(output_app) -> None:
     _write_output(admin_root, relative_path, b"local output")
 
     with client:
-        response = client.get(f"/api/outputs/{relative_path}")
+        response = client.get(f"/files/outputs/{relative_path}")
 
     assert response.status_code == 200
     assert response.content == b"local output"
+
+
+def test_authenticated_user_downloads_visible_partner_output(output_app, monkeypatch) -> None:
+    relative_path = "workspace/outputs/chat/session-1/turn-1/media/chart.png"
+    alice = TokenPayload(username="alice", role="user", user_id="u_alice")
+    client, admin_root, _users_root = output_app({"alice-token": alice})
+
+    from deeptutor.api.routers import outputs
+
+    partner_root = admin_root / "partners" / "math-bot" / "workspace"
+    _write_output(partner_root, relative_path, b"\x89PNG\r\n\x1a\npartner image")
+    monkeypatch.setattr(
+        outputs,
+        "visible_partners",
+        lambda: [{"partner_id": "math-bot", "can_manage": True}],
+    )
+
+    with client:
+        client.cookies.set("dt_token", "alice-token")
+        response = client.get(f"/files/outputs/{relative_path}")
+
+    assert response.status_code == 200
+    assert response.content.startswith(b"\x89PNG\r\n\x1a\n")
+    assert response.headers["content-type"] == "image/png"
+
+
+@pytest.mark.parametrize("kind", ["exec", "media", "cli"])
+def test_workspace_output_chat_kinds_are_public(tmp_path: Path, kind: str) -> None:
+    workspace_root = tmp_path / "workspace"
+    service = PathService(workspace_root=workspace_root)
+    output = _write_output(
+        workspace_root,
+        f"workspace/outputs/chat/session-1/turn-1/{kind}/report.pdf",
+        b"generated output",
+    )
+
+    assert service.resolve_public_output_path(output) == output
+
+
+def test_workspace_markdown_output_is_public(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "workspace"
+    service = PathService(workspace_root=workspace_root)
+    output = _write_output(
+        workspace_root,
+        "workspace/outputs/chat/session-1/turn-1/exec/report.md",
+        b"# generated report",
+    )
+
+    assert service.resolve_public_output_path(output) == output
+
+
+def test_arbitrary_workspace_output_file_is_not_public(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "workspace"
+    service = PathService(workspace_root=workspace_root)
+    output = _write_output(
+        workspace_root,
+        "workspace/outputs/chat/session-1/turn-1/other/report.pdf",
+        b"private workspace file",
+    )
+
+    assert service.resolve_public_output_path(output) is None
 
 
 def test_private_suffix_is_rejected(output_app) -> None:
@@ -137,7 +191,7 @@ def test_private_suffix_is_rejected(output_app) -> None:
 
     with client:
         client.cookies.set("dt_token", "alice-token")
-        response = client.get(f"/api/outputs/{relative_path}")
+        response = client.get(f"/files/outputs/{relative_path}")
 
     assert response.status_code == 404
     assert "secret" not in response.text
@@ -150,7 +204,7 @@ def test_path_traversal_is_rejected(output_app) -> None:
 
     with client:
         client.cookies.set("dt_token", "alice-token")
-        response = client.get("/api/outputs/%2E%2E/secret.pdf")
+        response = client.get("/files/outputs/%2E%2E/secret.pdf")
 
     assert response.status_code == 404
     assert "outside public allowlist" not in response.text
@@ -168,7 +222,7 @@ def test_symlink_outside_user_root_is_rejected(output_app, tmp_path: Path) -> No
 
     with client:
         client.cookies.set("dt_token", "alice-token")
-        response = client.get(f"/api/outputs/{relative_path}")
+        response = client.get(f"/files/outputs/{relative_path}")
 
     assert response.status_code == 404
     assert "other user's data" not in response.text

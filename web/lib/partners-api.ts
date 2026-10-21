@@ -1,7 +1,20 @@
-/** Typed client for the /api/v1/partners backend. */
+/** Typed client for the /api/partners backend. */
 
 import { apiFetch, apiUrl } from "@/lib/api";
-import type { LLMSelection } from "@/lib/unified-ws";
+import type { LLMSelection } from "@/features/chat/model/protocol";
+import type { ChatWorkspaceRegistration } from "@/lib/workspaces-api";
+
+export async function getPartnerWorkspaces(
+  partnerId: string,
+): Promise<ChatWorkspaceRegistration[]> {
+  const response = await apiFetch(
+    apiUrl(`/api/partners/${encodeURIComponent(partnerId)}/workspaces`),
+  );
+  const result = await json<{ workspaces: ChatWorkspaceRegistration[] }>(
+    response,
+  );
+  return result.workspaces;
+}
 
 export interface PartnerInfo {
   partner_id: string;
@@ -9,6 +22,7 @@ export interface PartnerInfo {
   description: string;
   /** Account that created the partner; empty for admin-managed ones. */
   owner_id?: string;
+  workspace_id?: string;
   /**
    * Whether the signed-in user may configure this partner (its owner, or an
    * admin). False for a partner merely assigned to them, whose response is
@@ -85,6 +99,35 @@ export interface PartnerSessionInfo {
   updated_at: string;
   last_message: string;
   archived?: boolean;
+  /** The platform conversation this session belongs to, when the channel said. */
+  chat_id?: string;
+  /** "group" or "direct"; absent when the channel does not distinguish them. */
+  scope?: string;
+}
+
+export interface PartnerWebContinuity {
+  enabled: boolean;
+  session_key: string | null;
+}
+
+export interface PartnerHistoryMessage {
+  role: string;
+  content: string;
+  timestamp?: string;
+  channel?: string;
+  sender_id?: string;
+  metadata?: Record<string, unknown>;
+  attachments?: Record<string, unknown>[];
+  /** Persisted turn trace (assistant rows only) for rehydrating activity. */
+  events?: Record<string, unknown>[];
+}
+
+export interface PartnerHistoryPage {
+  messages: PartnerHistoryMessage[];
+  next_before: number | null;
+  /** Index of the first record returned, and current record count. */
+  start: number;
+  total: number;
 }
 
 export interface PartnerCommandInfo {
@@ -100,6 +143,7 @@ export interface SoulSpec {
 }
 
 export interface CreatePartnerPayload {
+  workspace_id?: string;
   partner_id?: string;
   name: string;
   description?: string;
@@ -122,6 +166,16 @@ export interface CreatePartnerPayload {
   start?: boolean;
 }
 
+export interface ConfirmPartnerDraftPayload {
+  name?: string;
+  description?: string;
+  soul?: string;
+  language?: string;
+  emoji?: string;
+  color?: string;
+  start?: boolean;
+}
+
 async function json<T>(res: Response): Promise<T> {
   if (!res.ok) {
     const body = (await res.json().catch(() => ({}))) as {
@@ -138,9 +192,7 @@ async function json<T>(res: Response): Promise<T> {
 }
 
 export async function listPartners(): Promise<PartnerInfo[]> {
-  return json(
-    await apiFetch(apiUrl("/api/v1/partners"), { cache: "no-store" }),
-  );
+  return json(await apiFetch(apiUrl("/api/partners"), { cache: "no-store" }));
 }
 
 export async function getPartner(
@@ -150,7 +202,7 @@ export async function getPartner(
   const query = options?.includeSecrets ? "?include_secrets=true" : "";
   return json(
     await apiFetch(
-      apiUrl(`/api/v1/partners/${encodeURIComponent(partnerId)}${query}`),
+      apiUrl(`/api/partners/${encodeURIComponent(partnerId)}${query}`),
     ),
   );
 }
@@ -159,11 +211,27 @@ export async function createPartner(
   payload: CreatePartnerPayload,
 ): Promise<PartnerInfo> {
   return json(
-    await apiFetch(apiUrl("/api/v1/partners"), {
+    await apiFetch(apiUrl("/api/partners"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     }),
+  );
+}
+
+export async function confirmPartnerDraft(
+  draftId: string,
+  payload: ConfirmPartnerDraftPayload,
+): Promise<PartnerInfo> {
+  return json(
+    await apiFetch(
+      apiUrl(`/api/partners/drafts/${encodeURIComponent(draftId)}/confirm`),
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      },
+    ),
   );
 }
 
@@ -174,21 +242,18 @@ export async function updatePartner(
   },
 ): Promise<PartnerInfo> {
   return json(
-    await apiFetch(
-      apiUrl(`/api/v1/partners/${encodeURIComponent(partnerId)}`),
-      {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      },
-    ),
+    await apiFetch(apiUrl(`/api/partners/${encodeURIComponent(partnerId)}`), {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }),
   );
 }
 
 export async function startPartner(partnerId: string): Promise<PartnerInfo> {
   return json(
     await apiFetch(
-      apiUrl(`/api/v1/partners/${encodeURIComponent(partnerId)}/start`),
+      apiUrl(`/api/partners/${encodeURIComponent(partnerId)}/start`),
       { method: "POST" },
     ),
   );
@@ -197,7 +262,7 @@ export async function startPartner(partnerId: string): Promise<PartnerInfo> {
 export async function stopPartner(partnerId: string): Promise<void> {
   await json(
     await apiFetch(
-      apiUrl(`/api/v1/partners/${encodeURIComponent(partnerId)}/stop`),
+      apiUrl(`/api/partners/${encodeURIComponent(partnerId)}/stop`),
       { method: "POST" },
     ),
   );
@@ -205,19 +270,16 @@ export async function stopPartner(partnerId: string): Promise<void> {
 
 export async function destroyPartner(partnerId: string): Promise<void> {
   await json(
-    await apiFetch(
-      apiUrl(`/api/v1/partners/${encodeURIComponent(partnerId)}`),
-      {
-        method: "DELETE",
-      },
-    ),
+    await apiFetch(apiUrl(`/api/partners/${encodeURIComponent(partnerId)}`), {
+      method: "DELETE",
+    }),
   );
 }
 
 export async function getPartnerSoul(partnerId: string): Promise<string> {
   const data = await json<{ content: string }>(
     await apiFetch(
-      apiUrl(`/api/v1/partners/${encodeURIComponent(partnerId)}/soul`),
+      apiUrl(`/api/partners/${encodeURIComponent(partnerId)}/soul`),
     ),
   );
   return data.content ?? "";
@@ -229,7 +291,7 @@ export async function savePartnerSoul(
 ): Promise<void> {
   await json(
     await apiFetch(
-      apiUrl(`/api/v1/partners/${encodeURIComponent(partnerId)}/soul`),
+      apiUrl(`/api/partners/${encodeURIComponent(partnerId)}/soul`),
       {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
@@ -240,7 +302,7 @@ export async function savePartnerSoul(
 }
 
 export async function getSoulSources(): Promise<SoulSources> {
-  return json(await apiFetch(apiUrl("/api/v1/partners/soul-sources")));
+  return json(await apiFetch(apiUrl("/api/partners/soul-sources")));
 }
 
 export async function createSoulTemplate(
@@ -249,7 +311,7 @@ export async function createSoulTemplate(
   content: string,
 ): Promise<SoulTemplate> {
   return json(
-    await apiFetch(apiUrl("/api/v1/partners/souls"), {
+    await apiFetch(apiUrl("/api/partners/souls"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ id, name, content }),
@@ -258,12 +320,12 @@ export async function createSoulTemplate(
 }
 
 export async function getToolOptions(): Promise<ToolOptions> {
-  return json(await apiFetch(apiUrl("/api/v1/partners/tool-options")));
+  return json(await apiFetch(apiUrl("/api/partners/tool-options")));
 }
 
 export async function getPartnerCommands(): Promise<PartnerCommandInfo[]> {
   const data = await json<{ commands: PartnerCommandInfo[] }>(
-    await apiFetch(apiUrl("/api/v1/partners/commands/palette")),
+    await apiFetch(apiUrl("/api/partners/commands/palette")),
   );
   return data.commands;
 }
@@ -273,7 +335,7 @@ export async function getPartnerAssets(
 ): Promise<PartnerAssets> {
   return json(
     await apiFetch(
-      apiUrl(`/api/v1/partners/${encodeURIComponent(partnerId)}/assets`),
+      apiUrl(`/api/partners/${encodeURIComponent(partnerId)}/assets`),
     ),
   );
 }
@@ -288,7 +350,7 @@ export async function addPartnerAssets(
 ): Promise<{ assets: PartnerAssets } & ProvisioningReport> {
   return json(
     await apiFetch(
-      apiUrl(`/api/v1/partners/${encodeURIComponent(partnerId)}/assets`),
+      apiUrl(`/api/partners/${encodeURIComponent(partnerId)}/assets`),
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -306,7 +368,7 @@ export async function removePartnerAsset(
   return json(
     await apiFetch(
       apiUrl(
-        `/api/v1/partners/${encodeURIComponent(partnerId)}/assets/${assetType}/${encodeURIComponent(name)}`,
+        `/api/partners/${encodeURIComponent(partnerId)}/assets/${assetType}/${encodeURIComponent(name)}`,
       ),
       { method: "DELETE" },
     ),
@@ -327,6 +389,36 @@ export interface ChannelSchemaEntry {
 
 export interface ChannelsSchemaResponse {
   channels: Record<string, ChannelSchemaEntry>;
+}
+
+export interface PartnerChannelRuntimeSetup {
+  status: string;
+  message?: string;
+  qr_payload?: string;
+  qr_data_url?: string | null;
+}
+
+export interface PartnerChannelRuntimeEntry {
+  enabled: boolean;
+  running: boolean;
+  setup: PartnerChannelRuntimeSetup;
+}
+
+export interface PartnerChannelRuntimeResponse {
+  partner_id: string;
+  running: boolean;
+  channels: Record<string, PartnerChannelRuntimeEntry>;
+}
+
+export async function getPartnerChannelRuntime(
+  partnerId: string,
+): Promise<PartnerChannelRuntimeResponse> {
+  return json(
+    await apiFetch(
+      apiUrl(`/api/partners/${encodeURIComponent(partnerId)}/channels/status`),
+      { cache: "no-store" },
+    ),
+  );
 }
 
 export type PartnerChannelOnboardingChannel = "feishu" | "wecom";
@@ -367,7 +459,7 @@ export async function startChannelOnboarding(
   return json(
     await apiFetch(
       apiUrl(
-        `/api/v1/partners/${encodeURIComponent(partnerId)}/channel-onboarding/start`,
+        `/api/partners/${encodeURIComponent(partnerId)}/channel-onboarding/start`,
       ),
       {
         method: "POST",
@@ -385,7 +477,7 @@ export async function getChannelOnboarding(
   return json(
     await apiFetch(
       apiUrl(
-        `/api/v1/partners/${encodeURIComponent(partnerId)}/channel-onboarding/${encodeURIComponent(sessionId)}`,
+        `/api/partners/${encodeURIComponent(partnerId)}/channel-onboarding/${encodeURIComponent(sessionId)}`,
       ),
       { cache: "no-store" },
     ),
@@ -399,7 +491,7 @@ export async function cancelChannelOnboarding(
   return json(
     await apiFetch(
       apiUrl(
-        `/api/v1/partners/${encodeURIComponent(partnerId)}/channel-onboarding/${encodeURIComponent(sessionId)}`,
+        `/api/partners/${encodeURIComponent(partnerId)}/channel-onboarding/${encodeURIComponent(sessionId)}`,
       ),
       { method: "DELETE" },
     ),
@@ -413,7 +505,7 @@ export async function applyChannelOnboarding(
   return json(
     await apiFetch(
       apiUrl(
-        `/api/v1/partners/${encodeURIComponent(partnerId)}/channel-onboarding/${encodeURIComponent(sessionId)}/apply`,
+        `/api/partners/${encodeURIComponent(partnerId)}/channel-onboarding/${encodeURIComponent(sessionId)}/apply`,
       ),
       { method: "POST" },
     ),
@@ -424,7 +516,7 @@ export async function getChannelSchemas(): Promise<ChannelsSchemaResponse> {
   // no-store: availability reflects live server imports (e.g. a dependency
   // installed minutes ago) — a cached copy here shows phantom-missing channels.
   return json(
-    await apiFetch(apiUrl("/api/v1/partners/channels/schema"), {
+    await apiFetch(apiUrl("/api/partners/channels/schema"), {
       cache: "no-store",
     }),
   );
@@ -433,17 +525,7 @@ export async function getChannelSchemas(): Promise<ChannelsSchemaResponse> {
 export async function getPartnerHistory(
   partnerId: string,
   options?: { sessionKey?: string; sessionId?: string; limit?: number },
-): Promise<
-  {
-    role: string;
-    content: string;
-    timestamp?: string;
-    channel?: string;
-    attachments?: Record<string, unknown>[];
-    /** Persisted turn trace (assistant rows only) for rehydrating activity. */
-    events?: Record<string, unknown>[];
-  }[]
-> {
+): Promise<PartnerHistoryMessage[]> {
   const params = new URLSearchParams();
   if (options?.sessionKey) params.set("session_key", options.sessionKey);
   if (options?.sessionId) params.set("session_id", options.sessionId);
@@ -451,9 +533,52 @@ export async function getPartnerHistory(
   const query = params.toString() ? `?${params.toString()}` : "";
   return json(
     await apiFetch(
+      apiUrl(`/api/partners/${encodeURIComponent(partnerId)}/history${query}`),
+    ),
+  );
+}
+
+export async function getPartnerHistoryPage(
+  partnerId: string,
+  sessionKey: string,
+  options?: { before?: number; limit?: number },
+): Promise<PartnerHistoryPage> {
+  const params = new URLSearchParams({ session_key: sessionKey });
+  if (options?.before !== undefined) params.set("before", String(options.before));
+  if (options?.limit !== undefined) params.set("limit", String(options.limit));
+  return json(
+    await apiFetch(
       apiUrl(
-        `/api/v1/partners/${encodeURIComponent(partnerId)}/history${query}`,
+        `/api/partners/${encodeURIComponent(partnerId)}/history/page?${params.toString()}`,
       ),
+      { cache: "no-store" },
+    ),
+  );
+}
+
+export async function getPartnerWebContinuity(
+  partnerId: string,
+): Promise<PartnerWebContinuity> {
+  return json(
+    await apiFetch(
+      apiUrl(`/api/partners/${encodeURIComponent(partnerId)}/web-continuity`),
+      { cache: "no-store" },
+    ),
+  );
+}
+
+export async function setPartnerWebContinuity(
+  partnerId: string,
+  state: PartnerWebContinuity,
+): Promise<PartnerWebContinuity> {
+  return json(
+    await apiFetch(
+      apiUrl(`/api/partners/${encodeURIComponent(partnerId)}/web-continuity`),
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(state),
+      },
     ),
   );
 }
@@ -463,7 +588,7 @@ export async function getPartnerSessions(
 ): Promise<PartnerSessionInfo[]> {
   return json(
     await apiFetch(
-      apiUrl(`/api/v1/partners/${encodeURIComponent(partnerId)}/sessions`),
+      apiUrl(`/api/partners/${encodeURIComponent(partnerId)}/sessions`),
       { cache: "no-store" },
     ),
   );
@@ -473,16 +598,18 @@ async function postSessionAction(
   partnerId: string,
   action: "archive" | "resume" | "delete",
   sessionKey: string,
-): Promise<void> {
-  await apiFetch(
-    apiUrl(
-      `/api/v1/partners/${encodeURIComponent(partnerId)}/sessions/${action}`,
+): Promise<{ active_session_key: string | null }> {
+  return json(
+    await apiFetch(
+      apiUrl(
+        `/api/partners/${encodeURIComponent(partnerId)}/sessions/${action}`,
+      ),
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_key: sessionKey }),
+      },
     ),
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ session_key: sessionKey }),
-    },
   );
 }
 
@@ -502,12 +629,10 @@ export async function branchPartnerSession(
   partnerId: string,
   sourceKey: string,
   newKey: string,
-): Promise<{ session: PartnerSessionInfo }> {
+): Promise<{ session: PartnerSessionInfo; active_session_key: string | null }> {
   return json(
     await apiFetch(
-      apiUrl(
-        `/api/v1/partners/${encodeURIComponent(partnerId)}/sessions/branch`,
-      ),
+      apiUrl(`/api/partners/${encodeURIComponent(partnerId)}/sessions/branch`),
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -519,7 +644,7 @@ export async function branchPartnerSession(
 
 // ── Channel account links ─────────────────────────────────────
 //
-// Connecting a chat account (QQ, Telegram, …) to your DeepTutor account, so
+// Connecting a chat account (QQ, Telegram, …) to your LearnLeader account, so
 // messages you send the partner there are yours: private history you can read
 // back here, answered out of your own library and memory.
 
@@ -542,7 +667,7 @@ export async function createPartnerLinkCode(
 ): Promise<PartnerLinkCode> {
   return json(
     await apiFetch(
-      apiUrl(`/api/v1/partners/${encodeURIComponent(partnerId)}/links/code`),
+      apiUrl(`/api/partners/${encodeURIComponent(partnerId)}/links/code`),
       { method: "POST" },
     ),
   );
@@ -553,7 +678,7 @@ export async function listPartnerLinks(
 ): Promise<PartnerLink[]> {
   const data = await json<{ links: PartnerLink[] }>(
     await apiFetch(
-      apiUrl(`/api/v1/partners/${encodeURIComponent(partnerId)}/links`),
+      apiUrl(`/api/partners/${encodeURIComponent(partnerId)}/links`),
     ),
   );
   return data.links ?? [];
@@ -566,7 +691,7 @@ export async function removePartnerLink(
   await json(
     await apiFetch(
       apiUrl(
-        `/api/v1/partners/${encodeURIComponent(partnerId)}/links/${encodeURIComponent(key)}`,
+        `/api/partners/${encodeURIComponent(partnerId)}/links/${encodeURIComponent(key)}`,
       ),
       { method: "DELETE" },
     ),
@@ -601,7 +726,7 @@ export async function startWeixinQr(
   return json(
     await apiFetch(
       apiUrl(
-        `/api/v1/partners/${encodeURIComponent(partnerId)}/channels/weixin/qr`,
+        `/api/partners/${encodeURIComponent(partnerId)}/channels/weixin/qr`,
       ),
       { method: "POST" },
     ),
@@ -615,9 +740,15 @@ export async function pollWeixinQr(
   return json(
     await apiFetch(
       apiUrl(
-        `/api/v1/partners/${encodeURIComponent(partnerId)}/channels/weixin/qr/${encodeURIComponent(sessionId)}`,
+        `/api/partners/${encodeURIComponent(partnerId)}/channels/weixin/qr/${encodeURIComponent(sessionId)}`,
       ),
       { cache: "no-store" },
     ),
   );
+}
+
+/** Resolve older saved consultations which did not yet carry native session IDs. */
+export async function getPartnerConsultationSession(chatSessionId: string, partnerName: string): Promise<{ partner_id: string; session_key: string } | null> {
+  const query = new URLSearchParams({ chat_session_id: chatSessionId, partner_name: partnerName });
+  return json(await apiFetch(apiUrl(`/api/partners/consultation-session?${query}`)));
 }

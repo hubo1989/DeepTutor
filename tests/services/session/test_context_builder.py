@@ -9,10 +9,14 @@ import pytest
 
 from deeptutor.services.session.ask_user_trace import extract_ask_user_clarifications
 from deeptutor.services.session.context_builder import (
+    MAX_HISTORY_PLAN_TOKENS,
+    MAX_RAW_REBUILD_TOKENS,
+    MAX_SUMMARY_OUTPUT_TOKENS,
     ContextBuilder,
     ContextBuildResult,
     build_history_text,
     count_tokens,
+    extract_ask_user_clarifications,
     format_messages_as_transcript,
     trim_incomplete_tail,
 )
@@ -151,7 +155,12 @@ class TestContextBuilderBudgets:
     def test_history_budget_uses_large_context_model_heuristic(self) -> None:
         builder = ContextBuilder(store=MagicMock(), history_budget_ratio=0.35)
         budget = builder._history_budget(self._make_llm_config(4096, model="gpt-4o-mini"))
-        assert budget == int(65536 * 0.35)
+        assert budget == int(128000 * 0.35)
+
+    def test_history_budget_has_absolute_cap(self) -> None:
+        builder = ContextBuilder(store=MagicMock(), history_budget_ratio=0.35)
+        budget = builder._history_budget(self._make_llm_config(4096, context_window=983_616))
+        assert budget == MAX_HISTORY_PLAN_TOKENS
 
     def test_history_budget_minimum(self) -> None:
         builder = ContextBuilder(store=MagicMock(), history_budget_ratio=0.01)
@@ -166,6 +175,20 @@ class TestContextBuilderBudgets:
         builder = ContextBuilder(store=MagicMock(), summary_target_ratio=0.01)
         assert builder._summary_budget(100) >= 96
 
+    def test_summary_budget_has_absolute_cap(self) -> None:
+        builder = ContextBuilder(store=MagicMock(), summary_target_ratio=0.40)
+        assert builder._summary_budget(MAX_HISTORY_PLAN_TOKENS) == (MAX_SUMMARY_OUTPUT_TOKENS)
+
+    def test_summary_budget_respects_configured_output_limit(self) -> None:
+        builder = ContextBuilder(store=MagicMock(), summary_target_ratio=0.40)
+        cfg = self._make_llm_config(4096, context_window=983_616)
+        assert builder._summary_budget(MAX_HISTORY_PLAN_TOKENS, cfg) == 4096
+
+    def test_summary_budget_can_follow_small_generation_limit(self) -> None:
+        builder = ContextBuilder(store=MagicMock(), summary_target_ratio=0.40)
+        cfg = self._make_llm_config(50, context_window=983_616)
+        assert builder._summary_budget(MAX_HISTORY_PLAN_TOKENS, cfg) == 50
+
     def test_recent_budget(self) -> None:
         builder = ContextBuilder(store=MagicMock(), summary_target_ratio=0.40)
         recent = builder._recent_budget(1000)
@@ -174,6 +197,20 @@ class TestContextBuilderBudgets:
     def test_recent_budget_minimum(self) -> None:
         builder = ContextBuilder(store=MagicMock(), summary_target_ratio=0.99)
         assert builder._recent_budget(200) >= 128
+
+    def test_recent_budget_preserves_headroom_when_summary_is_capped(self) -> None:
+        builder = ContextBuilder(store=MagicMock(), summary_target_ratio=0.40)
+        cfg = self._make_llm_config(4096, context_window=983_616)
+        recent_budget = builder._recent_budget(MAX_HISTORY_PLAN_TOKENS)
+        summary_budget = builder._summary_budget(MAX_HISTORY_PLAN_TOKENS, cfg)
+
+        assert recent_budget == int(MAX_HISTORY_PLAN_TOKENS * 0.60)
+        assert recent_budget + summary_budget < MAX_HISTORY_PLAN_TOKENS
+
+    def test_rebuild_source_budget_has_absolute_cap(self) -> None:
+        builder = ContextBuilder(store=MagicMock())
+        cfg = self._make_llm_config(4096, context_window=983_616)
+        assert builder._rebuild_source_budget(cfg) == MAX_RAW_REBUILD_TOKENS
 
 
 # ---------------------------------------------------------------------------
@@ -397,6 +434,50 @@ class TestContextBuilderBuild:
         assert result.events == []
         store.update_summary.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_large_context_build_uses_capped_plan_with_headroom(self) -> None:
+        store = AsyncMock()
+        store.get_session = AsyncMock(
+            return_value={
+                "id": "s1",
+                "compressed_summary": "",
+                "summary_up_to_msg_id": 0,
+            }
+        )
+        store.get_messages_for_context = AsyncMock(
+            return_value=[
+                {"id": 1, "role": "user", "content": "old turn"},
+                {"id": 2, "role": "assistant", "content": "recent turn"},
+            ]
+        )
+
+        builder = ContextBuilder(store=store)
+        builder._summarize = AsyncMock(return_value=("SUMMARY", []))
+        select_recent = MagicMock(wraps=builder._select_recent_messages)
+        builder._select_recent_messages = select_recent
+        cfg = MagicMock()
+        cfg.max_tokens = 4096
+        cfg.model = "qwen3.8-max"
+        cfg.context_window = 983_616
+
+        def _fake_count_tokens(text: str) -> int:
+            if text in {"old turn", "recent turn"}:
+                return 70_000
+            if "User: old turn" in text and "Assistant: recent turn" in text:
+                return 140_000
+            return 100
+
+        with patch(
+            "deeptutor.services.session.context_builder.count_tokens",
+            side_effect=_fake_count_tokens,
+        ):
+            result = await builder.build(session_id="s1", llm_config=cfg)
+
+        assert result.budget == MAX_HISTORY_PLAN_TOKENS
+        assert builder._summarize.call_args.kwargs["summary_budget"] == 4096
+        assert select_recent.call_args.args[1] == int(MAX_HISTORY_PLAN_TOKENS * 0.60)
+        store.update_summary.assert_awaited_once_with("s1", "SUMMARY", 1)
+
 
 # ---------------------------------------------------------------------------
 # trim_incomplete_tail
@@ -409,6 +490,77 @@ class TestTrimIncompleteTail:
 
     def test_single_line_kept(self) -> None:
         assert trim_incomplete_tail("only one line, keep it") == "only one line, keep it"
+
+
+# ---------------------------------------------------------------------------
+# ContextBuilder._summarize
+# ---------------------------------------------------------------------------
+
+
+class TestContextBuilderSummarize:
+    @pytest.mark.asyncio
+    async def test_target_stays_below_small_output_cap(self) -> None:
+        captured: dict[str, Any] = {}
+
+        async def _stream_llm(**kwargs: Any):
+            captured.update(kwargs)
+            yield "short summary"
+
+        agent = MagicMock()
+        agent.stream_llm = _stream_llm
+        builder = ContextBuilder(store=MagicMock())
+
+        with patch(
+            "deeptutor.services.session.context_builder._ContextSummaryAgent",
+            return_value=agent,
+        ):
+            summary, _events = await builder._summarize(
+                session_id="s1",
+                language="en",
+                source_text="User: hello",
+                summary_budget=50,
+            )
+
+        assert summary == "short summary"
+        assert captured["max_tokens"] == 50
+        assert "under 40 tokens" in captured["user_prompt"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("language", "expected"),
+        [
+            ("ja", "Write the summary itself in 日本語."),
+            ("zh", "摘要正文本身请使用中文（简体）撰写。"),
+        ],
+    )
+    async def test_summary_instruction_names_the_session_language(
+        self, language: str, expected: str
+    ) -> None:
+        captured: dict[str, Any] = {}
+
+        async def _stream_llm(**kwargs: Any):
+            captured.update(kwargs)
+            yield "short summary"
+
+        agent = MagicMock()
+        agent.stream_llm = _stream_llm
+        builder = ContextBuilder(store=MagicMock())
+
+        with patch(
+            "deeptutor.services.session.context_builder._ContextSummaryAgent",
+            return_value=agent,
+        ):
+            await builder._summarize(
+                session_id="s1",
+                language=language,
+                source_text="User: hello",
+                summary_budget=50,
+            )
+
+        # The summary is replayed as a system row on every later turn, so an
+        # instruction that never says which language to write in drags the
+        # answer back to the prompt's own language (#1511).
+        assert expected in captured["system_prompt"]
 
 
 # ---------------------------------------------------------------------------

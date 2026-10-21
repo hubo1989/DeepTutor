@@ -31,6 +31,7 @@ import os
 import re
 from typing import Any
 
+from deeptutor.multi_user.models import AccountPreset, Role
 from deeptutor.services.config import load_auth_settings, load_integrations_settings
 
 logger = logging.getLogger(__name__)
@@ -76,6 +77,8 @@ class TokenPayload:
     username: str
     role: str
     user_id: str = ""
+    device_credential_id: str = ""
+    device_session_nonce: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -123,7 +126,12 @@ def verify_password(plain: str, hashed: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _make_user_record(hashed: str, role: str = "user", created_at: str = "") -> dict[str, Any]:
+def _make_user_record(
+    hashed: str,
+    role: str = "user",
+    created_at: str = "",
+    preset: str = "standard",
+) -> dict[str, Any]:
     """Build a canonical user record dict for legacy callers/tests."""
     from deeptutor.multi_user.identity import new_user_id
 
@@ -135,6 +143,7 @@ def _make_user_record(hashed: str, role: str = "user", created_at: str = "") -> 
         "disabled": False,
         "avatar": "",
         "email_verified": True,
+                "preset": preset,
     }
 
 
@@ -192,7 +201,14 @@ def _ensure_configured_admin_persisted() -> None:
     )
 
 
-def add_user(username: str, plain_password: str, role: str = "user") -> None:
+
+
+def add_user(
+    username: str,
+    plain_password: str,
+    role: Role = "user",
+    preset: AccountPreset = "standard",
+) -> None:
     """
     Add or update a user in data/user/auth_users.json.
 
@@ -204,9 +220,19 @@ def add_user(username: str, plain_password: str, role: str = "user") -> None:
     from deeptutor.multi_user.identity import save_user
 
     _ensure_configured_admin_persisted()
-    record = save_user(username, hash_password(plain_password), role=role)  # type: ignore[arg-type]
+    record = save_user(
+        username,
+        hash_password(plain_password),
+        role=role,
+        preset=preset,
+    )
     _initialize_user_grant(record)
-    logger.info("User '%s' saved with role=%r", username, record.get("role", "user"))
+    logger.info(
+        "User '%s' saved with role=%r preset=%r",
+        username,
+        record.get("role", "user"),
+        record.get("preset", "standard"),
+    )
 
 
 def add_verified_user(
@@ -291,10 +317,12 @@ def set_role(username: str, role: str) -> bool:
     """
     Change the role for an existing user. Returns True on success.
 
-    Valid roles: 'admin', 'user'.
+    Valid roles are the entries of ``VALID_ROLES``.
     """
-    if role not in ("admin", "user"):
-        raise ValueError(f"Invalid role: {role!r}. Must be 'admin' or 'user'.")
+    from deeptutor.multi_user.models import VALID_ROLES
+
+    if role not in VALID_ROLES:
+        raise ValueError(f"Invalid role: {role!r}. Must be one of {sorted(VALID_ROLES)}.")
 
     from deeptutor.multi_user.identity import set_role as _set_role
 
@@ -327,12 +355,32 @@ def get_user_info(username: str) -> dict | None:
     return None
 
 
+def get_learner_profile(username: str) -> dict[str, Any] | None:
+    """Return the structured learner profile for an existing account."""
+    from deeptutor.multi_user.identity import get_learner_profile as _get_profile
+
+    return _get_profile(username)
+
+
+def set_learner_profile(username: str, profile: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Replace the structured learner profile for an existing account."""
+    from deeptutor.multi_user.identity import set_learner_profile as _set_profile
+
+    return _set_profile(username, profile)
+
+
 # ---------------------------------------------------------------------------
 # JWT
 # ---------------------------------------------------------------------------
 
 
-def create_token(username: str, role: str = "user", user_id: str | None = None) -> str:
+def create_token(
+    username: str,
+    role: str = "user",
+    user_id: str | None = None,
+    device_credential_id: str = "",
+    device_session_nonce: str = "",
+) -> str:
     """Create a signed JWT for the given username and role."""
     from jose import jwt
 
@@ -345,6 +393,8 @@ def create_token(username: str, role: str = "user", user_id: str | None = None) 
         "role": role,
         "uid": user_id,
         "ver": max(0, int(record.get("auth_version") or 0)),
+                "dcid": device_credential_id,
+        "dcs": device_session_nonce,
         "exp": datetime.now(timezone.utc) + timedelta(hours=TOKEN_EXPIRE_HOURS),
         "iat": datetime.now(timezone.utc),
     }
@@ -404,7 +454,24 @@ def decode_token(token: str) -> TokenPayload | None:
             return None
         role = str(record.get("role") or payload.get("role", "user"))
         user_id = str(record.get("id") or payload.get("uid") or "")
-        return TokenPayload(username=canonical_username, role=role, user_id=user_id)
+        device_credential_id = str(payload.get("dcid") or "")
+        device_session_nonce = str(payload.get("dcs") or "")
+        if device_credential_id:
+            from deeptutor.multi_user.device_credentials import validate_device_token
+
+            if not validate_device_token(
+                user_id,
+                device_credential_id,
+                device_session_nonce,
+            ):
+                return None
+        return TokenPayload(
+            username=canonical_username,
+            role=role,
+            user_id=user_id,
+            device_credential_id=device_credential_id,
+            device_session_nonce=device_session_nonce,
+        )
     except JWTError:
         return None
 
@@ -512,4 +579,24 @@ def authenticate(username: str, password: str) -> TokenPayload | None:
 
     role = record.get("role", "user") if isinstance(record, dict) else "user"
     user_id = str(record.get("id") or "") if isinstance(record, dict) else ""
-    return TokenPayload(username=lookup_username, role=role, user_id=user_id)
+    return TokenPayload(username=username, role=role, user_id=user_id)
+
+
+def authenticate_device(pairing_code: str, pin: str) -> TokenPayload | None:
+    """Exchange a learner device credential for the account's normal JWT identity."""
+
+    if not AUTH_ENABLED or POCKETBASE_ENABLED:
+        return None
+    from deeptutor.multi_user.device_credentials import begin_device_session
+
+    session = begin_device_session(pairing_code, pin)
+    if session is None:
+        return None
+    _view, username, role, user_id, session_nonce = session
+    return TokenPayload(
+        username=username,
+        role=role,
+        user_id=user_id,
+        device_credential_id=str(_view["id"]),
+        device_session_nonce=session_nonce,
+    )

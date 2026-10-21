@@ -243,6 +243,7 @@ def _rag_check(
     )
     from deeptutor.services.rag.factory import (
         LIGHTRAG_SERVER_PROVIDER,
+        WEKNORA_PROVIDER,
         normalize_provider_name,
     )
 
@@ -253,22 +254,36 @@ def _rag_check(
             continue
         provider = normalize_provider_name(str(entry.get("rag_provider") or default_provider))
         providers.add(provider)
+        if provider == WEKNORA_PROVIDER:
+            from deeptutor.services.rag.pipelines.weknora.config import (
+                config_from_entry as weknora_config_from_entry,
+            )
+
+            try:
+                weknora_config = weknora_config_from_entry(entry)
+                endpoint_ok, _ = _safe_endpoint(weknora_config.base_url)
+                if not endpoint_ok:
+                    failures.append(f"{kb_name}: invalid WeKnora server URL")
+            except Exception as exc:
+                failures.append(f"{kb_name}: {_redact_error(exc, None)}")
+            continue
+
         if provider != LIGHTRAG_SERVER_PROVIDER:
             continue
 
         from deeptutor.services.rag.pipelines.lightrag_server.config import (
-            config_from_entry,
+            config_from_entry as lightrag_server_config_from_entry,
         )
 
         try:
-            server_config = config_from_entry(entry)
+            server_config = lightrag_server_config_from_entry(entry)
             endpoint_ok, _ = _safe_endpoint(server_config.base_url)
             if not endpoint_ok:
                 failures.append(f"{kb_name}: invalid LightRAG server URL")
         except Exception as exc:
             failures.append(f"{kb_name}: {_redact_error(exc, None)}")
 
-    for provider in sorted(providers - {LIGHTRAG_SERVER_PROVIDER}):
+    for provider in sorted(providers - {LIGHTRAG_SERVER_PROVIDER, WEKNORA_PROVIDER}):
         try:
             report = preflight(provider)
             for check in report.get("checks", []):
@@ -321,22 +336,29 @@ def _redact_error(exc: Exception, config: Any) -> str:
 
 
 async def _probe_provider(config: Any) -> None:
-    from deeptutor.services.llm import complete
+    from deeptutor.services.config.loader import get_agent_params
+    from deeptutor.services.llm.factory import complete_with_config
 
-    response = await complete(
-        model=str(config.model),
+    # Share the Settings probe's configurable budget. A 64-token cap can be
+    # exhausted by hidden reasoning before a healthy model emits even "OK".
+    # Doctor must also work before agents.yaml has been created.
+    try:
+        probe_params = get_agent_params("llm_probe")
+    except FileNotFoundError:
+        probe_params = {}
+    try:
+        max_tokens = max(1, int(probe_params.get("max_tokens", 4096)))
+    except (TypeError, ValueError):
+        max_tokens = 4096
+
+    response = await complete_with_config(
+        config,
         prompt="Reply with OK.",
         system_prompt="Reply with only OK.",
-        binding=str(config.binding),
-        api_key=str(config.api_key or ""),
-        base_url=str(config.effective_url or config.base_url or ""),
-        api_version=config.api_version,
         temperature=0,
-        extra_headers=config.extra_headers,
-        reasoning_effort=config.reasoning_effort,
         max_retries=0,
         allow_image_fallback=False,
-        max_tokens=64,
+        max_tokens=max_tokens,
     )
     if not (response or "").strip():
         raise RuntimeError("The model returned an empty response.")
@@ -354,8 +376,13 @@ async def run_diagnostics(
     """Run setup diagnostics without network access unless ``online`` is set."""
     if resolve_llm is None:
         from deeptutor.services.config import resolve_llm_runtime_config
+        from deeptutor.services.model_selection.runtime import llm_config_from_resolved
 
-        resolve_llm = resolve_llm_runtime_config
+        # The probe hands this config to ``complete_with_config``, which needs
+        # an LLMConfig, not the provider-runtime ResolvedLLMConfig.
+        def resolve_llm() -> Any:
+            return llm_config_from_resolved(resolve_llm_runtime_config())
+
     if data_root is None:
         from deeptutor.services.path_service import get_path_service
 
@@ -447,4 +474,103 @@ async def run_diagnostics(
     return DoctorReport(online=online, checks=checks)
 
 
-__all__ = ["DoctorCheck", "DoctorReport", "run_diagnostics"]
+async def run_runtime_diagnostics() -> DoctorReport:
+    """Preflight v2 storage, migrations, and coordination without an LLM call."""
+
+    checks: list[DoctorCheck] = []
+    try:
+        from deeptutor.runtime.coordination import (
+            CoordinationSettings,
+            create_runtime_coordinator,
+        )
+        from deeptutor.services.config import (
+            load_integrations_settings,
+            load_system_settings,
+        )
+
+        coordination_settings = CoordinationSettings.from_runtime_settings(
+            load_system_settings(), load_integrations_settings()
+        )
+        coordinator = await create_runtime_coordinator(coordination_settings)
+        healthy = await coordinator.health()
+        await coordinator.close()
+        checks.append(
+            DoctorCheck(
+                key="turn_coordination",
+                label="Turn coordination",
+                status="pass" if healthy else "fail",
+                detail=(
+                    f"{coordination_settings.backend} coordination is ready for "
+                    f"{coordination_settings.backend_workers} worker(s)."
+                    if healthy
+                    else "The configured coordination backend is unavailable."
+                ),
+            )
+        )
+    except Exception as exc:
+        checks.append(
+            DoctorCheck(
+                key="turn_coordination",
+                label="Turn coordination",
+                status="fail",
+                detail=_redact_error(exc, None),
+            )
+        )
+
+    try:
+        from deeptutor.services.session import get_session_store
+
+        store = get_session_store()
+        await store.list_nonterminal_turns()
+        checks.append(
+            DoctorCheck(
+                key="turn_repository",
+                label="Turn repository",
+                status="pass",
+                detail=f"{type(store).__name__} schema and active-turn query are ready.",
+            )
+        )
+    except Exception as exc:
+        checks.append(
+            DoctorCheck(
+                key="turn_repository",
+                label="Turn repository",
+                status="fail",
+                detail=_redact_error(exc, None),
+            )
+        )
+
+    try:
+        from deeptutor.services.session.legacy_migration import (
+            migrate_all_legacy_chat_scopes,
+        )
+
+        reports = await migrate_all_legacy_chat_scopes(dry_run=True)
+        pending_sessions = sum(int(report.get("imported") or 0) for report in reports)
+        checks.append(
+            DoctorCheck(
+                key="legacy_chat_migration",
+                label="Legacy chat migration",
+                status="pass",
+                detail=f"Preflight succeeded; {pending_sessions} session(s) pending migration.",
+            )
+        )
+    except Exception as exc:
+        checks.append(
+            DoctorCheck(
+                key="legacy_chat_migration",
+                label="Legacy chat migration",
+                status="fail",
+                detail=_redact_error(exc, None),
+            )
+        )
+
+    return DoctorReport(online=False, checks=checks)
+
+
+__all__ = [
+    "DoctorCheck",
+    "DoctorReport",
+    "run_diagnostics",
+    "run_runtime_diagnostics",
+]
