@@ -416,6 +416,62 @@ class CommercialControlPlane:
         )
         return await self.repository.reserve_usage(candidate, quota_policy.limit)
 
+    async def usage_summary(self, customer_id: str) -> dict[str, dict[str, Any]]:
+        """Read-only per-meter usage inside each quota's current window.
+
+        Mirrors the enforcement accounting (``InMemoryCommercialRepository.
+        reserve_usage``): finalized usage events plus still-held reservations
+        share one period, so a finalized reservation is never double-counted.
+        """
+        clean_customer_id = _required(customer_id, "customer_id")
+        resolved = await self.resolve_entitlements(clean_customer_id)
+        if resolved.subscription_id is None:
+            return {}
+        subscription = await self._require_subscription(resolved.subscription_id)
+        now = self._now()
+        events = await self.repository.list_usage_events(clean_customer_id)
+        reservations = await self.repository.list_usage_reservations(clean_customer_id)
+
+        summary: dict[str, dict[str, Any]] = {}
+        for key in resolved.values:
+            if not isinstance(key, str) or not key.startswith("quota."):
+                continue
+            meter = key[len("quota.") :]
+            try:
+                policy = resolved.quota(meter)
+            except (KeyError, ValueError):
+                continue
+            period_start, period_end = _quota_period(
+                policy.window,
+                now,
+                subscription.current_period_start,
+                resolved.valid_until or subscription.current_period_end,
+            )
+
+            def _in_period(item: Any, *, _meter: str = meter) -> bool:
+                return (
+                    item.subscription_id == resolved.subscription_id
+                    and item.meter == _meter
+                    and item.period_start == period_start
+                    and item.period_end == period_end
+                )
+
+            used = sum(event.quantity for event in events if _in_period(event))
+            held = sum(
+                item.quantity
+                for item in reservations
+                if item.state is UsageReservationState.RESERVED and _in_period(item)
+            )
+            summary[meter] = {
+                "limit": policy.limit,
+                "window": policy.window.value,
+                "used": used,
+                "reserved": held,
+                "period_start": period_start,
+                "period_end": period_end,
+            }
+        return summary
+
     async def finalize_usage(
         self,
         reservation_id: str,

@@ -3,6 +3,7 @@ import type { Capability } from "@/lib/capability-routes";
 import {
   COMMERCIAL_STATUSES,
   type CommercialAccessSnapshot,
+  type CommercialMeterUsage,
   type CommercialStatus,
 } from "./types";
 
@@ -23,6 +24,36 @@ function isCommercialStatus(value: unknown): value is CommercialStatus {
     (typeof value === "string" &&
       (COMMERCIAL_STATUSES as readonly string[]).includes(value))
   );
+}
+
+function parseMeterUsage(value: unknown): CommercialMeterUsage | null {
+  if (!isPlainRecord(value)) return null;
+  const { limit, window, used, reserved } = value;
+  if (
+    limit !== null &&
+    (typeof limit !== "number" || !Number.isFinite(limit))
+  ) {
+    return null;
+  }
+  if (window !== "utc_day" && window !== "subscription") return null;
+  if (typeof used !== "number" || !Number.isFinite(used)) return null;
+  if (typeof reserved !== "number" || !Number.isFinite(reserved)) return null;
+  return { limit, window, used, reserved };
+}
+
+/**
+ * Usage is display-only, so a malformed or missing ``usage`` block degrades to
+ * an empty map instead of invalidating the whole snapshot. The backend remains
+ * the enforcement boundary.
+ */
+function parseUsage(value: unknown): Record<string, CommercialMeterUsage> {
+  if (!isPlainRecord(value)) return {};
+  const parsed: Record<string, CommercialMeterUsage> = {};
+  for (const [meter, entry] of Object.entries(value)) {
+    const usage = parseMeterUsage(entry);
+    if (usage) parsed[meter] = usage;
+  }
+  return parsed;
 }
 
 /**
@@ -59,6 +90,7 @@ export function parseCommercialAccessSnapshot(
     validUntil: value.valid_until,
     planVersionId: value.plan_version_id,
     values: value.values,
+    usage: parseUsage(value.usage),
   };
 }
 

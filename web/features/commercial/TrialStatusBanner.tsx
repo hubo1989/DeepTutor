@@ -6,6 +6,23 @@ import { useTranslation } from "react-i18next";
 
 import { trialCountdown, type TrialCountdown } from "./access";
 import { useCommercialAccess } from "./CommercialAccessContext";
+import type { CommercialMeterUsage } from "./types";
+
+const numberFormat = new Intl.NumberFormat();
+
+function usageLabel(
+  usage: CommercialMeterUsage,
+  t: (key: string, options?: Record<string, unknown>) => string,
+): string {
+  const used = numberFormat.format(usage.used + usage.reserved);
+  if (usage.limit === null) {
+    return t("commercial.trial.usageUnlimited", { used });
+  }
+  const limit = numberFormat.format(usage.limit);
+  return usage.window === "utc_day"
+    ? t("commercial.trial.usageToday", { used, limit })
+    : t("commercial.trial.usageTotal", { used, limit });
+}
 
 function countdownLabel(
   countdown: TrialCountdown | null,
@@ -49,6 +66,7 @@ export function TrialStatusBanner() {
   }
 
   const label = countdownLabel(trialCountdown(snapshot.validUntil), t);
+  const llmUsage = snapshot.usage?.llm_tokens;
   return (
     <div
       role="status"
@@ -58,6 +76,12 @@ export function TrialStatusBanner() {
       <span className="font-medium">{t("commercial.trial.label")}</span>
       <span aria-hidden="true">·</span>
       <span>{label}</span>
+      {llmUsage ? (
+        <>
+          <span aria-hidden="true">·</span>
+          <span>{usageLabel(llmUsage, t)}</span>
+        </>
+      ) : null}
     </div>
   );
 }

@@ -37,7 +37,8 @@ test("admin user creation sends the selected preset", () => {
 
 test("grant editing exposes the server-enforced learning policy controls", () => {
   assert.match(grantEditor, /learning_policy: conservativeLearningPolicy\(\)/);
-  assert.match(grantEditor, /allowed_surfaces: \["chat", "reading"\]/);
+  // Quote-style agnostic: formatters may rewrite literals to single quotes.
+  assert.match(grantEditor, /allowed_surfaces: \[["']chat["'], ["']reading["']\]/);
   assert.match(grantEditor, /toggleReadingMaterial/);
   assert.match(grantEditor, /toggleReadingExtension/);
   assert.match(

@@ -22,6 +22,7 @@ function snapshot(
     validUntil: "2026-08-06T10:30:00.000Z",
     planVersionId: "trial_v1",
     values: {},
+    usage: {},
     ...overrides,
   };
 }
@@ -43,8 +44,50 @@ test("commercial API parser accepts the stable public schema", () => {
       validUntil: "2026-08-12T08:00:00+00:00",
       planVersionId: "trial_v1",
       values: { "quota.llm_tokens": { limit: 100_000 } },
+      usage: {},
     },
   );
+});
+
+test("commercial API parser reads per-meter usage and tolerates bad entries", () => {
+  const parsed = parseCommercialAccessSnapshot({
+    enabled: true,
+    is_admin: false,
+    status: "trialing",
+    valid_until: "2026-08-12T08:00:00+00:00",
+    plan_version_id: "trial_v1",
+    values: {},
+    usage: {
+      llm_tokens: { limit: 100_000, window: "utc_day", used: 12, reserved: 3 },
+      embedding_tokens: {
+        limit: null,
+        window: "subscription",
+        used: 0,
+        reserved: 0,
+      },
+      broken: { limit: "many", window: "utc_day", used: 1, reserved: 0 },
+    },
+  });
+  assert.ok(parsed);
+  // Invalid entries degrade to omission; valid ones survive.
+  assert.deepEqual(Object.keys(parsed.usage).sort(), [
+    "embedding_tokens",
+    "llm_tokens",
+  ]);
+  assert.equal(parsed.usage.llm_tokens.used + parsed.usage.llm_tokens.reserved, 15);
+  assert.equal(parsed.usage.embedding_tokens.limit, null);
+
+  // A missing or non-object usage block never invalidates the snapshot.
+  const legacy = parseCommercialAccessSnapshot({
+    enabled: true,
+    is_admin: false,
+    status: "trialing",
+    valid_until: null,
+    plan_version_id: null,
+    values: {},
+  });
+  assert.ok(legacy);
+  assert.deepEqual(legacy.usage, {});
 });
 
 test("commercial API parser fails open on malformed or unknown data", () => {

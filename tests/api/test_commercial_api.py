@@ -114,4 +114,68 @@ def test_commercial_me_admin_bypass(tmp_path, monkeypatch) -> None:
         "valid_until": None,
         "plan_version_id": None,
         "values": {},
+        "usage": {},
+    }
+
+
+def test_commercial_me_includes_meter_usage(tmp_path, monkeypatch) -> None:
+    now = datetime.now(timezone.utc)
+    user = CurrentUser(
+        id="u_me",
+        username="me@example.com",
+        role="user",
+        scope=UserScope(kind="user", user_id="u_me", root=tmp_path),
+    )
+    resolved = ResolvedEntitlements(
+        customer_id="cus_secret",
+        subscription_id="sub_secret",
+        plan_version_id="plan_trial_v1",
+        status=SubscriptionStatus.TRIALING,
+        active=True,
+        resolved_at=now,
+        valid_until=now + timedelta(days=7),
+        values={"quota.llm_tokens": {"limit": 100_000, "window": "utc_day"}},
+    )
+
+    class ControlPlane:
+        async def usage_summary(self, customer_id: str):
+            assert customer_id == "cus_secret"
+            return {
+                "llm_tokens": {
+                    "limit": 100_000,
+                    "window": "utc_day",
+                    "used": 12,
+                    "reserved": 3,
+                }
+            }
+
+    class Runtime:
+        settings = CommercialSettings(
+            enabled=True,
+            database_url="postgresql://unused/test",
+            trial_model_binding=None,
+        )
+        control_plane = ControlPlane()
+
+    monkeypatch.setattr("deeptutor.commercial.api.get_commercial_runtime", lambda: Runtime())
+    app = FastAPI()
+    app.include_router(router, prefix="/api/v1")
+
+    async def install_access():
+        set_current_user(user)
+        from deeptutor.commercial.access import set_commercial_access
+
+        set_commercial_access(CommercialAccess(user.id, resolved))
+        return TokenPayload(username=user.username, role="user", user_id=user.id)
+
+    app.dependency_overrides[require_commercial_access] = install_access
+    response = TestClient(app).get("/api/v1/commercial/me")
+    assert response.status_code == 200
+    assert response.json()["usage"] == {
+        "llm_tokens": {
+            "limit": 100_000,
+            "window": "utc_day",
+            "used": 12,
+            "reserved": 3,
+        }
     }

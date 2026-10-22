@@ -18,6 +18,15 @@ from .runtime import get_commercial_runtime
 router = APIRouter()
 
 
+class CommercialMeterUsage(BaseModel):
+    """One quota meter's consumption inside its current window."""
+
+    limit: int | None
+    window: str
+    used: int
+    reserved: int
+
+
 class CommercialMeResponse(BaseModel):
     """Stable, sanitized read model consumed by the subscription UI."""
 
@@ -38,6 +47,7 @@ class CommercialMeResponse(BaseModel):
     valid_until: datetime | None
     plan_version_id: str | None
     values: dict[str, Any] = Field(default_factory=dict)
+    usage: dict[str, CommercialMeterUsage] = Field(default_factory=dict)
 
 
 @router.get("/commercial/me", response_model=CommercialMeResponse)
@@ -75,6 +85,11 @@ async def get_my_commercial_access(
             detail="Subscription state is temporarily unavailable.",
         )
     resolved = access.resolved
+    usage: dict[str, Any] = {}
+    if resolved.subscription_id is not None:
+        control_plane = getattr(runtime, "control_plane", None)
+        if control_plane is not None:
+            usage = await control_plane.usage_summary(resolved.customer_id)
     return {
         "enabled": True,
         "is_admin": False,
@@ -82,6 +97,7 @@ async def get_my_commercial_access(
         "valid_until": resolved.valid_until,
         "plan_version_id": resolved.plan_version_id,
         "values": thaw_json(resolved.values),
+        "usage": usage,
     }
 
 
