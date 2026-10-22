@@ -5533,5 +5533,15 @@
   "Verify and create account": "验证并创建账户",
   "auth.brandTagline": "LearnLeader · 智能体原生学习",
   "commercial.registration.trialLimits": "包含核心学习功能；最多 2 个知识库、同时运行 1 项学习任务、单文件 25 MiB。代码沙箱和高成本视频渲染不在试用范围内。",
-  "commercial.registration.trialSummary": "{{days}} 天免费试用 · 无需绑卡 · 到期不扣费"
+  "commercial.registration.trialSummary": "{{days}} 天免费试用 · 无需绑卡 · 到期不扣费",
+  "Usage quota": "用量额度",
+  "Per-user limits applied on top of the assigned access. 0 means unlimited.": "在已分配权限之上按用户限制用量。0 表示不限制。",
+  "Reset to deployment default": "恢复部署默认值",
+  "LLM tokens": "LLM tokens",
+  "Embedding tokens": "向量 tokens",
+  "Document parsing pages": "文档解析页数",
+  "Daily limit": "每日限额",
+  "Monthly limit": "每月限额",
+  "Per-file limit": "单文件限额",
+  "Failed to load default quota": "加载默认额度失败"
 }

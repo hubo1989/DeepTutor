@@ -5533,5 +5533,15 @@
   "Verify and create account": "Verify and create account",
   "auth.brandTagline": "LearnLeader · Agent-Native Learning",
   "commercial.registration.trialLimits": "Includes core learning features, up to 2 knowledge bases, 1 active learning task, and 25 MiB per file. Code sandboxing and high-cost video rendering are not included.",
-  "commercial.registration.trialSummary": "{{days}}-day free trial · no card · no automatic charge"
+  "commercial.registration.trialSummary": "{{days}}-day free trial · no card · no automatic charge",
+  "Usage quota": "Nutzungskontingent",
+  "Per-user limits applied on top of the assigned access. 0 means unlimited.": "Benutzerspezifische Limits zusätzlich zum zugewiesenen Zugriff. 0 bedeutet unbegrenzt.",
+  "Reset to deployment default": "Auf Bereitstellungsstandard zurücksetzen",
+  "LLM tokens": "LLM-Tokens",
+  "Embedding tokens": "Embedding-Tokens",
+  "Document parsing pages": "Dokumentenparser-Seiten",
+  "Daily limit": "Tageslimit",
+  "Monthly limit": "Monatslimit",
+  "Per-file limit": "Limit pro Datei",
+  "Failed to load default quota": "Standardkontingent konnte nicht geladen werden"
 }

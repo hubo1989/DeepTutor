@@ -5549,5 +5549,15 @@
   "Verify and create account": "Verify and create account",
   "auth.brandTagline": "LearnLeader · Agent-Native Learning",
   "commercial.registration.trialLimits": "Includes core learning features, up to 2 knowledge bases, 1 active learning task, and 25 MiB per file. Code sandboxing and high-cost video rendering are not included.",
-  "commercial.registration.trialSummary": "{{days}}-day free trial · no card · no automatic charge"
+  "commercial.registration.trialSummary": "{{days}}-day free trial · no card · no automatic charge",
+  "Usage quota": "Квота використання",
+  "Per-user limits applied on top of the assigned access. 0 means unlimited.": "Ліміти на користувача поверх наданого доступу. 0 — без обмежень.",
+  "Reset to deployment default": "Відновити стандартні значення",
+  "LLM tokens": "Токени LLM",
+  "Embedding tokens": "Токени ембедингу",
+  "Document parsing pages": "Сторінки розбору документів",
+  "Daily limit": "Денний ліміт",
+  "Monthly limit": "Місячний ліміт",
+  "Per-file limit": "Ліміт на файл",
+  "Failed to load default quota": "Не вдалося завантажити стандартну квоту"
 }
