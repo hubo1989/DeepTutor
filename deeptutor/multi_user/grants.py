@@ -246,9 +246,20 @@ def learner_grant(user_id: str) -> dict[str, Any]:
 
 
 def load_grant(user_id: str) -> dict[str, Any]:
+    def _projected(grant: dict[str, Any]) -> dict[str, Any]:
+        # Lazy import: commercial.entitlement_context imports multi_user.context,
+        # so the module-level cycle is only avoided by deferring this one call.
+        # The projection overlays the active plan (or fails closed when the
+        # commercial snapshot is missing) without persisting billing state.
+        from deeptutor.commercial.entitlement_context import (
+            project_grant_for_commercial,
+        )
+
+        return project_grant_for_commercial(user_id, grant)
+
     path = grant_path(user_id)
     if not path.exists():
-        return empty_grant(user_id)
+        return _projected(empty_grant(user_id))
     try:
         stored = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
@@ -283,7 +294,7 @@ def load_grant(user_id: str) -> dict[str, Any]:
         validate_grant(grant)
     except ValueError as exc:
         raise GrantStorageError(f"Grant for user {user_id} is invalid") from exc
-    return grant
+    return _projected(grant)
 
 
 def _validated_grant(user_id: str, payload: dict[str, Any]) -> dict[str, Any]:
