@@ -78,8 +78,11 @@ export function AppShellProvider({ children }: { children: React.ReactNode }) {
   const [theme, setThemeState] = useState<Theme>(() => {
     return getStoredTheme() ?? getSystemTheme();
   });
-  // Always start with "en" to match SSR; hydrate from localStorage after mount
-  const [language, setLanguageState] = useState<AppLanguage>("en");
+  // The interface defaults to Chinese for first-time visitors; the I18nProvider
+  // renders a blank shell until languageReady, so SSR never observes this
+  // value and no hydration mismatch is possible. Explicit choices (localStorage
+  // or the account's saved UI settings) still win after mount.
+  const [language, setLanguageState] = useState<AppLanguage>("zh");
   const [languageReady, setLanguageReady] = useState(false);
   const [activeSessionId, setActiveSessionIdState] = useState<string | null>(
     () => readStoredActiveSessionId(),
