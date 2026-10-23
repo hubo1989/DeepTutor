@@ -285,4 +285,5 @@ def test_commercial_me_is_served_under_api_v1_on_real_app(monkeypatch) -> None:
         "valid_until": None,
         "plan_version_id": None,
         "values": {},
+        "usage": {},
     }
