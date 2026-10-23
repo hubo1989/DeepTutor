@@ -226,7 +226,6 @@ def add_user(
         role=role,
         preset=preset,
     )
-    _initialize_user_grant(record)
     logger.info(
         "User '%s' saved with role=%r preset=%r",
         username,
@@ -253,30 +252,12 @@ def add_verified_user(
         bootstrap_admin_username=bootstrap_admin_email(),
     )
     if created:
-        _initialize_user_grant(record)
+        # No create-time grant snapshot: grants are created on the first admin
+        # save, and ``grants.load_grant`` falls back to ``empty_grant`` (which
+        # resolves the deployment's default quotas) until then. This matches
+        # upstream, whose grants module has no initializer.
         logger.info("Verified user '%s' created with role=%r", username, record.get("role", "user"))
     return created, record
-
-
-def _initialize_user_grant(record: dict[str, Any]) -> None:
-    """Persist a create-time quota snapshot for a newly created regular user."""
-    if str(record.get("role") or "user") == "admin":
-        return
-    user_id = str(record.get("id") or "")
-    if not user_id:
-        logger.error("Cannot initialize grant: newly created user has no id")
-        return
-
-    try:
-        from deeptutor.multi_user.grants import initialize_grant
-        from deeptutor.multi_user.token_quota import default_quota
-
-        initialize_grant(user_id, quota=default_quota())
-    except Exception:
-        # The account store is already committed at this point. Keep account
-        # creation usable, but make the repairable grant failure explicit; the
-        # admin grant endpoint can create the missing file on the next save.
-        logger.exception("Failed to initialize grant for newly created user %s", user_id)
 
 
 def list_users() -> list[dict]:

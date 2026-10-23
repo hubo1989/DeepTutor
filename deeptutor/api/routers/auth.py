@@ -790,6 +790,21 @@ async def require_auth(
 
     _install_current_user(payload)
     _install_request_workspace(request)
+    # Install the commercial snapshot for every authenticated HTTP request,
+    # mirroring ws_revalidate_identity on the WebSocket side. Without it,
+    # load_grant's projection fails closed (commercial enabled, no snapshot)
+    # and grant-backed surfaces — model options, capability gates, turns —
+    # see a deny-all grant even for an active trial.
+    try:
+        from deeptutor.commercial.entitlement_context import (
+            install_commercial_access_for_current_user,
+        )
+
+        await install_commercial_access_for_current_user()
+    except Exception:
+        # Leave the snapshot unset: the fail-closed projection denies costly
+        # work, and the error surfaces in logs rather than 500ing every route.
+        logger.exception("Commercial access install failed in require_auth")
     return payload
 
 

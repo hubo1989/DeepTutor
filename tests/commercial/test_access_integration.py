@@ -541,3 +541,58 @@ async def test_consuming_guards_use_stable_denial_codes_and_limits(tmp_path, mon
     finally:
         reset_commercial_access(access_token)
         reset_current_user(user_token)
+
+
+@pytest.mark.asyncio
+async def test_load_grant_projects_the_active_trial_onto_users_without_a_grant_file(
+    tmp_path, monkeypatch
+):
+    """Regression: load_grant must call project_grant_for_commercial.
+
+    The projection is designed to be applied at load time; without the call a
+    trial user (no grant file yet) resolves to empty_grant — no models — and
+    the WS capability gate silently closes the chat with code 4003.
+    """
+    from deeptutor.multi_user import grants
+    from deeptutor.multi_user.grants import load_grant
+
+    monkeypatch.setattr(grants, "GRANTS_DIR", tmp_path / "grants")
+    now = datetime.now(timezone.utc)
+    runtime, _service = await _active_runtime(now)
+    await runtime.ensure_trial_for_owner("u_trial")
+    resolved = await runtime.resolve_for_owner("u_trial")
+    assert resolved is not None
+
+    user_token = set_current_user(_user(tmp_path, user_id="u_trial"))
+    access_token = set_commercial_access(CommercialAccess("u_trial", resolved))
+    try:
+        grant = load_grant("u_trial")
+    finally:
+        reset_commercial_access(access_token)
+        reset_current_user(user_token)
+
+    assert grant["models"]["llm"] == [
+        {"profile_id": "trial-profile", "model_ids": ["trial-model"]}
+    ]
+    assert grant["quota"]["llm"]["daily_tokens"] == 100_000
+
+
+def test_load_grant_fails_closed_without_a_commercial_snapshot(tmp_path, monkeypatch):
+    from deeptutor.multi_user import grants
+    from deeptutor.multi_user.grants import load_grant
+
+    monkeypatch.setattr(grants, "GRANTS_DIR", tmp_path / "grants")
+    monkeypatch.setattr(
+        "deeptutor.commercial.entitlement_context.get_commercial_runtime",
+        lambda: SimpleNamespace(settings=_settings()),
+    )
+    user_token = set_current_user(_user(tmp_path, user_id="u_no_snapshot"))
+    access_token = set_commercial_access(None)
+    try:
+        grant = load_grant("u_no_snapshot")
+    finally:
+        reset_commercial_access(access_token)
+        reset_current_user(user_token)
+
+    assert grant["models"]["llm"] == []
+    assert grant["exec_enabled"] is False
