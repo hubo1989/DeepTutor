@@ -11,34 +11,14 @@ import type { LucideIcon } from 'lucide-react'
 import type { SettingsAccess } from './settings-access'
 
 export const SETTINGS_PAGE_GROUPS: { label: Lang; keys: string[] }[] = [
-  {
-    label: { en: 'Personal', zh: '个人' },
-    keys: ['general', 'workspace', 'data-migration', 'appearance', 'usage', 'orders'],
-  },
+  { label: { en: 'Personal', zh: '个人' }, keys: ['general', 'workspace', 'data-migration', 'appearance', 'usage', 'orders'] },
   {
     label: { en: 'Models & services', zh: '模型与服务' },
-    keys: [
-      'connections',
-      'llm',
-      'task-models',
-      'embedding',
-      'search',
-      'voice',
-      'multimodal',
-      'byok',
-    ],
+    keys: ['connections', 'llm', 'task-models', 'embedding', 'search', 'voice', 'multimodal', 'byok'],
   },
   {
     label: { en: 'Learning & conversation', zh: '学习与对话' },
-    keys: [
-      'starters',
-      'attachments',
-      'video-learning',
-      'learner-profile',
-      'progress',
-      'guardian',
-      'memory',
-    ],
+    keys: ['starters', 'attachments', 'video-learning', 'learner-profile', 'progress', 'guardian', 'memory'],
   },
   {
     label: { en: 'Features & integrations', zh: '功能与集成' },

@@ -1,88 +1,88 @@
-'use client'
+"use client";
 
-import { useCallback, useEffect, useMemo, useState } from 'react'
-import { useTranslation } from 'react-i18next'
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
 
 import {
   cancelCommercialOrder,
   createCommercialOrder,
   fetchCommercialOrders,
   fetchCommercialPlans,
-} from './api'
-import type { CommercialOrder, CommercialPlan } from './types'
+} from "./api";
+import type { CommercialOrder, CommercialPlan } from "./types";
 
 function formatPrice(priceMinor: number, currency: string): string {
-  return `${(priceMinor / 100).toLocaleString()} ${currency}`
+  return `${(priceMinor / 100).toLocaleString()} ${currency}`;
 }
 
 function formatDate(iso: string): string {
-  return new Date(iso).toLocaleDateString()
+  return new Date(iso).toLocaleDateString();
 }
 
 export default function OrdersSection() {
-  const { t } = useTranslation()
-  const [plans, setPlans] = useState<CommercialPlan[]>([])
-  const [orders, setOrders] = useState<CommercialOrder[]>([])
-  const [error, setError] = useState<string | null>(null)
-  const [busy, setBusy] = useState(false)
+  const { t } = useTranslation();
+  const [plans, setPlans] = useState<CommercialPlan[]>([]);
+  const [orders, setOrders] = useState<CommercialOrder[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
       const [planList, orderList] = await Promise.all([
         fetchCommercialPlans(),
         fetchCommercialOrders(),
-      ])
-      setPlans(planList.filter(plan => plan.priceMinor > 0))
-      setOrders(orderList)
-      setError(null)
+      ]);
+      setPlans(planList.filter((plan) => plan.priceMinor > 0));
+      setOrders(orderList);
+      setError(null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
+      setError(err instanceof Error ? err.message : String(err));
     }
-  }, [])
+  }, []);
 
   useEffect(() => {
-    void refresh()
-  }, [refresh])
+    void refresh();
+  }, [refresh]);
 
   const pendingOrder = useMemo(
-    () => orders.find(order => order.status === 'pending_payment') ?? null,
-    [orders]
-  )
+    () => orders.find((order) => order.status === "pending_payment") ?? null,
+    [orders],
+  );
 
   async function handleOrder(plan: CommercialPlan) {
-    setBusy(true)
+    setBusy(true);
     try {
       await createCommercialOrder({
         planVersionId: plan.id,
         idempotencyKey: `web-${plan.id}-${Date.now()}`,
-      })
-      await refresh()
+      });
+      await refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
+      setError(err instanceof Error ? err.message : String(err));
     } finally {
-      setBusy(false)
+      setBusy(false);
     }
   }
 
   async function handleCancel(orderId: string) {
-    setBusy(true)
+    setBusy(true);
     try {
-      await cancelCommercialOrder(orderId)
-      await refresh()
+      await cancelCommercialOrder(orderId);
+      await refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
+      setError(err instanceof Error ? err.message : String(err));
     } finally {
-      setBusy(false)
+      setBusy(false);
     }
   }
 
   return (
     <div className="space-y-6">
       <div>
-        <h2 className="text-lg font-semibold">{t('Plans and orders')}</h2>
+        <h2 className="text-lg font-semibold">{t("Plans and orders")}</h2>
         <p className="mt-1 text-sm text-[var(--muted-foreground)]">
           {t(
-            'Orders are paid offline. Create an order, then note its id with your transfer so it can be confirmed.'
+            "Orders are paid offline. Create an order, then note its id with your transfer so it can be confirmed.",
           )}
         </p>
       </div>
@@ -94,7 +94,7 @@ export default function OrdersSection() {
       ) : null}
 
       <div className="grid gap-3 sm:grid-cols-2">
-        {plans.map(plan => (
+        {plans.map((plan) => (
           <div
             key={plan.id}
             className="rounded-lg border border-[var(--border)] bg-[var(--card)] p-4"
@@ -104,7 +104,7 @@ export default function OrdersSection() {
               <span className="text-sm">{formatPrice(plan.priceMinor, plan.currency)}</span>
             </div>
             <p className="mt-1 text-xs text-[var(--muted-foreground)]">
-              {t('per {{interval}}', { interval: plan.billingInterval })}
+              {t("per {{interval}}", { interval: plan.billingInterval })}
             </p>
             <button
               type="button"
@@ -112,24 +112,28 @@ export default function OrdersSection() {
               onClick={() => void handleOrder(plan)}
               className="mt-3 rounded-md border border-[var(--border)] px-3 py-1.5 text-sm disabled:opacity-50"
             >
-              {pendingOrder ? t('An order is already awaiting payment') : t('Create order')}
+              {pendingOrder
+                ? t("An order is already awaiting payment")
+                : t("Create order")}
             </button>
           </div>
         ))}
         {plans.length === 0 ? (
-          <p className="text-sm text-[var(--muted-foreground)]">{t('No purchasable plans yet.')}</p>
+          <p className="text-sm text-[var(--muted-foreground)]">
+            {t("No purchasable plans yet.")}
+          </p>
         ) : null}
       </div>
 
       {pendingOrder ? (
         <div className="rounded-lg border border-amber-300 bg-amber-50 p-4 text-sm dark:border-amber-900/60 dark:bg-amber-950/30">
-          <p className="font-medium">{t('Awaiting payment confirmation')}</p>
+          <p className="font-medium">{t("Awaiting payment confirmation")}</p>
           <p className="mt-1 text-xs text-[var(--muted-foreground)]">
-            {t('Order id')}{' '}
+            {t("Order id")}{" "}
             <code className="rounded bg-[var(--muted)] px-1">{pendingOrder.id}</code>
-            {' · '}
+            {" · "}
             {formatPrice(pendingOrder.priceMinor, pendingOrder.currency)}
-            {' · '}
+            {" · "}
             {formatDate(pendingOrder.periodStart)} → {formatDate(pendingOrder.periodEnd)}
           </p>
           <button
@@ -138,7 +142,7 @@ export default function OrdersSection() {
             onClick={() => void handleCancel(pendingOrder.id)}
             className="mt-2 rounded-md border border-[var(--border)] px-3 py-1 text-xs disabled:opacity-50"
           >
-            {t('Cancel order')}
+            {t("Cancel order")}
           </button>
         </div>
       ) : null}
@@ -147,14 +151,14 @@ export default function OrdersSection() {
         <table className="w-full text-sm">
           <thead>
             <tr className="border-b border-[var(--border)] text-left text-xs text-[var(--muted-foreground)]">
-              <th className="py-2 pr-4">{t('Order')}</th>
-              <th className="py-2 pr-4">{t('Status')}</th>
-              <th className="py-2 pr-4">{t('Period')}</th>
-              <th className="py-2 pr-4">{t('Created')}</th>
+              <th className="py-2 pr-4">{t("Order")}</th>
+              <th className="py-2 pr-4">{t("Status")}</th>
+              <th className="py-2 pr-4">{t("Period")}</th>
+              <th className="py-2 pr-4">{t("Created")}</th>
             </tr>
           </thead>
           <tbody>
-            {orders.map(order => (
+            {orders.map((order) => (
               <tr key={order.id} className="border-b border-[var(--border)]/60">
                 <td className="py-2 pr-4 font-mono text-xs">{order.id}</td>
                 <td className="py-2 pr-4">{order.status}</td>
@@ -167,7 +171,7 @@ export default function OrdersSection() {
             {orders.length === 0 ? (
               <tr>
                 <td colSpan={4} className="py-3 text-[var(--muted-foreground)]">
-                  {t('No orders yet.')}
+                  {t("No orders yet.")}
                 </td>
               </tr>
             ) : null}
@@ -175,5 +179,5 @@ export default function OrdersSection() {
         </table>
       </div>
     </div>
-  )
+  );
 }
