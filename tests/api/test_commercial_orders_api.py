@@ -9,8 +9,8 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timedelta, timezone
 
-import httpx
 from fastapi import FastAPI
+import httpx
 
 from deeptutor.api.routers.auth import require_admin
 from deeptutor.commercial import CommercialControlPlane, InMemoryCommercialRepository
