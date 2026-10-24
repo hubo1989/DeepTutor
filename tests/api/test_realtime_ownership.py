@@ -92,6 +92,7 @@ async def _run_user_input(
         "deeptutor.commercial.entitlement_context.install_commercial_access_for_current_user",
         refresh_commercial_access,
     )
+
     # The v2 socket resolves its turn service through the application
     # container rather than the legacy module-level manager accessor.
     async def _submit_user_input(turn_id: str, content: str, command_id: str) -> bool:
@@ -229,6 +230,7 @@ async def test_user_input_keeps_auth_disabled_local_mode_compatible(monkeypatch)
         "deeptutor.commercial.entitlement_context.install_commercial_access_for_current_user",
         refresh_commercial_access,
     )
+
     # The v2 socket resolves its turn service through the application
     # container rather than the legacy module-level manager accessor.
     async def _submit_user_input(turn_id: str, content: str, command_id: str) -> bool:

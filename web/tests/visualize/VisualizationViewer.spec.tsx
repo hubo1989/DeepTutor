@@ -477,7 +477,7 @@ it("renders html in a sandboxed iframe and opens it in a new tab", () => {
   );
 });
 
-it("grows the html iframe via bridge height reports and ignores foreign sources", () => {
+it("grows the html iframe via bridge height reports and ignores foreign sources", async () => {
   const { container } = render(
     <VisualizationViewer
       result={canvasResult({
@@ -494,6 +494,15 @@ it("grows the html iframe via bridge height reports and ignores foreign sources"
     />,
   );
   const iframe = screen.getByTitle("HTML visualization") as HTMLIFrameElement;
+
+  // jsdom fires the srcDoc iframe's load event asynchronously after render;
+  // flush it inside act so onLoad's height reset happens before the bridge
+  // assertions below instead of escaping the test as an act() warning.
+  await act(async () => {
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 0);
+    });
+  });
 
   // A message from another window must not resize the iframe.
   fireEvent(

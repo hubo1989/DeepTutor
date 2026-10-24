@@ -143,7 +143,7 @@ def _make_user_record(
         "disabled": False,
         "avatar": "",
         "email_verified": True,
-                "preset": preset,
+        "preset": preset,
     }
 
 
@@ -199,8 +199,6 @@ def _ensure_configured_admin_persisted() -> None:
         role="admin",
         email_verified=True,
     )
-
-
 
 
 def add_user(
@@ -374,7 +372,7 @@ def create_token(
         "role": role,
         "uid": user_id,
         "ver": max(0, int(record.get("auth_version") or 0)),
-                "dcid": device_credential_id,
+        "dcid": device_credential_id,
         "dcs": device_session_nonce,
         "exp": datetime.now(timezone.utc) + timedelta(hours=TOKEN_EXPIRE_HOURS),
         "iat": datetime.now(timezone.utc),

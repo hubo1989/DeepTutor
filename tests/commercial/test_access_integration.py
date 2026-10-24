@@ -571,9 +571,7 @@ async def test_load_grant_projects_the_active_trial_onto_users_without_a_grant_f
         reset_commercial_access(access_token)
         reset_current_user(user_token)
 
-    assert grant["models"]["llm"] == [
-        {"profile_id": "trial-profile", "model_ids": ["trial-model"]}
-    ]
+    assert grant["models"]["llm"] == [{"profile_id": "trial-profile", "model_ids": ["trial-model"]}]
     assert grant["quota"]["llm"]["daily_tokens"] == 100_000
 
 

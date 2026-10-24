@@ -20,7 +20,8 @@ const ROUTE_TARGETS = [
     route: "/learning/reading/[workspaceId]/sessions/[sessionId]",
     requestPath: "/learning/reading/perf-budget/sessions/perf-session",
     // v1.6.10 dependency upgrades moved the measured raw JS above 1120KB.
-    budgetKb: 1_160,
+    // The v1.6.15 upstream merge (PR #22) moved it above 1160KB.
+    budgetKb: 1_175,
   },
   {
     route: "/learning/mastery/[pathId]/sessions/[sessionId]",

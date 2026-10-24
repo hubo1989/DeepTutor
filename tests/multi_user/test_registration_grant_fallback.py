@@ -16,9 +16,7 @@ def test_verified_registration_creates_no_grant_file(mu_isolated_root, monkeypat
     from deeptutor.services import auth as auth_service
 
     monkeypatch.setattr(auth_service, "AUTH_ENABLED", True)
-    created, record = auth_service.add_verified_user(
-        "newbie@example.com", "hashed-password"
-    )
+    created, record = auth_service.add_verified_user("newbie@example.com", "hashed-password")
 
     assert created is True
     # Upstream semantics: no snapshot at creation time…
@@ -32,9 +30,7 @@ def test_missing_grant_falls_back_to_default_quotas(mu_isolated_root, monkeypatc
     from deeptutor.services import auth as auth_service
 
     monkeypatch.setattr(auth_service, "AUTH_ENABLED", True)
-    _created, record = auth_service.add_verified_user(
-        "newbie@example.com", "hashed-password"
-    )
+    _created, record = auth_service.add_verified_user("newbie@example.com", "hashed-password")
 
     grant = load_grant(record["id"])
     assert grant["models"]["llm"] == []

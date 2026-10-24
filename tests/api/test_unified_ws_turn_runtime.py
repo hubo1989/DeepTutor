@@ -794,7 +794,13 @@ async def test_regenerate_reuses_snapshot_or_override_llm_selection(tmp_path) ->
     session = await store.create_session(session_id="session-with-snapshot")
     await store.update_session_preferences(
         session["id"],
-        {"llm_selection": {"source": "platform", "profile_id": "p-default", "model_id": "m-default"}},
+        {
+            "llm_selection": {
+                "source": "platform",
+                "profile_id": "p-default",
+                "model_id": "m-default",
+            }
+        },
     )
     await store.add_message(
         session_id=session["id"],
