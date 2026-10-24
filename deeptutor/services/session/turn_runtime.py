@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Any
+
+from deeptutor.core.turn_request import TurnRequest
 
 from . import _turn_runtime_shared as _shared
 from .turns import (
@@ -58,64 +61,30 @@ class TurnRuntimeManager(
             )
 
             payload = {**payload, "language": get_response_language(default="en")}
-        raw_config = dict(payload.get("config", {}) or {})
-        runtime_only_keys = (
-            "linked_task_ids",
-            "_resource_reuse",
-            "_persistent_knowledge_bases",
-            "_persist_user_message",
-            "_regenerate",
-            "_regenerated_from_message_id",
-            "_superseded_turn_id",
-            "followup_question_context",
-            "subagent_consult_budget",
-            # Turn-level partner routing keys: public on the wire, not part of
-            # any capability's config schema.
-            "consult_partner_id",
-            "partner_discussion_group_id",
-        )
-        runtime_only_config = {
-            key: raw_config.pop(key) for key in runtime_only_keys if key in raw_config
-        }
         from deeptutor.runtime.request_contracts import validate_capability_config
 
+        # The wire contract migrates legacy runtime options (auto_route,
+        # selection tutor, course, regeneration) to explicit top-level fields.
+        # Do this before strict capability validation, while preserving the
+        # fork's internal resource bookkeeping outside that public schema.
         try:
+            payload = TurnRequest.model_validate(
+                {key: value for key, value in payload.items() if key != "type"}
+            ).to_payload()
+            raw_config = dict(payload.get("config") or {})
+            runtime_only_config = {
+                key: raw_config.pop(key)
+                for key in ("linked_task_ids", "_resource_reuse", "_persistent_knowledge_bases")
+                if key in raw_config
+            }
             validated_public_config = validate_capability_config(capability, raw_config)
         except ValueError as exc:
             raise RuntimeError(str(exc)) from exc
         payload = {
             **payload,
             "capability": capability,
-            # runtime_only_config is re-merged after the strict wire contract
-            # validates below; keep it out of the public config here.
-            "config": validated_public_config,
+            "config": {**validated_public_config, **runtime_only_config},
         }
-        # Strip runtime-only config keys before the strict public contract
-        # validates; they are re-merged into the payload afterwards.
-        wire = dict(payload)
-        raw_cfg = dict(wire.get("config", {}) or {})
-        stripped = {
-            key: raw_cfg.pop(key)
-            for key in (
-                "linked_task_ids",
-                "_resource_reuse",
-                "_persistent_knowledge_bases",
-                "_persist_user_message",
-                "_regenerate",
-                "_regenerated_from_message_id",
-                "_superseded_turn_id",
-                "followup_question_context",
-                "subagent_consult_budget",
-            )
-            if key in raw_cfg
-        }
-        wire["config"] = raw_cfg
-        from deeptutor.services.session.turns.request_preparer import TurnRequest
-
-        payload = TurnRequest.model_validate(
-            {key: value for key, value in wire.items() if key != "type"}
-        ).to_payload()
-        payload = {**payload, "config": {**(payload.get("config") or {}), **stripped, **runtime_only_config}}
         try:
             access = require_capability(capability)
             if access is not None:
@@ -190,6 +159,7 @@ def get_turn_runtime_manager() -> TurnRuntimeManager:
 
 
 __all__ = ["TurnRuntimeManager", "cancel_turns_for_user", "get_turn_runtime_manager"]
+
 
 async def cancel_turns_for_user(user_id: str) -> int:
     """Quiesce local in-flight turns before deleting an owner's workspace."""

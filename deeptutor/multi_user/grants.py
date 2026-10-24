@@ -13,11 +13,11 @@ import threading
 from typing import Any
 
 from deeptutor.services.file_io import atomic_write_text
-from .quota_config import normalize_quotas
-from .token_quota import default_quota
 
 from .identity import get_user_by_id
 from .paths import SYSTEM_ROOT, ensure_system_dirs
+from .quota_config import normalize_quotas
+from .token_quota import default_quota
 
 GRANTS_DIR = SYSTEM_ROOT / "grants"
 
@@ -107,6 +107,7 @@ def empty_grant(user_id: str) -> dict[str, Any]:
         "token_quota": dict(normalized_quota["llm"]),
         "learning_policy": None,
     }
+
 
 def _normalize_tool_list(value: Any) -> list[str] | None:
     if value is None:

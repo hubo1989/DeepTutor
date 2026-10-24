@@ -11,9 +11,9 @@ from __future__ import annotations
 
 import json
 
-import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+import pytest
 
 from deeptutor.api.routers import multi_user
 from deeptutor.api.routers.auth import require_admin

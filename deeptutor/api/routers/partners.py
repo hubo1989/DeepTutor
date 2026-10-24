@@ -25,6 +25,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from deeptutor.api.routers.auth import require_admin
 from deeptutor.app.container import get_application_container
 from deeptutor.multi_user.context import get_current_user
+from deeptutor.multi_user.model_access import has_capability_access  # noqa: F401  (route + tests)
 from deeptutor.multi_user.partner_access import (
     assert_partner_allowed,
     assert_partner_manageable,
@@ -36,7 +37,6 @@ from deeptutor.multi_user.partner_access import (
 from deeptutor.partners.config.paths import get_partner_media_dir
 from deeptutor.partners.helpers import safe_filename
 from deeptutor.runtime.coordination import BackgroundCommandKind
-from deeptutor.multi_user.model_access import has_capability_access  # noqa: F401  (route + tests)
 from deeptutor.services.i18n import t
 from deeptutor.services.partners import (
     get_partner_manager,
@@ -1899,6 +1899,9 @@ async def partner_chat_ws(ws: WebSocket, partner_id: str):
             try:
                 raw = await ws.receive_text()
             except WebSocketDisconnect:
+                disconnected.set()
+                break
+            if not await ws_authorize_message(ws):
                 disconnected.set()
                 break
             try:

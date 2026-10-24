@@ -14,15 +14,12 @@ import threading
 from typing import Any
 from uuid import uuid4
 
+from deeptutor.services.file_io import atomic_write_text
 from deeptutor.services.private_state import (
     chmod_private,
     ensure_private_directory,
     exclusive_path_lock,
 )
-from deeptutor.utils.secret_files import write_secret_text
-
-from .models import Role
-from deeptutor.services.file_io import atomic_write_text
 from deeptutor.utils.secret_files import write_secret_text
 
 from .book_permission import (
@@ -479,6 +476,7 @@ def remove_book_permission_overrides(book_id: str) -> list[str]:
         if changed:
             _write_users(users)
     return affected
+
 
 def set_password(username: str, hashed_password: str) -> dict[str, Any] | None:
     """Replace one account's password hash without changing its identity fields."""

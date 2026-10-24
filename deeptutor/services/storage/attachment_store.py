@@ -28,9 +28,8 @@ uploaded twice in the same session.
 
 from __future__ import annotations
 
-import hashlib
-
 import asyncio
+import hashlib
 import logging
 import os
 from pathlib import Path
@@ -332,7 +331,6 @@ def _attachment_root() -> Path:
 
 def _legacy_attachment_root() -> Path:
     return get_path_service().get_user_root().joinpath(*_LEGACY_SUBPATH).resolve()
-
 
 
 def external_attachment_root_for_owner(owner_id: str) -> Path | None:

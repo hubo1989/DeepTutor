@@ -7,12 +7,12 @@ Handles knowledge base CRUD operations, file uploads, and initialization.
 
 import asyncio
 from contextlib import contextmanager
-from datetime import datetime
-import json
-import inspect
-from functools import wraps
-import logging
 from contextvars import ContextVar
+from datetime import datetime
+from functools import wraps
+import inspect
+import json
+import logging
 import mimetypes
 import os
 from pathlib import Path
@@ -41,17 +41,18 @@ from fastapi.responses import FileResponse, PlainTextResponse, Response, Streami
 from pydantic import BaseModel, Field
 
 from deeptutor.api.routers.auth import require_admin
+from deeptutor.api.utils.progress_broadcaster import ProgressBroadcaster
+from deeptutor.api.utils.task_id_manager import TaskIDManager
+from deeptutor.api.utils.task_log_stream import capture_task_logs, get_task_stream_manager
 from deeptutor.commercial.entitlement_context import (
     CommercialAccessDenied,
     require_active_commercial_access,
 )
 from deeptutor.commercial.storage_limits import (
     CommercialResourceLimitDenied,
+    enforce_kb_count_limit,
     enforce_upload_size_limits,
 )
-from deeptutor.api.utils.progress_broadcaster import ProgressBroadcaster
-from deeptutor.api.utils.task_id_manager import TaskIDManager
-from deeptutor.api.utils.task_log_stream import capture_task_logs, get_task_stream_manager
 from deeptutor.knowledge.add_documents import (
     DocumentAdder,
     hashes_for_indexed_files,
@@ -1579,7 +1580,9 @@ def _pageindex_config_payload() -> dict:
     }
 
 
-@router.get("/knowledge-bases/rag-pipelines/pageindex/config", dependencies=[Depends(require_admin)])
+@router.get(
+    "/knowledge-bases/rag-pipelines/pageindex/config", dependencies=[Depends(require_admin)]
+)
 async def get_pageindex_pipeline_config():
     """Read the PageIndex credential state (key redacted to a boolean)."""
     try:
@@ -1589,7 +1592,9 @@ async def get_pageindex_pipeline_config():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.put("/knowledge-bases/rag-pipelines/pageindex/config", dependencies=[Depends(require_admin)])
+@router.put(
+    "/knowledge-bases/rag-pipelines/pageindex/config", dependencies=[Depends(require_admin)]
+)
 async def update_pageindex_pipeline_config(payload: PageIndexConfigUpdate):
     """Persist the deployment-level PageIndex Cloud credential."""
     try:
@@ -1686,7 +1691,9 @@ class LlamaIndexConfigUpdate(BaseModel):
     image_description_timeout_seconds: int | None = None
 
 
-@router.get("/knowledge-bases/rag-pipelines/llamaindex/config", dependencies=[Depends(require_admin)])
+@router.get(
+    "/knowledge-bases/rag-pipelines/llamaindex/config", dependencies=[Depends(require_admin)]
+)
 async def get_llamaindex_pipeline_config():
     """Read the LlamaIndex engine's retrieval + chunking knobs.
 
@@ -1712,7 +1719,9 @@ async def get_llamaindex_pipeline_config():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.put("/knowledge-bases/rag-pipelines/llamaindex/config", dependencies=[Depends(require_admin)])
+@router.put(
+    "/knowledge-bases/rag-pipelines/llamaindex/config", dependencies=[Depends(require_admin)]
+)
 async def update_llamaindex_pipeline_config(payload: LlamaIndexConfigUpdate):
     """Persist the LlamaIndex engine knobs.
 
@@ -1920,7 +1929,9 @@ async def update_lightrag_server_pipeline_config(payload: LightRagServerConfigUp
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/knowledge-bases/rag-pipelines/{provider}/preflight", dependencies=[Depends(require_admin)])
+@router.get(
+    "/knowledge-bases/rag-pipelines/{provider}/preflight", dependencies=[Depends(require_admin)]
+)
 async def get_rag_pipeline_preflight(provider: str):
     """Check whether ``provider`` can run in the current environment.
 
@@ -4837,7 +4848,11 @@ async def websocket_progress(websocket: WebSocket, kb_name: str):
                 logger.warning("Failed to reset user context after progress WS: %s", reset_error)
 
 
-@router.post("/knowledge-bases/{kb_name}/link-folder", response_model=LinkedFolderInfo, dependencies=[Depends(require_admin)])
+@router.post(
+    "/knowledge-bases/{kb_name}/link-folder",
+    response_model=LinkedFolderInfo,
+    dependencies=[Depends(require_admin)],
+)
 async def link_folder(kb_name: str, request: LinkFolderRequest):
     """
     Link a local folder to a knowledge base.
@@ -4867,7 +4882,11 @@ async def link_folder(kb_name: str, request: LinkFolderRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/knowledge-bases/{kb_name}/linked-folders", response_model=list[LinkedFolderInfo], dependencies=[Depends(require_admin)])
+@router.get(
+    "/knowledge-bases/{kb_name}/linked-folders",
+    response_model=list[LinkedFolderInfo],
+    dependencies=[Depends(require_admin)],
+)
 async def get_linked_folders(kb_name: str):
     """Get list of linked folders for a knowledge base."""
     try:
@@ -4883,7 +4902,9 @@ async def get_linked_folders(kb_name: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.delete("/knowledge-bases/{kb_name}/linked-folders/{folder_id}", dependencies=[Depends(require_admin)])
+@router.delete(
+    "/knowledge-bases/{kb_name}/linked-folders/{folder_id}", dependencies=[Depends(require_admin)]
+)
 async def unlink_folder(kb_name: str, folder_id: str):
     """Unlink a folder from a knowledge base."""
     try:

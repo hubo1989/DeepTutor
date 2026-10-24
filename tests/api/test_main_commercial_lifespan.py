@@ -24,7 +24,6 @@ import pytest
 
 import deeptutor.api.main as api_main
 
-
 # ---------------------------------------------------------------------------
 # Seam stubs
 # ---------------------------------------------------------------------------
@@ -51,12 +50,8 @@ def commercial_calls(monkeypatch):
     async def fake_shutdown(runtime):
         calls["shutdown"].append(runtime)
 
-    monkeypatch.setattr(
-        commercial_integration, "startup_commercial_foundation", fake_startup
-    )
-    monkeypatch.setattr(
-        commercial_integration, "shutdown_commercial_foundation", fake_shutdown
-    )
+    monkeypatch.setattr(commercial_integration, "startup_commercial_foundation", fake_startup)
+    monkeypatch.setattr(commercial_integration, "shutdown_commercial_foundation", fake_shutdown)
     return calls
 
 
@@ -92,9 +87,7 @@ def _stub_container(monkeypatch) -> SimpleNamespace:
 
     import deeptutor.app.container as container_module
 
-    monkeypatch.setattr(
-        container_module, "get_application_container", lambda: container
-    )
+    monkeypatch.setattr(container_module, "get_application_container", lambda: container)
     return container
 
 
@@ -116,9 +109,7 @@ def _stub_supervisor(monkeypatch, *, fail_start: bool = False) -> list[str]:
 
     import deeptutor.runtime.background_leader as background_leader
 
-    monkeypatch.setattr(
-        background_leader, "BackgroundLeaderSupervisor", _StubSupervisor
-    )
+    monkeypatch.setattr(background_leader, "BackgroundLeaderSupervisor", _StubSupervisor)
     return events
 
 
@@ -163,9 +154,7 @@ def quiet_external_seams(monkeypatch):
     async def fake_reconcile() -> tuple[int, int]:
         return 0, 0
 
-    monkeypatch.setattr(
-        assessment_module, "reconcile_linked_assessments", fake_reconcile
-    )
+    monkeypatch.setattr(assessment_module, "reconcile_linked_assessments", fake_reconcile)
 
     async def noop() -> None:
         return None
@@ -243,9 +232,7 @@ async def test_lifespan_commercial_startup_failure_does_not_double_shutdown(
         commercial_calls["startup"].append("failed")
         raise RuntimeError("commercial bootstrap failed")
 
-    monkeypatch.setattr(
-        commercial_integration, "startup_commercial_foundation", failing_startup
-    )
+    monkeypatch.setattr(commercial_integration, "startup_commercial_foundation", failing_startup)
     _stub_container(monkeypatch)
     _stub_supervisor(monkeypatch)
 

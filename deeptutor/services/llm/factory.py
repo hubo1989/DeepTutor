@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import json
-
 import asyncio
 from collections.abc import AsyncGenerator, Mapping
 import contextlib
+import json
 from types import SimpleNamespace
 from typing import Any, TypedDict
 

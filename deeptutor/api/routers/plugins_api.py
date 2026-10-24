@@ -18,7 +18,6 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from deeptutor.services.i18n import t
 from deeptutor.i18n.metadata_i18n import tool_description_i18n
 from deeptutor.logging import (
     ProcessLogEvent,
@@ -28,6 +27,7 @@ from deeptutor.logging import (
 )
 from deeptutor.runtime.registry.capability_registry import get_capability_registry
 from deeptutor.runtime.registry.tool_registry import get_tool_registry
+from deeptutor.services.i18n import t
 
 from .auth import require_admin
 

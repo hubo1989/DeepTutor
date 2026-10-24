@@ -7,6 +7,12 @@ import os
 from pathlib import Path
 from typing import Any, Callable
 
+from deeptutor.multi_user.quota_config import (
+    DEFAULT_QUOTA,
+    DEFAULT_TOKEN_QUOTA,
+    default_quotas,
+    normalize_quotas,
+)
 from deeptutor.services.file_io import atomic_write_json as _atomic_write_json
 from deeptutor.services.path_service import get_path_service
 
@@ -35,6 +41,8 @@ DEFAULT_SYSTEM_SETTINGS: dict[str, Any] = {
     # deployment shapes; a stronger backend (runner sidecar / bwrap) still
     # takes precedence when available. Set false to disable host-side exec.
     "sandbox_allow_subprocess": True,
+    # Ordinary users require an explicitly configured isolated runner.
+    "sandbox_allow_untrusted_users": False,
     # Conservative chat -> deep_question routing. Explicit requests only, and
     # callers can still pass config.auto_route=false for a single turn.
     "capability_routing_enabled": False,
@@ -106,6 +114,15 @@ DEFAULT_AUTH_SETTINGS: dict[str, Any] = {
     "token_expire_hours": 24,
     "cookie_secure": False,
     "private_login_hosts": [],
+    "default_quota": default_quotas(),
+    "default_token_quota": dict(DEFAULT_TOKEN_QUOTA),
+    "self_registration_enabled": True,
+    "email_verification_required": True,
+    "verification_code_ttl_minutes": 10,
+    "verification_resend_cooldown_seconds": 60,
+    "verification_max_attempts": 5,
+    "verification_max_per_email_hour": 5,
+    "verification_max_per_ip_hour": 30,
 }
 
 DEFAULT_INTEGRATIONS_SETTINGS: dict[str, Any] = {
@@ -567,17 +584,21 @@ class RuntimeSettingsService:
         return payload
 
     def load_auth(self, *, include_process_overrides: bool = True) -> dict[str, Any]:
-        payload = self._load_or_create(
-            "auth",
-            DEFAULT_AUTH_SETTINGS,
-            self._normalize_auth,
-        )
+        # Do not mask a customized legacy LLM quota with newly injected defaults.
+        loaded = _json_object(self.path_for("auth"))
+        defaults = _deepcopy_default(DEFAULT_AUTH_SETTINGS)
+        if loaded and "default_quota" not in loaded and "default_token_quota" in loaded:
+            defaults.pop("default_quota", None)
+        payload = self._load_or_create("auth", defaults, self._normalize_auth)
         if include_process_overrides:
             payload = self._apply_auth_process_overrides(payload)
         return payload
 
     def save_auth(self, settings: dict[str, Any]) -> dict[str, Any]:
-        payload = self._normalize_auth({**DEFAULT_AUTH_SETTINGS, **settings})
+        merged = {**DEFAULT_AUTH_SETTINGS, **settings}
+        if "default_quota" not in settings and "default_token_quota" in settings:
+            merged.pop("default_quota", None)
+        payload = self._normalize_auth(merged)
         _atomic_write_json(self.path_for("auth"), payload)
         return payload
 
@@ -779,12 +800,26 @@ class RuntimeSettingsService:
             "DISABLE_SSL_VERIFY": _bool_env(system["disable_ssl_verify"]),
             "CHAT_ATTACHMENT_DIR": system["chat_attachment_dir"],
             "DEEPTUTOR_SANDBOX_ALLOW_SUBPROCESS": _bool_env(system["sandbox_allow_subprocess"]),
+            "DEEPTUTOR_SANDBOX_ALLOW_UNTRUSTED_USERS": _bool_env(
+                system["sandbox_allow_untrusted_users"]
+            ),
             "AUTH_ENABLED": _bool_env(auth["enabled"]),
             "AUTH_USERNAME": auth["username"],
             "AUTH_PASSWORD_HASH": auth["password_hash"],
             "AUTH_TOKEN_EXPIRE_HOURS": str(auth["token_expire_hours"]),
             "AUTH_COOKIE_SECURE": _bool_env(auth["cookie_secure"]),
             "AUTH_PRIVATE_LOGIN_HOSTS": ",".join(auth["private_login_hosts"]),
+            "DEEPTUTOR_SELF_REGISTRATION_ENABLED": _bool_env(auth["self_registration_enabled"]),
+            "DEEPTUTOR_EMAIL_VERIFICATION_REQUIRED": _bool_env(auth["email_verification_required"]),
+            "DEEPTUTOR_VERIFICATION_CODE_TTL_MINUTES": str(auth["verification_code_ttl_minutes"]),
+            "DEEPTUTOR_VERIFICATION_RESEND_COOLDOWN_SECONDS": str(
+                auth["verification_resend_cooldown_seconds"]
+            ),
+            "DEEPTUTOR_VERIFICATION_MAX_ATTEMPTS": str(auth["verification_max_attempts"]),
+            "DEEPTUTOR_VERIFICATION_MAX_PER_EMAIL_HOUR": str(
+                auth["verification_max_per_email_hour"]
+            ),
+            "DEEPTUTOR_VERIFICATION_MAX_PER_IP_HOUR": str(auth["verification_max_per_ip_hour"]),
             "NEXT_PUBLIC_AUTH_ENABLED": _bool_env(auth["enabled"]),
             # Consumed server-side by the Next.js middleware (web/proxy.ts) at
             # request time — NOT inlined into the browser bundle. The proxy
@@ -927,6 +962,8 @@ class RuntimeSettingsService:
             payload["backend_workers"] = value
         if value := self._process_env_value("DEEPTUTOR_SANDBOX_ALLOW_SUBPROCESS"):
             payload["sandbox_allow_subprocess"] = value
+        if value := self._process_env_value("DEEPTUTOR_SANDBOX_ALLOW_UNTRUSTED_USERS"):
+            payload["sandbox_allow_untrusted_users"] = value
         if value := self._process_env_value("DEEPTUTOR_CAPABILITY_ROUTING_ENABLED"):
             payload["capability_routing_enabled"] = value
         if value := self._process_env_value("CHAT_ATTACHMENT_MAX_FILE_MB"):
@@ -963,6 +1000,17 @@ class RuntimeSettingsService:
             payload["cookie_secure"] = value
         if value := self._process_env_value("AUTH_PRIVATE_LOGIN_HOSTS"):
             payload["private_login_hosts"] = value
+        for key in (
+            "self_registration_enabled",
+            "email_verification_required",
+            "verification_code_ttl_minutes",
+            "verification_resend_cooldown_seconds",
+            "verification_max_attempts",
+            "verification_max_per_email_hour",
+            "verification_max_per_ip_hour",
+        ):
+            if value := self._process_env_value(f"DEEPTUTOR_{key.upper()}"):
+                payload[key] = value
         return self._normalize_auth(payload)
 
     def _apply_integrations_process_overrides(self, settings: dict[str, Any]) -> dict[str, Any]:
@@ -1382,6 +1430,9 @@ class RuntimeSettingsService:
             "sandbox_allow_subprocess": _coerce_bool(
                 settings.get("sandbox_allow_subprocess"), True
             ),
+            "sandbox_allow_untrusted_users": _coerce_bool(
+                settings.get("sandbox_allow_untrusted_users"), False
+            ),
             "capability_routing_enabled": _coerce_bool(
                 settings.get("capability_routing_enabled"), False
             ),
@@ -1434,6 +1485,11 @@ class RuntimeSettingsService:
         }
 
     def _normalize_auth(self, settings: dict[str, Any]) -> dict[str, Any]:
+        default_quota = normalize_quotas(
+            settings.get("default_quota"),
+            fallback=DEFAULT_QUOTA,
+            legacy_token_quota=settings.get("default_token_quota"),
+        )
         return {
             "version": 1,
             "enabled": _coerce_bool(settings.get("enabled"), False),
@@ -1442,6 +1498,29 @@ class RuntimeSettingsService:
             "token_expire_hours": max(1, _coerce_int(settings.get("token_expire_hours"), 24)),
             "cookie_secure": _coerce_bool(settings.get("cookie_secure"), False),
             "private_login_hosts": _host_list(settings.get("private_login_hosts")),
+            "default_quota": default_quota,
+            "default_token_quota": dict(default_quota["llm"]),
+            "self_registration_enabled": _coerce_bool(
+                settings.get("self_registration_enabled"), True
+            ),
+            "email_verification_required": _coerce_bool(
+                settings.get("email_verification_required"), True
+            ),
+            "verification_code_ttl_minutes": _coerce_clamped_int(
+                settings.get("verification_code_ttl_minutes"), 10, 5, 60
+            ),
+            "verification_resend_cooldown_seconds": _coerce_clamped_int(
+                settings.get("verification_resend_cooldown_seconds"), 60, 30, 3600
+            ),
+            "verification_max_attempts": _coerce_clamped_int(
+                settings.get("verification_max_attempts"), 5, 3, 10
+            ),
+            "verification_max_per_email_hour": _coerce_clamped_int(
+                settings.get("verification_max_per_email_hour"), 5, 1, 50
+            ),
+            "verification_max_per_ip_hour": _coerce_clamped_int(
+                settings.get("verification_max_per_ip_hour"), 30, 5, 200
+            ),
         }
 
     def _normalize_integrations(self, settings: dict[str, Any]) -> dict[str, Any]:

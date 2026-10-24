@@ -8,6 +8,17 @@ import json
 from typing import Any
 from urllib.parse import urlparse
 
+from deeptutor.multi_user.byok_policy import (
+    allowed_binding,
+    byok_runtime_enabled,
+    grant_service_enabled,
+    load_policy,
+    official_endpoint,
+    validate_endpoint,
+)
+from deeptutor.multi_user.byok_vault import get_user_byok_vault
+from deeptutor.multi_user.context import get_current_user
+from deeptutor.multi_user.grants import load_grant
 from deeptutor.services.imagegen.config import ImagegenConfig
 from deeptutor.services.keypool import primary_api_key
 from deeptutor.services.model_selection import LLMSelection, apply_llm_selection_to_catalog
@@ -617,6 +628,7 @@ class ResolvedLLMConfig:
     context_window: int | None = None
     # The active model's explicit capability overrides (see MODEL_CAPABILITY_KEYS).
     capabilities: dict[str, bool] = field(default_factory=dict)
+    source: str = "platform"
 
 
 @dataclass(slots=True)
@@ -840,6 +852,62 @@ def _choose_resolved_provider(
     return find_by_name("openai") or PROVIDERS[0]
 
 
+def _resolve_byok_llm_runtime_config(selection: LLMSelection) -> ResolvedLLMConfig:
+    """Resolve a user-owned LLM profile without touching the platform catalog."""
+    user = get_current_user()
+    policy = load_policy()
+    grant = load_grant(user.id)
+    if not byok_runtime_enabled("llm", policy):
+        raise PermissionError("BYOK is disabled for LLM requests")
+    if not user.is_admin and not grant_service_enabled(grant, "byok", "llm"):
+        raise PermissionError("BYOK is not enabled for this account")
+    if not selection.profile_id:
+        raise ValueError("Invalid BYOK selection: profile_id is required")
+
+    metadata, api_key = get_user_byok_vault().load_secret(user.id, selection.profile_id)
+    if str(metadata.get("service") or "") != "llm":
+        raise PermissionError("The selected BYOK profile is not an LLM profile")
+    current_generation = int(metadata.get("generation") or 0)
+    if selection.generation is not None and current_generation != selection.generation:
+        raise PermissionError("The selected BYOK profile changed; reload and select it again")
+
+    binding_hint_raw = _as_str(metadata.get("provider"))
+    if not binding_hint_raw or not allowed_binding("llm", binding_hint_raw, policy):
+        raise PermissionError("This BYOK provider is not allowed by the administrator")
+    binding_hint = canonical_provider_name(binding_hint_raw) or binding_hint_raw
+    spec = find_by_name(binding_hint)
+    if spec is None:
+        raise ValueError("The selected BYOK provider is not registered")
+    model = _as_str(metadata.get("model"))
+    if not model:
+        raise ValueError("The selected BYOK profile has no model")
+    configured_endpoint = _as_str(metadata.get("base_url")) or official_endpoint(binding_hint)
+    if not configured_endpoint:
+        raise ValueError("The selected BYOK profile has no usable endpoint")
+    endpoint = validate_endpoint(
+        configured_endpoint,
+        service="llm",
+        binding=binding_hint,
+        policy=policy,
+        # Creation validates DNS before persistence; resolution must not block
+        # the event loop with a second synchronous DNS lookup.
+        resolve_dns=False,
+    )
+    if not endpoint:
+        raise ValueError("The selected BYOK profile has no usable endpoint")
+    return ResolvedLLMConfig(
+        model=model,
+        provider_name=spec.name,
+        provider_mode=spec.mode,
+        binding_hint=binding_hint,
+        binding=spec.name,
+        api_key=api_key,
+        base_url=endpoint,
+        effective_url=endpoint,
+        source="byok",
+    )
+
+
 def resolve_llm_runtime_config(
     catalog: dict[str, Any] | None = None,
     *,
@@ -856,6 +924,24 @@ def resolve_llm_runtime_config(
     a task profile that names a bare model still resolves against the
     credentials configured for chat.
     """
+    selection = LLMSelection.from_payload(llm_selection)
+    if not get_current_user().is_admin:
+        from deeptutor.multi_user.model_access import (
+            apply_allowed_llm_selection,
+            default_llm_selection,
+        )
+
+        if selection is None:
+            selection = LLMSelection.from_payload(default_llm_selection())
+        if selection is None:
+            raise PermissionError("No LLM model is assigned to your account")
+        if selection.source != "byok":
+            selection = LLMSelection.from_payload(apply_allowed_llm_selection(selection.to_dict()))
+        # User requests must not inherit an administrator's task-model override.
+        service_name = "llm"
+    if selection is not None and selection.source == "byok":
+        return _resolve_byok_llm_runtime_config(selection)
+    llm_selection = selection
     catalog_service = service or get_model_catalog_service()
     loaded = _with_personal_llm_profiles(_load_catalog(catalog))
     # Parse the payload once: ``apply_llm_selection_to_catalog`` would otherwise
