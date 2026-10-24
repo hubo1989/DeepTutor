@@ -128,7 +128,12 @@ test("book arrows read the current chapter before turning chapters", async ({
     return route.fulfill(json({}));
   });
 
-  await page.goto(`${BASE_URL}/books/sequential-fixture/pages/page-2`, {
+  // This fork's deployment default UI language is Chinese; force English so
+  // the role names asserted below are stable in every environment.
+  await page.addInitScript(() =>
+    localStorage.setItem("deeptutor-language", "en"),
+  );
+  await page.goto(`${BASE_URL}/learning/books/sequential-fixture/pages/page-2`, {
     waitUntil: "domcontentloaded",
   });
   // A hidden reader (for example when the mobile chapter sidebar is expanded)
