@@ -54,7 +54,9 @@ def _configure_runtime(monkeypatch: pytest.MonkeyPatch, captured: dict, tmp_path
         "deeptutor.services.config.runtime_settings.load_system_settings",
         lambda: {"capability_routing_enabled": captured["global_enabled"]},
     )
-    monkeypatch.setattr("deeptutor.services.llm.config.get_llm_config", lambda: SimpleNamespace(source="platform"))
+    monkeypatch.setattr(
+        "deeptutor.services.llm.config.get_llm_config", lambda: SimpleNamespace(source="platform")
+    )
     monkeypatch.setattr(
         "deeptutor.services.session.context_builder.ContextBuilder", FakeContextBuilder
     )

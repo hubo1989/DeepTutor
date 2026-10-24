@@ -84,7 +84,9 @@ def _workspace_root(tmp_path, monkeypatch: pytest.MonkeyPatch):
 
 @pytest.fixture
 def llm_and_context(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr("deeptutor.services.llm.config.get_llm_config", lambda: SimpleNamespace(source="platform"))
+    monkeypatch.setattr(
+        "deeptutor.services.llm.config.get_llm_config", lambda: SimpleNamespace(source="platform")
+    )
     monkeypatch.setattr(
         "deeptutor.services.session.context_builder.ContextBuilder", _ContextBuilder
     )

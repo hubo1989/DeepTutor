@@ -132,7 +132,13 @@ def test_docker_manual_dispatch_builds_authenticated_push_only() -> None:
     assert "workflow_dispatch" in triggers
     assert set(triggers["workflow_dispatch"]["inputs"]) >= {"ref", "version"}
     build = document["jobs"]["build-and-push"]
-    login = next(step for step in build["steps"] if step.get("name") == "Log in to GitHub Container Registry")
+    login = next(
+        step for step in build["steps"] if step.get("name") == "Log in to GitHub Container Registry"
+    )
     assert login["with"]["registry"] == "ghcr.io"
-    push = next(step for step in build["steps"] if step.get("uses", "").startswith("docker/build-push-action"))
+    push = next(
+        step
+        for step in build["steps"]
+        if step.get("uses", "").startswith("docker/build-push-action")
+    )
     assert push["with"]["push"] is True

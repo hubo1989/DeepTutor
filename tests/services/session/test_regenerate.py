@@ -637,7 +637,8 @@ class TestRegenerateLastTurn:
             refresh_calls.append(event)
 
         monkeypatch.setattr(
-            "deeptutor.services.llm.config.get_llm_config", lambda: SimpleNamespace()
+            "deeptutor.services.llm.config.get_llm_config",
+            lambda: SimpleNamespace(source="platform"),
         )
         monkeypatch.setattr(
             "deeptutor.services.session.context_builder.ContextBuilder",

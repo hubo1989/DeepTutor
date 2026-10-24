@@ -86,7 +86,9 @@ async def test_reply_accepted_after_local_queue_dropped_is_never_delivered(
                 content=f"reply:{reply['text']}",
             )
 
-    monkeypatch.setattr("deeptutor.services.llm.config.get_llm_config", lambda: SimpleNamespace(source="platform"))
+    monkeypatch.setattr(
+        "deeptutor.services.llm.config.get_llm_config", lambda: SimpleNamespace(source="platform")
+    )
     monkeypatch.setattr(
         "deeptutor.services.session.context_builder.ContextBuilder", _ContextBuilder
     )
