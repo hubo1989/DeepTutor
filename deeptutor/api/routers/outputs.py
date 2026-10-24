@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 from pathlib import Path
-
-from fastapi import APIRouter, Depends, HTTPException, status
 from urllib.parse import quote
 
+from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import FileResponse
 
 _RESTRICTIVE_CSP = "sandbox; default-src 'none'"

@@ -73,7 +73,9 @@ def submission_service(monkeypatch, tmp_path):
     async def noop(*args, **kwargs):
         pass
 
-    monkeypatch.setattr("deeptutor.services.llm.config.get_llm_config", lambda: SimpleNamespace())
+    monkeypatch.setattr(
+        "deeptutor.services.llm.config.get_llm_config", lambda: SimpleNamespace(source="platform")
+    )
     monkeypatch.setattr("deeptutor.services.session.context_builder.ContextBuilder", Builder)
     monkeypatch.setattr("deeptutor.runtime.orchestrator.ChatOrchestrator", Orchestrator)
     monkeypatch.setattr(

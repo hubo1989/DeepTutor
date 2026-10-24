@@ -570,6 +570,7 @@ from deeptutor.api.routers import (
     attachments,
     auth,
     book,
+    byok,  # noqa: E402
     capabilities,
     capabilities_settings,
     co_writer,
@@ -589,6 +590,7 @@ from deeptutor.api.routers import (
     partners,
     personas,
     plugins,
+    plugins_api,  # noqa: E402
     practice,
     question,
     question_notebook,
@@ -612,8 +614,6 @@ from deeptutor.api.routers import (
 from deeptutor.api.routers import (
     tools as tools_router,
 )
-from deeptutor.api.routers import byok  # noqa: E402
-from deeptutor.api.routers import plugins_api  # noqa: E402
 from deeptutor.api.routers.file_library import router as file_library_router  # noqa: E402
 from deeptutor.api.routers.multi_user import router as multi_user_router  # noqa: E402
 from deeptutor.commercial.api import router as commercial_router  # noqa: E402
@@ -641,7 +641,9 @@ from deeptutor.api.routers.auth import (  # noqa: E402
 
 _auth = [Depends(require_learning_surface)]
 app.include_router(byok.router, prefix="/api/v1", tags=["byok"], dependencies=_auth)
-app.include_router(plugins_api.router, prefix="/api/v1/plugins", tags=["plugins"], dependencies=_auth)
+app.include_router(
+    plugins_api.router, prefix="/api/v1/plugins", tags=["plugins"], dependencies=_auth
+)
 # Partner data is anchored at the admin workspace (data/partners) and shared
 # process-wide, so management is admin-gated in multi-user deployments
 # (single-user local runs are implicitly admin — no behaviour change there).

@@ -60,7 +60,9 @@ async def test_remote_worker_subscribes_and_cancels_owner_turn(monkeypatch, tmp_
             )
             await hold.wait()
 
-    monkeypatch.setattr("deeptutor.services.llm.config.get_llm_config", lambda: SimpleNamespace())
+    monkeypatch.setattr(
+        "deeptutor.services.llm.config.get_llm_config", lambda: SimpleNamespace(source="platform")
+    )
     monkeypatch.setattr(
         "deeptutor.services.session.context_builder.ContextBuilder", _ContextBuilder
     )
@@ -120,7 +122,9 @@ async def test_remote_worker_reply_reaches_owner_waiter(monkeypatch, tmp_path) -
                 content=f"reply:{reply['text']}",
             )
 
-    monkeypatch.setattr("deeptutor.services.llm.config.get_llm_config", lambda: SimpleNamespace())
+    monkeypatch.setattr(
+        "deeptutor.services.llm.config.get_llm_config", lambda: SimpleNamespace(source="platform")
+    )
     monkeypatch.setattr(
         "deeptutor.services.session.context_builder.ContextBuilder", _ContextBuilder
     )
@@ -194,7 +198,9 @@ async def test_remote_cancel_waits_for_waiting_turn_teardown(monkeypatch, tmp_pa
             waiting.set()
             await context.runtime.wait_for_user_reply()
 
-    monkeypatch.setattr("deeptutor.services.llm.config.get_llm_config", lambda: SimpleNamespace())
+    monkeypatch.setattr(
+        "deeptutor.services.llm.config.get_llm_config", lambda: SimpleNamespace(source="platform")
+    )
     monkeypatch.setattr(
         "deeptutor.services.session.context_builder.ContextBuilder", _ContextBuilder
     )

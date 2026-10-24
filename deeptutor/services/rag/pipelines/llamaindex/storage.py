@@ -10,7 +10,7 @@ from pathlib import Path
 import shutil
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 
 from deeptutor.services.embedding.validation import validate_embedding_batch
 from deeptutor.services.rag.index_versioning import (

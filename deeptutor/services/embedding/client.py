@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import math
-
 from contextlib import asynccontextmanager
+import json
 import logging
+import math
 import threading
 from typing import Any, Dict, List, Mapping, Optional
 
@@ -162,6 +162,7 @@ def _usage_tokens(usage: Any) -> int:
 
 class EmbeddingClient:
     """Unified embedding client for RAG and retrieval services."""
+
     # 发帖节流：线程级锁串行化"等待间隔+发帖"，跨线程/跨 event loop 互斥
     # （asyncio 锁在新 loop 模型下失效的教训）。
     _spacing_lock: Any = None
@@ -213,7 +214,6 @@ class EmbeddingClient:
             lock = EmbeddingClient._global_spacing_lock()
             lock.acquire()
             return lock
-
 
     # 全局发帖节流：KB reindex 时 LlamaIndex 用线程池并发调 embedding，
     # 每个线程经 _run_in_new_loop 跑独立 event loop——asyncio.Lock 绑定
@@ -424,7 +424,6 @@ class EmbeddingClient:
             f"{self.config.binding} (batch_size={batch_size})"
         )
         return all_embeddings
-
 
     def _reserve_quota(self, estimated_tokens: int):
         if self.config.source == "byok":

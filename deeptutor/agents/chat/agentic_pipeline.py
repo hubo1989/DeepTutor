@@ -19,11 +19,10 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import logging
 import mimetypes
 from pathlib import Path
 from typing import Any
-
-import logging
 
 from deeptutor.agents.loop.pipeline import (
     KB_SEED_CHARS_PER_KB,

@@ -855,6 +855,9 @@ it("restores a failed first message in a draft and can retry after reload", asyn
 
 it("retries a failed draft with its original settings after live settings change", async () => {
   vi.useFakeTimers();
+  // Explicitly choose the original locale: the product default may change.
+  localStorage.setItem("deeptutor-language", "en");
+  localStorage.setItem("deeptutor-response-language", "en");
   try {
     render(<ChatStateAdapterProvider><Harness /></ChatStateAdapterProvider>);
     fireEvent.click(screen.getByText("Send"));

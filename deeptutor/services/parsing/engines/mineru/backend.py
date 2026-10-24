@@ -244,8 +244,8 @@ def parse_pdf_to_workdir(
     )
     try:
         result = parse_document_to_workdir(
-        pdf_path,
-        output_base,
+            pdf_path,
+            output_base,
             config=config,
             on_output=on_output,
         )
@@ -267,7 +267,9 @@ def parse_pdf_to_workdir(
             lease.finalize(page_count)
     finally:
         if commercial_lease is not None:
-            commercial_lease.finalize(page_count, usage_units={"pages": page_count}, is_estimated=False)
+            commercial_lease.finalize(
+                page_count, usage_units={"pages": page_count}, is_estimated=False
+            )
     return result
 
 

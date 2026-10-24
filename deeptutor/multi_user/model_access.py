@@ -20,6 +20,13 @@ from deeptutor.services.config.model_catalog import ModelCatalogService
 from deeptutor.services.config.provider_links import resolve_profile_provider
 from deeptutor.services.model_selection import list_llm_options
 
+from .byok_policy import (
+    allowed_binding,
+    byok_runtime_enabled,
+    grant_service_enabled,
+    load_policy,
+)
+from .byok_vault import get_user_byok_vault
 from .context import get_current_user
 from .grants import load_grant
 from .paths import get_admin_path_service
@@ -191,6 +198,51 @@ def has_capability_access(capability: str, user_id: str | None = None) -> bool:
         user_id = user.id
     items = redacted_model_access(user_id).get(capability, []) or []
     return any(item.get("available") for item in items)
+
+
+def default_llm_selection() -> dict[str, Any] | None:
+    """Choose an owner-authorized default without exposing provider secrets."""
+    user = get_current_user()
+    if user.is_admin:
+        return None
+
+    from .execution_source import resolve_execution_source
+
+    vault = get_user_byok_vault()
+    profiles = [
+        item for item in vault.list_profiles(user.id, service="llm") if item.get("configured")
+    ]
+    preferences = vault.get_preferences(user.id)
+    preference = preferences.get("llm") if isinstance(preferences.get("llm"), dict) else {}
+    requested_source = str(preference.get("source") or "").strip().lower()
+    policy = load_policy()
+    valid_profiles = [
+        item for item in profiles if allowed_binding("llm", str(item.get("provider") or ""), policy)
+    ]
+    if requested_source == "byok" or (
+        not requested_source
+        and byok_runtime_enabled("llm", policy)
+        and grant_service_enabled(load_grant(user.id), "byok", "llm")
+        and valid_profiles
+    ):
+        source = resolve_execution_source(
+            "llm", preferences=preferences, byok_profiles=valid_profiles
+        )
+        if source.is_byok:
+            return {
+                "source": "byok",
+                "profile_id": source.profile_id,
+                "generation": source.profile_generation,
+            }
+
+    for item in redacted_model_access(user.id).get("llm", []):
+        if item.get("source") != "byok" and item.get("available"):
+            return {
+                "source": "platform",
+                "profile_id": item.get("profile_id"),
+                "model_id": item.get("model_id"),
+            }
+    raise PermissionError("No LLM model is assigned to your account.")
 
 
 def apply_allowed_llm_selection(selection: dict[str, Any] | None) -> dict[str, Any] | None:

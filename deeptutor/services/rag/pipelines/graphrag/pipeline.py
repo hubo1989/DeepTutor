@@ -113,9 +113,7 @@ class GraphRagPipeline:
                 return False
             await self._build(staging, is_update=False)
             storage.write_meta(staging, version_name=root_dir.name)
-            await asyncio.to_thread(
-                promote_staged_directory_with_storage_limits, staging, root_dir
-            )
+            await asyncio.to_thread(promote_staged_directory_with_storage_limits, staging, root_dir)
             if indexed_file_callback := kwargs.get("indexed_file_callback"):
                 names = await asyncio.to_thread(storage.indexed_input_names, root_dir)
                 indexed_file_callback(

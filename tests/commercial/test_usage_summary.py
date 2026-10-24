@@ -14,9 +14,7 @@ from deeptutor.commercial.memory import InMemoryCommercialRepository
 from deeptutor.commercial.service import CommercialControlPlane
 
 
-async def _metered_plane(
-    *, llm_limit: int | None = 100_000, window: str = "utc_day"
-):
+async def _metered_plane(*, llm_limit: int | None = 100_000, window: str = "utc_day"):
     repository = InMemoryCommercialRepository()
     control_plane = CommercialControlPlane(repository)
     customer = await control_plane.ensure_billing_customer(owner_id="u-trial")
@@ -40,9 +38,7 @@ async def _metered_plane(
 async def test_summary_counts_reservations_until_finalized():
     control_plane, customer = await _metered_plane()
 
-    reservation = await control_plane.reserve_usage(
-        customer.id, "llm_tokens", 30, "req-1"
-    )
+    reservation = await control_plane.reserve_usage(customer.id, "llm_tokens", 30, "req-1")
     summary = await control_plane.usage_summary(customer.id)
     assert summary["llm_tokens"]["limit"] == 100_000
     assert summary["llm_tokens"]["window"] == "utc_day"
@@ -63,9 +59,7 @@ async def test_summary_distinguishes_unlimited_from_deny_all():
     # Commercial semantics: limit=None is unlimited, limit=0 denies all usage
     # (unlike the legacy multi-user quota where 0 means unlimited).
     unlimited, unlimited_customer = await _metered_plane(llm_limit=None)
-    assert (
-        await unlimited.usage_summary(unlimited_customer.id)
-    )["llm_tokens"]["limit"] is None
+    assert (await unlimited.usage_summary(unlimited_customer.id))["llm_tokens"]["limit"] is None
 
     deny_all, deny_customer = await _metered_plane(llm_limit=0)
     assert (await deny_all.usage_summary(deny_customer.id))["llm_tokens"]["limit"] == 0

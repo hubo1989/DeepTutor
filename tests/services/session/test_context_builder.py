@@ -7,7 +7,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from deeptutor.services.session.ask_user_trace import extract_ask_user_clarifications
 from deeptutor.services.session.context_builder import (
     MAX_HISTORY_PLAN_TOKENS,
     MAX_RAW_REBUILD_TOKENS,

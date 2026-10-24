@@ -239,6 +239,7 @@ def _get_llm_config_from_resolver() -> LLMConfig:
         api_format=resolved.api_format,
         reasoning_effort=resolved.reasoning_effort,
         context_window=resolved.context_window,
+        source=resolved.source,
     )
 
 
@@ -257,6 +258,13 @@ def get_llm_config() -> LLMConfig:
     scoped = _SCOPED_LLM_CONFIG.get()
     if scoped is not None:
         return scoped
+
+    # The process cache holds the administrator's model and credential.
+    # Resolve ordinary users against their current grant on every request.
+    from deeptutor.multi_user.context import get_current_user
+
+    if not get_current_user().is_admin:
+        return _get_llm_config_from_resolver()
 
     if _LLM_CONFIG_CACHE is not None:
         return _LLM_CONFIG_CACHE

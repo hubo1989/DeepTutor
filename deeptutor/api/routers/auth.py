@@ -48,6 +48,7 @@ def _cookie_samesite(*, secure: bool, commercial: bool) -> str:
     # and API origins. SameSite=None preserves that behavior outside SaaS mode.
     return "none" if secure else "lax"
 
+
 _SECURE = bool(load_auth_settings()["cookie_secure"])
 _COMMERCIAL = commercial_mode_requested()
 _SAMESITE = _cookie_samesite(
@@ -55,11 +56,6 @@ _SAMESITE = _cookie_samesite(
     commercial=_COMMERCIAL,
 )
 
-from deeptutor.multi_user.audit import log_admin_action, log_usage
-from deeptutor.multi_user.context import (    reset_current_user,
-    set_current_user,
-    user_from_token_payload,
-)
 from deeptutor.multi_user.audit import log_admin_action, log_usage
 from deeptutor.multi_user.context import (
     get_current_user_or_none,
@@ -109,6 +105,7 @@ from deeptutor.services.auth import (
     authenticate_pb,
     create_token,
     decode_token,
+    delete_user,
     get_user_info,
     hash_password,
     list_users,
@@ -118,7 +115,6 @@ from deeptutor.services.auth import (
     set_learner_profile,
     set_role,
     validate_password_bytes,
-    delete_user,
 )
 from deeptutor.services.auth import (
     get_learner_profile as load_learner_profile,
@@ -498,6 +494,7 @@ class AuthStatusResponse(BaseModel):
     preset: AccountPreset | None = None
     learning_policy: dict | None = None
 
+
 class UserInfo(BaseModel):
     """Single user record returned by the GET /users and /profile endpoints."""
 
@@ -519,6 +516,7 @@ class LearnerProfileRequest(BaseModel):
     language: str | None = Field(default=None, max_length=80)
     reading_level: str | None = Field(default=None, max_length=80)
     explanation_style: str | None = Field(default=None, max_length=80)
+
 
 # Markers settable through PUT /profile. Image markers ("img:<version>") are
 # managed exclusively by the upload endpoint so users cannot point their
@@ -582,9 +580,7 @@ def _client_ip(request: Request) -> str:
     its own socket address, which keeps direct-request rate limiting and
     cross-account protection exactly as strict as before.
     """
-    return _asserted_client_ip(request) or (
-        request.client.host if request.client else "unknown"
-    )
+    return _asserted_client_ip(request) or (request.client.host if request.client else "unknown")
 
 
 def _check_login_rate_limit(username: str, client_ip: str) -> None:
@@ -995,21 +991,6 @@ async def ws_authorize_message(ws: WebSocket, capability: str = "llm") -> bool:
     return await ws_require_capability_access(ws, capability)
 
 
-async def ws_revalidate_identity(ws: WebSocket) -> bool:
-    """Apply account deletion/disable/password reset before an inbound frame."""
-    if not _websocket_principal_is_current(ws):
-        await _close_websocket(ws, 4001)
-        return False
-    return await _refresh_websocket_commercial_access(ws)
-
-
-async def ws_authorize_message(ws: WebSocket, capability: str = "llm") -> bool:
-    """Revalidate identity and model access before a consuming WS action."""
-    if not await ws_revalidate_identity(ws):
-        return False
-    return await ws_require_capability_access(ws, capability)
-
-
 async def ws_require_auth(ws: WebSocket) -> _CtxToken | _WsAuthFailed:
     """Authenticate a WebSocket connection and set the user ContextVar.
 
@@ -1051,6 +1032,7 @@ async def ws_require_auth(ws: WebSocket) -> _CtxToken | _WsAuthFailed:
         await ws.close(code=4004)
         return ws_auth_failed
     return user_token
+
 
 async def require_admin(
     payload: TokenPayload | None = Depends(require_auth),
@@ -1276,7 +1258,8 @@ async def auth_status(
             is_admin=True,
             commercial_enabled=False,
             trial_days=None,
-            preset="standard",        )
+            preset="standard",
+        )
 
     token = _extract_token(authorization, dt_token)
     payload = decode_token(token) if token else None
@@ -1314,7 +1297,8 @@ async def auth_status(
         commercial_enabled=_COMMERCIAL,
         trial_days=DEFAULT_TRIAL_DAYS if _COMMERCIAL else None,
         preset=preset,
-        learning_policy=learning_policy,    )
+        learning_policy=learning_policy,
+    )
 
 
 @router.post("/login")
@@ -1457,6 +1441,8 @@ async def confirm_password_reset(body: ConfirmPasswordResetRequest) -> dict:
         # revoked even if cleanup of failed-login history needs later repair.
         logger.exception("Could not clear login history after password reset")
     return {"ok": True}
+
+
 def _require_builtin_device_auth() -> None:
     if not AUTH_ENABLED:
         raise HTTPException(
@@ -1704,6 +1690,7 @@ async def device_heartbeat(
         ) from None
     return {"ok": not device.pop("limit_reached"), **device}
 
+
 @router.post("/logout")
 async def logout(response: Response) -> dict:
     """Clear the JWT cookie.
@@ -1788,6 +1775,7 @@ async def request_registration_code(
         "verification_required": True,
         "message": "If this address can register, a verification code has been sent.",
     }
+
 
 @router.post("/register", status_code=status.HTTP_201_CREATED)
 async def register(body: VerifyRegistrationRequest, request: Request, response: Response) -> dict:
@@ -2407,7 +2395,7 @@ async def _create_admin_user(
         "role": role,
         "is_admin": role == "admin",
         "trial_pending": trial_pending,
-                        "preset": preset,
+        "preset": preset,
     }
 
 

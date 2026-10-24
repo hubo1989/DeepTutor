@@ -18,7 +18,7 @@ import json
 import math
 import threading
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Literal
 
 from openai import AsyncAzureOpenAI, AsyncOpenAI
 
@@ -26,7 +26,6 @@ from deeptutor.services.config import load_system_settings
 from deeptutor.services.keypool import KeyPool, primary_api_key
 from deeptutor.services.llm import get_token_limit_kwargs, supports_tools
 from deeptutor.services.llm.capabilities import catalog_capability_override
-from deeptutor.services.llm.usage_estimation import estimate_prompt_tokens
 from deeptutor.services.llm.exceptions import (
     LLMProviderError,
     LLMProviderTransportError,
@@ -39,6 +38,7 @@ from deeptutor.services.llm.openai_http_client import (
 from deeptutor.services.llm.reasoning_params import (
     build_openai_compatible_reasoning_kwargs,
 )
+from deeptutor.services.llm.usage_estimation import estimate_prompt_tokens
 from deeptutor.services.provider_registry import (
     api_format_for_provider,
     api_format_from_legacy,
@@ -866,7 +866,6 @@ def _stream_chunk_text(chunk: Any) -> str:
     return str(getattr(delta, "content", "") or "") if delta is not None else ""
 
 
-
 def _wrap_token_quota(
     client: Any,
     *,
@@ -905,7 +904,6 @@ def _wrap_token_quota(
         provider=provider,
         model=model,
     )
-
 
 
 class _TokenQuotaClient:

@@ -400,10 +400,17 @@ class TurnApplicationService:
         timeout_seconds: float = 15.0,
     ) -> bool:
         """Stop a live turn and wait until its owner has finished teardown."""
-        if not await self.cancel_turn(turn_id, command_id=command_id):
+        deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+        try:
+            cancelled = await asyncio.wait_for(
+                self.cancel_turn(turn_id, command_id=command_id),
+                timeout=max(0.0, deadline - time.monotonic()),
+            )
+        except asyncio.TimeoutError:
+            return False
+        if not cancelled:
             return False
         store, _runtime = self._resolve()
-        deadline = time.monotonic() + max(0.0, float(timeout_seconds))
         released = False
         while True:
             turn = await store.get_turn(turn_id)

@@ -408,7 +408,10 @@ class _FakeRuntimeSettings:
 @pytest.mark.parametrize(
     ("path", "payload"),
     [
-        ("/knowledge-bases/rag-pipelines/pageindex/config", {"api_base_url": "https://example.test"}),
+        (
+            "/knowledge-bases/rag-pipelines/pageindex/config",
+            {"api_base_url": "https://example.test"},
+        ),
         ("/knowledge-bases/rag-pipelines/llamaindex/config", {"top_k": 3}),
         ("/knowledge-bases/rag-pipelines/graphrag/config", {"community_level": 2}),
         ("/knowledge-bases/rag-pipelines/lightrag/config", {"top_k": 3}),

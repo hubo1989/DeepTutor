@@ -35,11 +35,7 @@ async def _require_auth(
 
     if not AUTH_ENABLED:
         return None
-    token = (
-        authorization.removeprefix("Bearer ").strip()
-        if authorization
-        else dt_token
-    )
+    token = authorization.removeprefix("Bearer ").strip() if authorization else dt_token
     payload = decode_token(token) if token else None
     if not payload:
         raise HTTPException(
@@ -49,7 +45,6 @@ async def _require_auth(
         )
     set_current_user(user_from_token_payload(payload))
     return payload
-
 
 
 async def require_commercial_access(
