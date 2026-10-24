@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timedelta, timezone
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 import httpx
 
 from deeptutor.api.routers.auth import require_admin
@@ -51,7 +51,13 @@ def _build_app(monkeypatch, tmp_path, *, runtime):
     monkeypatch.setattr("deeptutor.commercial.admin_api.get_commercial_runtime", lambda: runtime)
     app = FastAPI()
     app.include_router(router, prefix="/api/v1")
-    app.include_router(admin_router, prefix="/api/v1")
+    # Mirror production: the adapter mounts the admin router behind
+    # require_admin; the override below swaps in the scenario's user.
+    app.include_router(
+        admin_router,
+        prefix="/api/v1",
+        dependencies=[Depends(require_admin)],
+    )
     user = _user(tmp_path)
 
     async def fake_access():

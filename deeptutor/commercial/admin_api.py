@@ -4,6 +4,10 @@ Order fulfillment is manual by design until a payment gateway exists: an
 administrator confirms offline collection through ``mark-paid``, which
 atomically lands payment and replaces effective access. Every write is
 recorded in the admin audit log.
+
+This module is domain/runtime code and must not import API adapters: the
+router ships without an auth dependency, and the API adapter mounts it
+behind ``require_admin`` (see ``deeptutor.api.main``).
 """
 
 from __future__ import annotations
@@ -11,13 +15,11 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
-from deeptutor.api.routers.auth import require_admin
 from deeptutor.multi_user.audit import log_admin_action
 from deeptutor.multi_user.context import get_current_user
-from deeptutor.services.auth import TokenPayload
 
 from .api import CommercialOrderResponse, CommercialPlanResponse, _order_response
 from .errors import CommercialError, CommercialNotFound
@@ -58,7 +60,6 @@ def _require_control_plane():
 
 @router.get("/admin/commercial/orders", response_model=list[CommercialOrderResponse])
 async def list_orders(
-    _payload: TokenPayload | None = Depends(require_admin),
     status_filter: str | None = Query(default=None, alias="status"),
     owner_id: str | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
@@ -86,7 +87,6 @@ async def list_orders(
 async def mark_order_paid(
     order_id: str,
     request: MarkPaidRequest,
-    _payload: TokenPayload | None = Depends(require_admin),
 ) -> CommercialOrderResponse:
     """Confirm collected payment and activate the ordered subscription."""
 
@@ -119,7 +119,6 @@ async def mark_order_paid(
 @router.post("/admin/commercial/plans", response_model=CommercialPlanResponse)
 async def publish_plan(
     request: PublishPlanRequest,
-    _payload: TokenPayload | None = Depends(require_admin),
 ) -> CommercialPlanResponse:
     """Publish an immutable plan version; changes require a new version."""
 
@@ -164,7 +163,6 @@ async def publish_plan(
 @router.get("/admin/commercial/usage/{owner_id}")
 async def get_owner_usage(
     owner_id: str,
-    _payload: TokenPayload | None = Depends(require_admin),
     since: datetime | None = Query(default=None),
     until: datetime | None = Query(default=None),
     meter: str | None = Query(default=None),
