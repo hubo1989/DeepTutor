@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
 from deeptutor.multi_user.context import get_current_user
@@ -99,6 +99,57 @@ async def get_my_commercial_access(
         "values": thaw_json(resolved.values),
         "usage": usage,
     }
+
+
+@router.get("/commercial/usage")
+async def get_my_commercial_usage(
+    _payload: TokenPayload | None = Depends(require_commercial_access),
+    since: datetime | None = Query(default=None),
+    until: datetime | None = Query(default=None),
+    meter: str | None = Query(default=None),
+) -> dict[str, Any]:
+    """Return the caller's usage events with per-day/per-model rollups."""
+
+    runtime = get_commercial_runtime()
+    if not runtime.settings.enabled:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Commercial usage accounting is not enabled.",
+        )
+    user = get_current_user()
+    if user.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Administrators are not metered; nothing to report.",
+        )
+    access = get_commercial_access()
+    if access is None or access.owner_id != user.id:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Subscription state is temporarily unavailable.",
+        )
+    control_plane = runtime.control_plane
+    if control_plane is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Subscription state is temporarily unavailable.",
+        )
+    if since is not None and since.tzinfo is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="since must carry a timezone offset",
+        )
+    if until is not None and until.tzinfo is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="until must carry a timezone offset",
+        )
+    return await control_plane.usage_details(
+        access.resolved.customer_id,
+        since=since,
+        until=until,
+        meter=meter,
+    )
 
 
 __all__ = ["CommercialMeResponse", "router"]

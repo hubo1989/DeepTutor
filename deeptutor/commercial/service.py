@@ -472,6 +472,82 @@ class CommercialControlPlane:
             }
         return summary
 
+    async def usage_details(
+        self,
+        customer_id: str,
+        *,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        meter: str | None = None,
+    ) -> dict[str, Any]:
+        """Filtered usage-event read model with per-day/per-model aggregates.
+
+        A per-user accounting view over the durable ledger: raw events plus
+        rollups that stay derived (never a billing source of truth). The
+        estimated share flags provider calls whose usage the provider never
+        reported, so a rising value is a metering-health signal.
+        """
+
+        clean_customer_id = _required(customer_id, "customer_id")
+        if since is not None:
+            _require_aware(since, "since")
+        if until is not None:
+            _require_aware(until, "until")
+        clean_meter = _optional(meter)
+        events = [
+            event
+            for event in await self.repository.list_usage_events(clean_customer_id)
+            if (since is None or event.occurred_at >= since)
+            and (until is None or event.occurred_at < until)
+            and (clean_meter is None or event.meter == clean_meter)
+        ]
+        totals: dict[str, int] = {}
+        by_day: dict[str, dict[str, int]] = {}
+        by_model: dict[str, dict[str, int]] = {}
+        estimated_events = 0
+        estimated_quantity = 0
+        for event in events:
+            quantity = int(event.quantity)
+            totals[event.meter] = totals.get(event.meter, 0) + quantity
+            day = event.occurred_at.astimezone(timezone.utc).date().isoformat()
+            by_day.setdefault(day, {}).setdefault(event.meter, 0)
+            by_day[day][event.meter] += quantity
+            model_key = event.model or "unknown"
+            by_model.setdefault(event.meter, {}).setdefault(model_key, 0)
+            by_model[event.meter][model_key] += quantity
+            if event.is_estimated:
+                estimated_events += 1
+                estimated_quantity += quantity
+        total_quantity = sum(totals.values())
+        return {
+            "events": [
+                {
+                    "id": event.id,
+                    "meter": event.meter,
+                    "quantity": int(event.quantity),
+                    "provider": event.provider,
+                    "model": event.model,
+                    "usage_units": thaw_json(event.usage_units),
+                    "price_version": event.price_version,
+                    "cost_micros": int(event.cost_micros),
+                    "is_estimated": event.is_estimated,
+                    "metadata": thaw_json(event.metadata),
+                    "occurred_at": event.occurred_at.isoformat(),
+                }
+                for event in events
+            ],
+            "totals": totals,
+            "by_day": by_day,
+            "by_model": by_model,
+            "estimated": {
+                "events": estimated_events,
+                "quantity": estimated_quantity,
+                "share": (estimated_quantity / total_quantity) if total_quantity else 0.0,
+            },
+            "since": since.isoformat() if since is not None else None,
+            "until": until.isoformat() if until is not None else None,
+        }
+
     async def finalize_usage(
         self,
         reservation_id: str,
