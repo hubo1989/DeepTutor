@@ -183,7 +183,10 @@ async def test_turn_runtime_replays_events_and_materializes_messages(
             )
             yield StreamEvent(type=StreamEventType.DONE, source="chat")
 
-    monkeypatch.setattr("deeptutor.services.llm.config.get_llm_config", lambda: SimpleNamespace())
+    monkeypatch.setattr(
+        "deeptutor.services.llm.config.get_llm_config",
+        lambda: SimpleNamespace(source="platform"),
+    )
     monkeypatch.setattr(
         "deeptutor.services.session.context_builder.ContextBuilder", FakeContextBuilder
     )
@@ -388,7 +391,10 @@ async def test_turn_runtime_persists_private_provider_response_state(
     async def title_after_done(*_args, **_kwargs):
         return None
 
-    monkeypatch.setattr("deeptutor.services.llm.config.get_llm_config", lambda: SimpleNamespace())
+    monkeypatch.setattr(
+        "deeptutor.services.llm.config.get_llm_config",
+        lambda: SimpleNamespace(source="platform"),
+    )
     monkeypatch.setattr(
         "deeptutor.services.session.context_builder.ContextBuilder", FakeContextBuilder
     )
@@ -573,7 +579,10 @@ async def test_turn_runtime_session_persona_persists_falls_back_and_clears(
             )
             yield StreamEvent(type=StreamEventType.DONE, source="chat")
 
-    monkeypatch.setattr("deeptutor.services.llm.config.get_llm_config", lambda: SimpleNamespace())
+    monkeypatch.setattr(
+        "deeptutor.services.llm.config.get_llm_config",
+        lambda: SimpleNamespace(source="platform"),
+    )
     monkeypatch.setattr(
         "deeptutor.services.session.context_builder.ContextBuilder", FakeContextBuilder
     )
@@ -875,7 +884,10 @@ async def test_turn_runtime_bootstraps_question_followup_context_once(
             )
             yield StreamEvent(type=StreamEventType.DONE, source="chat")
 
-    monkeypatch.setattr("deeptutor.services.llm.config.get_llm_config", lambda: SimpleNamespace())
+    monkeypatch.setattr(
+        "deeptutor.services.llm.config.get_llm_config",
+        lambda: SimpleNamespace(source="platform"),
+    )
     monkeypatch.setattr(
         "deeptutor.services.session.context_builder.ContextBuilder", FakeContextBuilder
     )
@@ -1000,7 +1012,10 @@ async def test_turn_runtime_persists_deep_research_session_preference(
             )
             yield StreamEvent(type=StreamEventType.DONE, source="deep_research")
 
-    monkeypatch.setattr("deeptutor.services.llm.config.get_llm_config", lambda: SimpleNamespace())
+    monkeypatch.setattr(
+        "deeptutor.services.llm.config.get_llm_config",
+        lambda: SimpleNamespace(source="platform"),
+    )
     monkeypatch.setattr(
         "deeptutor.services.session.context_builder.ContextBuilder", FakeContextBuilder
     )
@@ -1094,7 +1109,10 @@ async def test_turn_runtime_injects_memory_and_refreshes_after_completion(
         emit_calls.append(event)
         return None
 
-    monkeypatch.setattr("deeptutor.services.llm.config.get_llm_config", lambda: SimpleNamespace())
+    monkeypatch.setattr(
+        "deeptutor.services.llm.config.get_llm_config",
+        lambda: SimpleNamespace(source="platform"),
+    )
     monkeypatch.setattr(
         "deeptutor.services.session.context_builder.ContextBuilder", FakeContextBuilder
     )
@@ -1211,7 +1229,10 @@ async def test_prior_image_attachments_are_reattached_on_the_next_turn(
             )
             yield StreamEvent(type=StreamEventType.DONE, source="chat")
 
-    monkeypatch.setattr("deeptutor.services.llm.config.get_llm_config", lambda: SimpleNamespace())
+    monkeypatch.setattr(
+        "deeptutor.services.llm.config.get_llm_config",
+        lambda: SimpleNamespace(source="platform"),
+    )
     monkeypatch.setattr(
         "deeptutor.services.session.context_builder.ContextBuilder", FakeContextBuilder
     )
@@ -1316,7 +1337,10 @@ async def test_reattaching_the_same_image_does_not_duplicate_it(
             captured.append(list(context.attachments or []))
             yield StreamEvent(type=StreamEventType.DONE, source="chat")
 
-    monkeypatch.setattr("deeptutor.services.llm.config.get_llm_config", lambda: SimpleNamespace())
+    monkeypatch.setattr(
+        "deeptutor.services.llm.config.get_llm_config",
+        lambda: SimpleNamespace(source="platform"),
+    )
     monkeypatch.setattr(
         "deeptutor.services.session.context_builder.ContextBuilder", FakeContextBuilder
     )
@@ -1432,7 +1456,10 @@ async def test_selection_tutoring_never_mounts_the_learning_journal(
             journal_reads.append("consulted")
             return "# Learning journal\n## Mission\n- Topic: FFT"
 
-    monkeypatch.setattr("deeptutor.services.llm.config.get_llm_config", lambda: SimpleNamespace())
+    monkeypatch.setattr(
+        "deeptutor.services.llm.config.get_llm_config",
+        lambda: SimpleNamespace(source="platform"),
+    )
     monkeypatch.setattr(
         "deeptutor.services.session.context_builder.ContextBuilder", FakeContextBuilder
     )

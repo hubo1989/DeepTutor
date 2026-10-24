@@ -587,7 +587,7 @@ async def test_reconnect_after_turn_completion_still_carries_message_ids(
     async def _noop_title(**_kwargs):
         return None
 
-    monkeypatch.setattr("deeptutor.services.llm.config.get_llm_config", lambda: SimpleNamespace())
+    monkeypatch.setattr("deeptutor.services.llm.config.get_llm_config", lambda: SimpleNamespace(source="platform"))
     monkeypatch.setattr(
         "deeptutor.services.session.context_builder.ContextBuilder",
         FakeContextBuilder,
