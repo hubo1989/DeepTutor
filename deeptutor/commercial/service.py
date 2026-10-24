@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import calendar
 from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -12,6 +13,7 @@ from .errors import (
     CommercialNotFound,
     EntitlementDenied,
     IdempotencyConflict,
+    InvalidOrderTransition,
 )
 from .keys import (
     canonical_json,
@@ -22,7 +24,10 @@ from .keys import (
 from .models import (
     BillingCustomer,
     Entitlement,
+    OrderStatus,
+    OrderType,
     PlanVersion,
+    PurchaseOrder,
     QuotaWindow,
     ReconciliationReport,
     ResolvedEntitlements,
@@ -141,6 +146,11 @@ class CommercialControlPlane:
                 )
             )
         return await self.repository.publish_plan_version(plan, tuple(entitlement_rows))
+
+    async def list_plan_versions(self) -> tuple[PlanVersion, ...]:
+        """Every published plan version, ordered for stable pricing pages."""
+
+        return await self.repository.list_plan_versions()
 
     async def ensure_trial(self, customer_id: str, plan_version_id: str) -> Subscription:
         now = self._now()
@@ -616,6 +626,134 @@ class CommercialControlPlane:
             self._now(),
         )
 
+    async def create_order(
+        self,
+        customer_id: str,
+        plan_version_id: str,
+        *,
+        order_type: OrderType = OrderType.SUBSCRIPTION_NEW,
+        idempotency_key: str,
+    ) -> PurchaseOrder:
+        """Snapshot the plan's price and period into a pending payment order.
+
+        Payment capture is deliberately out of scope here: the order just
+        records what was agreed. Until a gateway exists, an administrator
+        moves it to fulfilled after offline collection; a future webhook
+        does the same through ``pay_and_fulfill_order``.
+        """
+
+        if not isinstance(order_type, OrderType):
+            raise ValueError("order_type must be an OrderType")
+        clean_customer_id = _required(customer_id, "customer_id")
+        clean_plan_id = _required(plan_version_id, "plan_version_id")
+        clean_idempotency_key = _required(idempotency_key, "idempotency_key")
+        plan = await self.repository.get_plan_version(clean_plan_id)
+        if plan is None:
+            raise CommercialNotFound(f"plan version not found: {clean_plan_id}")
+        now = self._now()
+        period_start = now
+        if order_type is OrderType.SUBSCRIPTION_RENEW:
+            live = await self.repository.get_entitled_subscription(clean_customer_id, now)
+            if live is not None and live.current_period_end > now:
+                period_start = live.current_period_end
+        period_end = _plan_period_end(plan.billing_interval, period_start)
+        candidate = PurchaseOrder(
+            id=self._id_factory("ord"),
+            dedupe_key=request_dedupe_key("order-create", clean_customer_id, clean_idempotency_key),
+            customer_id=clean_customer_id,
+            plan_version_id=plan.id,
+            order_type=order_type,
+            price_minor=plan.price_minor,
+            currency=plan.currency,
+            status=OrderStatus.PENDING_PAYMENT,
+            provider="manual",
+            external_order_id=None,
+            subscription_id=None,
+            period_start=period_start,
+            period_end=period_end,
+            paid_at=None,
+            fulfilled_at=None,
+            canceled_at=None,
+            refunded_at=None,
+            metadata={"order_type": order_type.value},
+            created_at=now,
+            updated_at=now,
+        )
+        return await self.repository.create_order(candidate)
+
+    async def get_order(self, order_id: str) -> PurchaseOrder:
+        order = await self.repository.get_order(_required(order_id, "order_id"))
+        if order is None:
+            raise CommercialNotFound(f"purchase order not found: {order_id}")
+        return order
+
+    async def list_orders(
+        self,
+        customer_id: str,
+        *,
+        status: str | None = None,
+    ) -> tuple[PurchaseOrder, ...]:
+        return await self.repository.list_orders(
+            _required(customer_id, "customer_id"),
+            status=status,
+        )
+
+    async def pay_and_fulfill_order(
+        self,
+        order_id: str,
+        *,
+        operator: str,
+        payment_reference: str | None = None,
+    ) -> tuple[PurchaseOrder, Subscription]:
+        """Confirm payment and atomically replace effective access.
+
+        The subscription is keyed to the order id (``external_subscription_id``),
+        so a retried fulfillment converges on the same row instead of stacking
+        subscriptions.
+        """
+
+        clean_order_id = _required(order_id, "order_id")
+        clean_operator = _required(operator, "operator")
+        order = await self.get_order(clean_order_id)
+        if order.status not in {
+            OrderStatus.PENDING_PAYMENT,
+            OrderStatus.PAID,
+            OrderStatus.FULFILLED,
+        }:
+            raise InvalidOrderTransition(
+                f"order in status {order.status.value} cannot be fulfilled"
+            )
+        now = self._now()
+        candidate = Subscription(
+            id=self._id_factory("sub"),
+            customer_id=order.customer_id,
+            plan_version_id=order.plan_version_id,
+            status=SubscriptionStatus.ACTIVE,
+            provider="manual",
+            external_subscription_id=order.id,
+            current_period_start=order.period_start,
+            current_period_end=order.period_end,
+            trial_started_at=None,
+            trial_ends_at=None,
+            canceled_at=None,
+            version=1,
+            created_at=now,
+            updated_at=now,
+        )
+        return await self.repository.pay_and_fulfill_order(
+            order.id,
+            candidate,
+            now,
+            operator=clean_operator,
+            payment_reference=_optional(payment_reference),
+        )
+
+    async def cancel_order(self, order_id: str) -> PurchaseOrder:
+        return await self.repository.cancel_order(
+            _required(order_id, "order_id"),
+            self._now(),
+        )
+
     async def reconcile(self, *, repair: bool = False) -> ReconciliationReport:
         """Audit derived lifecycle state and optionally apply deterministic repair."""
         return await self.repository.reconcile(self._now(), repair=repair)
@@ -634,6 +772,7 @@ class CommercialControlPlane:
         subscriptions = await self.repository.list_subscriptions(customer.id)
         reservations = await self.repository.list_usage_reservations(customer.id)
         usage_events = await self.repository.list_usage_events(customer.id)
+        orders = await self.repository.list_orders(customer.id)
         return {
             "schema_version": 1,
             "exported_at": self._now().isoformat(),
@@ -643,6 +782,23 @@ class CommercialControlPlane:
                 "trial_claimed_at": _iso(customer.trial_claimed_at),
                 "created_at": customer.created_at.isoformat(),
             },
+            "orders": [
+                {
+                    "id": order.id,
+                    "plan_version_id": order.plan_version_id,
+                    "order_type": order.order_type.value,
+                    "price_minor": order.price_minor,
+                    "currency": order.currency,
+                    "status": order.status.value,
+                    "period_start": order.period_start.isoformat(),
+                    "period_end": order.period_end.isoformat(),
+                    "paid_at": _iso(order.paid_at),
+                    "fulfilled_at": _iso(order.fulfilled_at),
+                    "canceled_at": _iso(order.canceled_at),
+                    "created_at": order.created_at.isoformat(),
+                }
+                for order in orders
+            ],
             "subscriptions": [
                 {
                     "id": item.id,
@@ -732,6 +888,22 @@ def _quota_period(
     day_start = utc.replace(hour=0, minute=0, second=0, microsecond=0)
     day_end = day_start + timedelta(days=1)
     return max(day_start, subscription_start), min(day_end, subscription_end)
+
+
+def _plan_period_end(interval: str, start: datetime) -> datetime:
+    """Calendar-accurate next period boundary (months clamp to their end)."""
+
+    clean = _required(interval, "billing_interval").lower()
+    if clean == "month":
+        year = start.year + (1 if start.month == 12 else 0)
+        month = 1 if start.month == 12 else start.month + 1
+        _, last_day = calendar.monthrange(year, month)
+        return start.replace(year=year, month=month, day=min(start.day, last_day))
+    if clean == "year":
+        year = start.year + 1
+        _, feb_last = calendar.monthrange(year, 2)
+        return start.replace(year=year, day=min(start.day, feb_last if start.month == 2 else 31))
+    raise ValueError(f"unsupported billing interval: {interval}")
 
 
 def _iso(value: datetime | None) -> str | None:
